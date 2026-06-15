@@ -1,0 +1,49 @@
+{
+  "name": "@camera.ui/rpc",
+  "version": "1.0.1",
+  "description": "camera.ui rpc package",
+  "author": "seydx (https://github.com/cameraui/rpc)",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "rimraf dist && tsc -p tsconfig.build.json",
+    "format": "prettier --write 'src/' --ignore-unknown --no-error-on-unmatched-pattern",
+    "lint": "eslint .",
+    "lint:fix": "eslint --fix .",
+    "test": "vitest run",
+    "prepublishOnly": "npm i --package-lock-only && npm run lint:fix && npm run format && npm run build"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "@nats-io/nats-core": "^3.4.0",
+    "@nats-io/services": "^3.4.0",
+    "@nats-io/transport-node": "^3.4.0",
+    "msgpackr": "^2.0.4",
+    "reflect-metadata": "^0.2.2"
+  },
+  "bugs": {
+    "url": "https://github.com/cameraui/rpc/issues"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "homepage": "https://github.com/cameraui/rpc#readme",
+  "keywords": [
+    "camera.ui",
+    "nats",
+    "rpc"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cameraui/rpc.git"
+  }
+}

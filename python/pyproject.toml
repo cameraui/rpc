@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "camera-ui-rpc"
+version = "1.0.1"
+description = "RPC Client for camera.ui"
+keywords = ["camera.ui", "python", "nats", "rpc"]
+readme = "README.md"
+license-files = ["../LICENSE.md"]
+authors = [{ name = "seydx", email = "hi@seydx.dev" }]
+maintainers = [{ name = "seydx", email = "hi@seydx.dev" }]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "typing_extensions>=4.15.0",
+    "nats-py>=2.15.0",
+    "ormsgpack>=1.12.2"
+]
+
+[project.optional-dependencies]
+examples = ["uvloop>=0.21.0"]
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/cameraui/rpc"
+Documentation = "https://github.com/cameraui/rpc"
+Repository = "https://github.com/cameraui/rpc"
+"Bug Tracker" = "https://github.com/cameraui/rpc/issues"
+Changelog = "https://github.com/cameraui/rpc/blob/main/CHANGELOG.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["camera_ui_rpc*"]
+
+[tool.setuptools.package-data]
+camera_ui_rpc = ["py.typed"]
