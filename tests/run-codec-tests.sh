@@ -38,10 +38,10 @@ run_phase() {
 
     if [ $exit_code -ne 0 ]; then
         PHASE_RESULTS+=("${RED}FAIL${NC} $phase_name")
-        ((TOTAL_FAILED++))
+        TOTAL_FAILED=$((TOTAL_FAILED + 1))
     else
         PHASE_RESULTS+=("${GREEN}OK${NC}   $phase_name")
-        ((TOTAL_PASSED++))
+        TOTAL_PASSED=$((TOTAL_PASSED + 1))
     fi
 
     return 0  # Don't fail the whole script on individual phase failure
