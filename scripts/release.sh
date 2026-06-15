@@ -129,7 +129,11 @@ case "$PKG" in
   go) ;; # no file to change; tag points at current HEAD
 esac
 
-if ! git diff --cached --quiet; then
+if [ "$PKG" = go ]; then
+  git commit -q --allow-empty -m "release($PKG): v$NEW"
+  committed=true
+  echo -e "${GREEN}Created release commit.${NC}"
+elif ! git diff --cached --quiet; then
   git commit -q -m "release($PKG): v$NEW"
   committed=true
   echo -e "${GREEN}Committed version bump.${NC}"
