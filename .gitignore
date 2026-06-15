@@ -23,6 +23,7 @@ __pycache__
 *.sw?
 *.egg-info
 .venv
+.tmp
 
 tests/nats
 tests/go-codec/go-codec
