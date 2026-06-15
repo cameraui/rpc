@@ -1,0 +1,47 @@
+name: Release Python
+
+on:
+  push:
+    tags:
+      - "python-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Verify tag matches pyproject.toml version
+        run: |
+          TAG="${GITHUB_REF_NAME#python-v}"
+          PKG="$(grep -E '^version' python/pyproject.toml | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+          echo "tag=$TAG pyproject=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject.toml version $PKG"
+            exit 1
+          fi
+
+      - name: Build sdist
+        run: |
+          pip install build
+          cd python && python -m build --sdist
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@v1.14.0
+        with:
+          packages-dir: python/dist
