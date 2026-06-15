@@ -8,7 +8,7 @@ version = "1.0.2"
 description = "RPC Client for camera.ui"
 keywords = ["camera.ui", "python", "nats", "rpc"]
 readme = "README.md"
-license-files = ["../LICENSE.md"]
+license-files = ["LICENSE.md"]
 authors = [{ name = "seydx", email = "hi@seydx.dev" }]
 maintainers = [{ name = "seydx", email = "hi@seydx.dev" }]
 requires-python = ">=3.11"
