@@ -1,0 +1,86 @@
+name: Test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install JS dependencies
+        run: |
+          npm ci
+          npm ci --prefix node
+
+      - name: Install Python dependencies
+        run: pip install -e ./python mypy
+
+      - name: Install Go lint tools (staticcheck + golangci-lint v2)
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.11.3/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.11.3
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Lint (node + go + python)
+        run: npm run lint
+
+      - name: Fail if linting produced changes
+        run: git diff --exit-code
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install JS dependencies
+        run: |
+          npm ci
+          npm ci --prefix node
+          echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Install Python package + example/test dependencies
+        run: pip install -e "./python[examples,test]"
+
+      - name: Node unit tests
+        run: npm --prefix node test
+
+      - name: Go unit tests
+        run: cd go && go test ./...
+
+      - name: Python unit tests
+        run: cd python && python -m pytest
+
+      - name: Codec cross-language tests
+        run: bash tests/run-codec-tests.sh
+
+      - name: Pull-callback cross-language tests
+        run: bash tests/run-pull-callback-cross.sh
+
+      - name: RPC cross-language tests
+        run: bash tests/run-cross-rpc-test.sh
