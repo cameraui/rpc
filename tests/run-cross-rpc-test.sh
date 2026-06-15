@@ -153,23 +153,44 @@ if [ -n "$PYTHON_TARGETS" ]; then
     echo -e "${GREEN}Starting Python server...${NC}"
     # exec so $! is the python process itself (not the cd-subshell), otherwise
     # our SIGTERM would hit the subshell and the example never shuts down cleanly.
-    ( cd "$SCRIPT_DIR/../python" && exec python run_example.py cross_language_test --targets "$PYTHON_TARGETS" ) &
+    ( cd "$SCRIPT_DIR/../python" && exec python run_example.py cross_language_test --targets "$PYTHON_TARGETS" ) > "$BIN_DIR/python.log" 2>&1 &
     PYTHON_PID=$!
 fi
 
 if [ -n "$NODE_TARGETS" ]; then
     echo -e "${GREEN}Starting Node.js server...${NC}"
-    ( cd "$SCRIPT_DIR/../node" && exec tsx examples/cross-language.ts --targets "$NODE_TARGETS" ) &
+    ( cd "$SCRIPT_DIR/../node" && exec tsx examples/cross-language.ts --targets "$NODE_TARGETS" ) > "$BIN_DIR/node.log" 2>&1 &
     NODE_PID=$!
 fi
 
 if [ -n "$GO_TARGETS" ]; then
     echo -e "${GREEN}Starting Go server...${NC}"
-    "$BIN_DIR/cross-go" --targets "$GO_TARGETS" &
+    "$BIN_DIR/cross-go" --targets "$GO_TARGETS" > "$BIN_DIR/go.log" 2>&1 &
     GO_PID=$!
 fi
 
-sleep 15
+# Wait until every started runtime has finished its client phase (each prints
+# "server running" once done) or has exited early. Tearing the processes down
+# after a fixed delay would cut calls off mid-flight.
+deadline=$((SECONDS + 120))
+while true; do
+    pending=0
+    for pair in "PYTHON_PID:python" "NODE_PID:node" "GO_PID:go"; do
+        pid_var="${pair%%:*}"
+        name="${pair##*:}"
+        pid="${!pid_var}"
+        [ -z "$pid" ] && continue
+        grep -q "server running" "$BIN_DIR/$name.log" 2>/dev/null && continue
+        kill -0 "$pid" 2>/dev/null || continue
+        pending=$((pending + 1))
+    done
+    [ "$pending" -eq 0 ] && break
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo -e "${YELLOW}Timed out waiting for client phases to complete${NC}"
+        break
+    fi
+    sleep 0.5
+done
 
 echo -e "\n${CYAN}Stopping servers & collecting results${NC}"
 
@@ -198,6 +219,12 @@ if [ "$RESULT" -eq 0 ]; then
     echo -e "\n${GREEN}Cross-language RPC test passed (mode: $MODE)${NC}"
 else
     echo -e "\n${RED}Cross-language RPC test FAILED (mode: $MODE)${NC}"
+    for name in python node go; do
+        if [ -f "$BIN_DIR/$name.log" ]; then
+            echo -e "\n${YELLOW}----- $name output -----${NC}"
+            cat "$BIN_DIR/$name.log"
+        fi
+    done
 fi
 
 exit "$RESULT"
