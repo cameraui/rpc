@@ -1,5 +1,7 @@
 """Camera UI RPC library for Python."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 # NATS service types
 from nats.micro.service import ServiceConfig, ServiceInfo, ServiceStats
 
@@ -69,4 +71,7 @@ __all__ = [
     "ServiceStats",
 ]
 
-__version__ = "1.0.0"
+try:
+    __version__ = version("camera-ui-rpc")
+except PackageNotFoundError:
+    __version__ = "0.0.0"

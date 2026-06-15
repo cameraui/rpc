@@ -22,6 +22,7 @@
     "test:rpc": "bash tests/run-cross-rpc-test.sh",
     "test:integration": "npm run test:codec && npm run test:pull-callback && npm run test:rpc",
     "test": "npm run test:unit && npm run test:integration",
+    "release": "bash scripts/release.sh",
     "update": "updates --file go,node,python --update ./"
   },
   "homepage": "https://github.com/cameraui/rpc#readme",
