@@ -2,52 +2,102 @@ name: Test
 
 on:
   workflow_call:
+    inputs:
+      node:
+        type: boolean
+        default: true
+      python:
+        type: boolean
+        default: true
+      go:
+        type: boolean
+        default: true
+      integration:
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
-  lint:
+  node:
+    if: ${{ inputs.node }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "stable"
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
 
-      - name: Install JS dependencies
+      - name: Install dependencies
         run: |
           npm ci
           npm ci --prefix node
 
-      - name: Install Python dependencies
-        run: pip install -e ./python mypy
+      - name: Lint
+        run: npm run lint:node
 
-      - name: Install Go lint tools (staticcheck + golangci-lint v2)
+      - name: Fail if linting produced changes
+        run: git diff --exit-code
+
+      - name: Unit tests
+        run: npm --prefix node test
+
+  python:
+    if: ${{ inputs.python }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -e "./python[test]" mypy
+
+      - name: Lint (mypy)
+        run: cd python && mypy --config-file ../mypy.ini camera_ui_rpc
+
+      - name: Unit tests
+        run: cd python && python -m pytest
+
+  go:
+    if: ${{ inputs.go }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "stable"
+
+      - name: Install lint tools (staticcheck + golangci-lint v2)
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@latest
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.11.3/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin" v2.11.3
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Lint (node + go + python)
-        run: npm run lint
+      - name: Lint
+        run: |
+          cd go
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+          go vet ./...
+          staticcheck ./...
+          golangci-lint run ./...
 
-      - name: Fail if linting produced changes
-        run: git diff --exit-code
+      - name: Unit tests
+        run: cd go && go test ./...
 
-  test:
+  integration:
+    if: ${{ inputs.integration }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
@@ -64,17 +114,8 @@ jobs:
           npm ci --prefix node
           echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"
 
-      - name: Install Python package + example/test dependencies
-        run: pip install -e "./python[examples,test]"
-
-      - name: Node unit tests
-        run: npm --prefix node test
-
-      - name: Go unit tests
-        run: cd go && go test ./...
-
-      - name: Python unit tests
-        run: cd python && python -m pytest
+      - name: Install Python package + example dependencies
+        run: pip install -e "./python[examples]"
 
       - name: Codec cross-language tests
         run: bash tests/run-codec-tests.sh

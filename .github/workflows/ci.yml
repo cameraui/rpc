@@ -8,11 +8,56 @@ on:
 permissions:
   contents: read
 
-# Cancel superseded runs on the same ref.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      node: ${{ steps.filter.outputs.node }}
+      python: ${{ steps.filter.outputs.python }}
+      go: ${{ steps.filter.outputs.go }}
+      tests: ${{ steps.filter.outputs.tests }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            node:
+              - 'node/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'eslint.config.js'
+              - '.prettierrc.json'
+              - '.prettierignore'
+              - '.github/workflows/**'
+            python:
+              - 'python/**'
+              - 'mypy.ini'
+              - 'ruff.toml'
+              - 'package.json'
+              - '.github/workflows/**'
+            go:
+              - 'go/**'
+              - '.golangci.yml'
+              - 'package.json'
+              - '.github/workflows/**'
+            tests:
+              - 'tests/**'
+              - 'package.json'
+              - '.github/workflows/**'
+
   test:
+    needs: changes
     uses: ./.github/workflows/test.yml
+    with:
+      node: ${{ needs.changes.outputs.node == 'true' }}
+      python: ${{ needs.changes.outputs.python == 'true' }}
+      go: ${{ needs.changes.outputs.go == 'true' }}
+      integration: ${{ needs.changes.outputs.node == 'true' || needs.changes.outputs.python == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.tests == 'true' }}
