@@ -1,6 +1,6 @@
 {
   "name": "@camera.ui/rpc",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "camera.ui rpc package",
   "author": "seydx (https://github.com/cameraui/rpc)",
   "type": "module",
