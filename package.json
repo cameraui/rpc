@@ -39,7 +39,7 @@
     "@camera.ui/nats": "^0.0.28",
     "@stylistic/eslint-plugin": "^5.10.0",
     "@types/node": "^25.9.3",
-    "@typescript-eslint/parser": "^8.61.0",
+    "@typescript-eslint/parser": "^8.61.1",
     "eslint": "9.39.2",
     "globals": "^17.6.0",
     "prettier": "^3.8.4",
