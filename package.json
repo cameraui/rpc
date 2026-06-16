@@ -11,7 +11,7 @@
     "build": "npm run build:node && npm run build:go && npm run build:python",
     "lint:node": "npm --prefix node run format && npm --prefix node run lint:fix",
     "lint:go": "cd go && gofmt -w . && go fix ./... && staticcheck ./... && golangci-lint run ./...",
-    "lint:python": "cd python && mypy --config-file ../mypy.ini camera_ui_rpc",
+    "lint:python": "cd python && mypy --config-file ./mypy.ini camera_ui_rpc",
     "lint": "npm run lint:node && npm run lint:go && npm run lint:python",
     "test:unit:node": "npm --prefix node test",
     "test:unit:go": "cd go && go test ./...",
@@ -23,7 +23,7 @@
     "test:integration": "npm run test:codec && npm run test:pull-callback && npm run test:rpc",
     "test": "npm run test:unit && npm run test:integration",
     "release": "bash scripts/release.sh",
-    "update": "updates --file go,node,python --update ./"
+    "update": "updates --update ./ && updates --file go,node,python --update ./ && npm i --save && npm run install-updates --if-present --prefix node"
   },
   "homepage": "https://github.com/cameraui/rpc#readme",
   "bugs": {
@@ -39,14 +39,14 @@
     "@camera.ui/nats": "^0.0.28",
     "@stylistic/eslint-plugin": "^5.10.0",
     "@types/node": "^25.9.3",
-    "@typescript-eslint/parser": "^8.61.0",
+    "@typescript-eslint/parser": "^8.61.1",
     "eslint": "9.39.2",
     "globals": "^17.6.0",
     "prettier": "^3.8.4",
     "rimraf": "^6.1.3",
     "tsx": "^4.22.4",
     "typescript": "5.9.3",
-    "typescript-eslint": "^8.61.0",
+    "typescript-eslint": "^8.61.1",
     "updates": "^17.18.0"
   }
 }

@@ -14,6 +14,7 @@
   "scripts": {
     "build": "rimraf dist && tsc -p tsconfig.build.json",
     "format": "prettier --write 'src/' --ignore-unknown --no-error-on-unmatched-pattern",
+    "install-updates": "npm i --save",
     "lint": "eslint .",
     "lint:fix": "eslint --fix .",
     "test": "vitest run",

@@ -56,7 +56,7 @@ jobs:
         run: pip install -e "./python[test]" mypy
 
       - name: Lint (mypy)
-        run: cd python && mypy --config-file ../mypy.ini camera_ui_rpc
+        run: cd python && mypy --config-file ./mypy.ini camera_ui_rpc
 
       - name: Unit tests
         run: cd python && python -m pytest
