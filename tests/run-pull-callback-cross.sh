@@ -7,7 +7,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NATS_BIN="$SCRIPT_DIR/../node_modules/@camera.ui/nats/binary/nats"
+NATS_BIN="$(cd "$SCRIPT_DIR/.." && node -p "require('@camera.ui/nats').natsServerPath()" 2>/dev/null)"
 
 export PYTHONUNBUFFERED=1
 
