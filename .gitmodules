@@ -1,0 +1,4 @@
+[submodule "node/externals/nats.js"]
+	path = node/externals/nats.js
+	url = https://github.com/seydx/nats.js.git
+	branch = main
