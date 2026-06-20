@@ -4,13 +4,23 @@
   "description": "camera.ui rpc package",
   "author": "seydx (https://github.com/cameraui/rpc)",
   "type": "module",
+  "sideEffects": [
+    "**/decorators.js"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "require": "./dist/index.js",
       "default": "./dist/index.js"
-    }
+    },
+    "./browser": "./dist/browser.js",
+    "./nats-core": "./externals/nats.js/core/src/mod.ts",
+    "./nats-core/internal": "./externals/nats.js/core/src/internal_mod.ts"
   },
+  "files": [
+    "dist",
+    "externals/nats.js/core/src"
+  ],
   "scripts": {
     "build": "rimraf dist && tsc -p tsconfig.build.json",
     "format": "prettier --write 'src/' --ignore-unknown --no-error-on-unmatched-pattern",
@@ -20,15 +30,15 @@
     "test": "vitest run",
     "prepublishOnly": "npm i --package-lock-only && npm run lint:fix && npm run format && npm run build"
   },
-  "devDependencies": {
-    "vitest": "^4.1.9"
-  },
   "dependencies": {
     "@nats-io/nats-core": "^3.4.0",
     "@nats-io/services": "^3.4.0",
     "@nats-io/transport-node": "^3.4.0",
     "msgpackr": "^2.0.4",
     "reflect-metadata": "^0.2.2"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.9"
   },
   "bugs": {
     "url": "https://github.com/cameraui/rpc/issues"
