@@ -5,10 +5,12 @@
   "description": "camera.ui rpc monorepo",
   "type": "module",
   "scripts": {
+    "audit": "npm audit fix && npm --prefix node audit fix",
     "build:node": "npm --prefix node run build",
     "build:go": "cd go && go build ./...",
     "build:python": "cd python && python scripts/build.py --local",
     "build": "npm run build:node && npm run build:go && npm run build:python",
+    "install-updates": "npm i --save && npm run install-updates --if-present --prefix node",
     "lint:node": "npm --prefix node run format && npm --prefix node run lint:fix",
     "lint:go": "cd go && gofmt -w . && go fix ./... && staticcheck ./... && golangci-lint run ./...",
     "lint:python": "cd python && mypy --config-file ./mypy.ini camera_ui_rpc",
@@ -23,7 +25,6 @@
     "test:integration": "npm run test:codec && npm run test:pull-callback && npm run test:rpc",
     "test": "npm run test:unit && npm run test:integration",
     "release": "bash scripts/release.sh",
-    "install-updates": "npm i --save && npm run install-updates --if-present --prefix node",
     "update": "updates --update ./ && updates --file go,node,python --update ./"
   },
   "homepage": "https://github.com/cameraui/rpc#readme",
@@ -37,9 +38,9 @@
   "license": "MIT",
   "author": "seydx",
   "devDependencies": {
-    "@camera.ui/nats": "^0.0.28",
+    "@camera.ui/nats": "^2.14.2",
     "@stylistic/eslint-plugin": "^5.10.0",
-    "@types/node": "^25.9.3",
+    "@types/node": "^26.0.0",
     "@typescript-eslint/parser": "^8.61.1",
     "eslint": "9.39.2",
     "globals": "^17.6.0",
