@@ -28,6 +28,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint --fix .",
     "test": "vitest run",
+    "prepack": "test -f externals/nats.js/core/src/mod.ts || { echo 'ERROR: nats.js fork source missing. Run: git submodule update --init --recursive'; exit 1; }",
     "prepublishOnly": "npm i --package-lock-only && npm run lint:fix && npm run format && npm run build"
   },
   "dependencies": {
