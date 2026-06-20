@@ -24,7 +24,7 @@
     "test": "npm run test:unit && npm run test:integration",
     "release": "bash scripts/release.sh",
     "install-updates": "npm i --save && npm run install-updates --if-present --prefix node",
-    "update": "updates --update ./ && updates --file go,node,python --update ./ && npm i --save && npm run install-updates --if-present --prefix node"
+    "update": "updates --update ./ && updates --file go,node,python --update ./"
   },
   "homepage": "https://github.com/cameraui/rpc#readme",
   "bugs": {
