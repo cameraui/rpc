@@ -1,4 +1,4 @@
-# @camera.ui/rpc
+# camera.ui - RPC
 
 [![npm](https://img.shields.io/npm/v/@camera.ui/rpc?label=npm&logo=npm)](https://www.npmjs.com/package/@camera.ui/rpc)
 [![PyPI](https://img.shields.io/pypi/v/camera-ui-rpc?label=pypi&logo=pypi&logoColor=white)](https://pypi.org/project/camera-ui-rpc/)
@@ -8,11 +8,11 @@ A lightweight, NATS-based RPC framework powering communication across the camera
 
 Available for three runtimes:
 
-| Runtime | Package                                  |
-| ------- | --------------------------------------- |
-| Node    | `@camera.ui/rpc` (`./node`)             |
-| Go      | `github.com/cameraui/rpc/go` (`./go`)   |
-| Python  | `camera-ui-rpc` (`./python`)            |
+| Runtime | Package                               |
+| ------- | ------------------------------------- |
+| Node    | `@camera.ui/rpc` (`./node`)           |
+| Go      | `github.com/cameraui/rpc/go` (`./go`) |
+| Python  | `camera-ui-rpc` (`./python`)          |
 
 ---
 
