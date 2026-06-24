@@ -231,6 +231,10 @@ class RPCClientOptions(TypedDict):
     no_responder_retry: NotRequired[NoResponderRetryOptions]
     """Retry configuration for 503/no-responder errors."""
 
+    error_cb: NotRequired[ErrorCallback]
+    """Async callback for NATS transport errors. When omitted, transport errors are
+    swallowed (reconnect logic recovers transient failures; shutdown errors are noise)."""
+
 
 class RPCMessage(TypedDict):
     """RPC request message format."""

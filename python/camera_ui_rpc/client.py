@@ -13,7 +13,7 @@ from nats import (
     connect,  # pyright: ignore[reportUnknownVariableType]
     errors,
 )
-from nats.aio.client import NO_RESPONDERS_STATUS
+from nats.aio.client import NO_RESPONDERS_STATUS, ErrorCallback
 from nats.aio.client import Client as NATSClient
 from nats.aio.msg import Msg
 from nats.aio.subscription import Subscription
@@ -140,6 +140,24 @@ class RPCClient(RPCClientProtocol):
 
         return self.nc
 
+    def _make_error_cb(self) -> ErrorCallback:
+        """Build the NATS error callback.
+
+        nats-py's default callback dumps full tracebacks to stderr for every transport
+        hiccup. During shutdown the broker goes away under us, so connection-reset and
+        reconnect errors are expected and pure noise — swallow them. A consumer-provided
+        error_cb still wins outside that case.
+        """
+        user_cb: ErrorCallback | None = self.options.get("error_cb")
+
+        async def _error_cb(error: Exception) -> None:
+            if self._closed:
+                return
+            if user_cb is not None:
+                await user_cb(error)
+
+        return _error_cb
+
     async def _connect(self) -> NATSClient:
         """Internal connection method."""
         # Build connection options
@@ -153,6 +171,7 @@ class RPCClient(RPCClientProtocol):
             ),  # Convert to seconds
             # "no_echo": True,  # Don't echo messages back to the client
             "pending_size": 6 * 1024 * 1024,  # 6MB pending buffer
+            "error_cb": self._make_error_cb(),
         }
 
         # Add auth if provided
@@ -590,7 +609,9 @@ class RPCClient(RPCClientProtocol):
 
             return cast(Any, decoded)
         except TimeoutError as e:
-            raise create_error(ErrorCode.TIMEOUT, f"Request to {subject!r} timed out after {timeout or 5000}ms") from e
+            raise create_error(
+                ErrorCode.TIMEOUT, f"Request to {subject!r} timed out after {timeout or 5000}ms"
+            ) from e
         except Exception as e:
             if "no responders" in str(e).lower():
                 raise create_error(ErrorCode.NOT_FOUND, "No responders available") from e
@@ -635,7 +656,9 @@ class RPCClient(RPCClientProtocol):
             if request_id in self.pending_requests:
                 del self.pending_requests[request_id]
                 if not future.done():
-                    future.set_exception(errors.TimeoutError(f"RPC call to {subject!r} timed out after {timeout}ms"))
+                    future.set_exception(
+                        errors.TimeoutError(f"RPC call to {subject!r} timed out after {timeout}ms")
+                    )
 
         timeout_handle = asyncio.get_event_loop().call_later(timeout / 1000, handle_timeout)
 
@@ -708,12 +731,16 @@ class RPCClient(RPCClientProtocol):
             await unsubscribe_all()
             raise
 
-    def _handle_timeout(self, request_id: str, subject: str, future: asyncio.Future[Any], timeout: int) -> None:
+    def _handle_timeout(
+        self, request_id: str, subject: str, future: asyncio.Future[Any], timeout: int
+    ) -> None:
         """Handle request timeout."""
         if request_id in self.pending_requests:
             del self.pending_requests[request_id]
             if not future.done():
-                future.set_exception(create_error(ErrorCode.TIMEOUT, f"RPC call to {subject!r} timed out after {timeout}ms"))
+                future.set_exception(
+                    create_error(ErrorCode.TIMEOUT, f"RPC call to {subject!r} timed out after {timeout}ms")
+                )
 
     def _handle_rpc_response(self, data: Any) -> None:
         """Handle RPC response."""
