@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "camera-ui-rpc"
-version = "1.0.2"
+version = "1.0.3"
 description = "RPC Client for camera.ui"
 keywords = ["camera.ui", "python", "nats", "rpc"]
 readme = "README.md"
