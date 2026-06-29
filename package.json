@@ -42,7 +42,7 @@
     "@stylistic/eslint-plugin": "^5.10.0",
     "@types/node": "^26.0.1",
     "@typescript-eslint/parser": "^8.62.0",
-    "eslint": "9.39.2",
+    "eslint": "10.6.0",
     "globals": "^17.7.0",
     "prettier": "^3.9.1",
     "rimraf": "^6.1.3",
