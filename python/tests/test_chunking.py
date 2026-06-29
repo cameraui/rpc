@@ -189,18 +189,14 @@ def test_manager_normalizes_chunk_index_key() -> None:
         total_size=len(payload),
     )
     chunk = chunks[0]
-    manager.process_chunk(
-        {"transferId": "t1", "chunkIndex": chunk["index"], "data": chunk["data"]}
-    )
+    manager.process_chunk({"transferId": "t1", "chunkIndex": chunk["index"], "data": chunk["data"]})
     assert received == [value]
 
 
 def test_manager_cancel_invokes_error_callback() -> None:
     errors: list[Exception] = []
     manager = ChunkingManager()
-    manager.start_receiving(
-        "t1", 5, on_complete=lambda d: None, on_error=errors.append, total_size=100
-    )
+    manager.start_receiving("t1", 5, on_complete=lambda d: None, on_error=errors.append, total_size=100)
     manager.cancel("t1")
     assert len(errors) == 1
     assert isinstance(errors[0], RuntimeError)

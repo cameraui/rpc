@@ -368,7 +368,9 @@ async def handle_pull_callback_request(
             generator = async_wrapper_iter()
         else:
             invoker.active = False
-            raise create_error(ErrorCode.INTERNAL_ERROR, "Handler must return a generator for pull-callback iterator")
+            raise create_error(
+                ErrorCode.INTERNAL_ERROR, "Handler must return a generator for pull-callback iterator"
+            )
     else:
         loop = asyncio.get_event_loop()
         func = partial(handler, *args, invoker)
@@ -384,7 +386,9 @@ async def handle_pull_callback_request(
             generator = async_wrapper_sync_fn()
         else:
             invoker.active = False
-            raise create_error(ErrorCode.INTERNAL_ERROR, "Handler must return a generator for pull-callback iterator")
+            raise create_error(
+                ErrorCode.INTERNAL_ERROR, "Handler must return a generator for pull-callback iterator"
+            )
 
     if not hasattr(generator, "__aiter__"):
         invoker.active = False

@@ -78,10 +78,7 @@ async def main() -> None:
     batches_consumed = 0
     async for _ in proxy.pull_batches(BATCHES, CHUNKS, cbs):
         batches_consumed += 1
-        print(
-            f"Batch {batches_consumed - 1} boundary crossed "
-            f"(iteration {batches_consumed}/{BATCHES})"
-        )
+        print(f"Batch {batches_consumed - 1} boundary crossed (iteration {batches_consumed}/{BATCHES})")
 
     elapsed_ms = (time.perf_counter() - start) * 1000
 
@@ -99,8 +96,7 @@ async def main() -> None:
         and len(received) == BATCHES * CHUNKS
         and batch_ends == BATCHES
         and all(
-            r.get("batch") == i // CHUNKS and r.get("index") == i % CHUNKS
-            for i, r in enumerate(received)
+            r.get("batch") == i // CHUNKS and r.get("index") == i % CHUNKS for i, r in enumerate(received)
         )
     )
 

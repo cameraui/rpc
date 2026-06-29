@@ -87,7 +87,9 @@ async def main() -> None:
 
     print("\nResults")
     print(f"  Batches consumed on client:   {batches_consumed} (expected 3)")
-    print(f"  Batches produced on server:   {svc.produced_batches} (expected 3 or 4, tolerance for in-flight)")
+    print(
+        f"  Batches produced on server:   {svc.produced_batches} (expected 3 or 4, tolerance for in-flight)"
+    )
     print(f"  Chunks received before cancel: {chunks_before_cancel}")
     print(f"  Chunks received after cancel:  {chunks_after_cancel} (expected small, async drain)")
     print(f"  Server teardown count:         {svc.teardown_count} (expected 1)")

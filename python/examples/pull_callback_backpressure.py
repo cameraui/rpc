@@ -53,9 +53,7 @@ async def main() -> None:
     CHUNKS = 1000
     CLIENT_DELAY_MS = 500
 
-    stats: list[dict[str, Any]] = [
-        {"first_wall": -1, "last_wall": -1, "count": 0} for _ in range(BATCHES)
-    ]
+    stats: list[dict[str, Any]] = [{"first_wall": -1, "last_wall": -1, "count": 0} for _ in range(BATCHES)]
 
     def on_chunk(data: Any) -> None:
         if data is None:

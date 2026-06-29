@@ -206,9 +206,7 @@ async def run_python_server(targets: list[str]):
             if isinstance(data, list):
                 data = bytes(data)
             checksum = calculate_checksum(data)
-            print(
-                f"Data integrity check: {'PASSED' if checksum == large_data['checksum'] else 'FAILED'}"
-            )
+            print(f"Data integrity check: {'PASSED' if checksum == large_data['checksum'] else 'FAILED'}")
             if checksum != large_data["checksum"]:
                 failures += 1
 
@@ -225,8 +223,7 @@ async def run_python_server(targets: list[str]):
                 }
             )
             print(
-                f"{target} verification of our 20MB data: "
-                f"{'PASSED' if verify_result['valid'] else 'FAILED'}"
+                f"{target} verification of our 20MB data: {'PASSED' if verify_result['valid'] else 'FAILED'}"
             )
             if not verify_result["valid"]:
                 failures += 1

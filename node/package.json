@@ -25,11 +25,10 @@
     "build": "rimraf dist && tsc -p tsconfig.build.json",
     "format": "prettier --write 'src/' --ignore-unknown --no-error-on-unmatched-pattern",
     "install-updates": "npm i --save",
-    "lint": "eslint .",
-    "lint:fix": "eslint --fix .",
+    "lint": "eslint --fix .",
     "test": "vitest run",
     "prepack": "test -f externals/nats.js/core/src/mod.ts || { echo 'ERROR: nats.js fork source missing. Run: git submodule update --init --recursive'; exit 1; }",
-    "prepublishOnly": "npm i --package-lock-only && npm run lint:fix && npm run format && npm run build"
+    "prepublishOnly": "npm i --package-lock-only && npm run lint && npm run format && npm run build"
   },
   "dependencies": {
     "@nats-io/nats-core": "^3.4.0",
