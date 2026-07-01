@@ -7,6 +7,7 @@ export interface RPCClient {
   readonly isConnected: boolean;
   readonly isClosed: boolean;
   readonly maxPayloadSize: number;
+  readonly isStale: boolean;
   connect(options?: { signal?: AbortSignal }): Promise<NatsConnection>;
   disconnect(): Promise<void>;
   suspend(): Promise<void>;

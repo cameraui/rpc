@@ -78,6 +78,17 @@ export class RPCClient implements RPCClientImpl {
     return this.nc?.isClosed() === false;
   }
 
+  /**
+   * True when the connection is stale by wall-clock (heartbeat deadline passed
+   * while the timer was throttled/frozen in the background). Detects a dead
+   * socket on resume without waiting for the ping timeout to fire.
+   */
+  get isStale(): boolean {
+    // isStale() is a camera.ui fork addition not present on the published
+    const nc = this.nc as unknown as { isStale?: () => boolean } | undefined;
+    return nc?.isStale?.() ?? false;
+  }
+
   get isClosed(): boolean {
     return this.closed;
   }
