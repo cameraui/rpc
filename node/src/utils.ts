@@ -294,8 +294,9 @@ export function createServiceProxy<T extends object>(client: RPCClient, selected
   }) as Promisify<T>;
 }
 
-export function generateId(): string {
-  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+export function generateId(connId?: string): string {
+  const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  return connId ? `${connId}.${id}` : id;
 }
 
 export function sleep(ms: number): Promise<void> {

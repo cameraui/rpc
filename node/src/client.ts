@@ -34,6 +34,10 @@ export function createRPCClient(options: RPCClientOptions): RPCClientImpl {
   return new RPCClient(options);
 }
 
+function scopedInbox(connId?: string): string {
+  return createInbox(connId ? `_INBOX.${connId}` : undefined);
+}
+
 export class RPCClient implements RPCClientImpl {
   public readonly service = new RPCService(this);
   public chunkingManager = new ChunkingManager();
@@ -147,6 +151,7 @@ export class RPCClient implements RPCClientImpl {
       user: this.options.auth?.user,
       pass: this.options.auth?.password,
       name: this.options.name,
+      inboxPrefix: this.options.connId ? `_INBOX.${this.options.connId}` : undefined,
       reconnect: this.options.reconnect ?? true,
       maxPingOut: this.options.maxPingOut ?? 2,
       maxReconnectAttempts: this.options.maxReconnectAttempts ?? -1,
@@ -754,7 +759,7 @@ export class RPCClient implements RPCClientImpl {
       throw new Error('Not connected');
     }
 
-    const id = generateId();
+    const id = generateId(this.options.connId);
     const timeout = this.options.timeout ?? 30000;
     // Use different reply patterns for RPC vs service calls
     const replySubject = subject.startsWith('rpc.') ? `rpc.reply.${id}` : `${subject}.reply.${id}`;
@@ -843,7 +848,7 @@ export class RPCClient implements RPCClientImpl {
       try {
         unsubscribe = await this.subscribe(replySubject, handleRpcResponse);
 
-        const inbox = createInbox();
+        const inbox = scopedInbox(this.options.connId);
         sub = this.nc!.subscribe(inbox, {
           max: 1,
           callback: requestCallback,
@@ -999,12 +1004,12 @@ export class RPCClient implements RPCClientImpl {
       }
       if (!client.nc) throw new Error('Not connected');
 
-      id = generateId();
+      id = generateId(client.options.connId);
       streamSubject = `stream.${subject}.${id}`;
       client.streamHandlers.set(id, handler);
 
       unsubscribe = await client.subscribe(streamSubject, handleStreamMessage);
-      const inbox = createInbox();
+      const inbox = scopedInbox(client.options.connId);
       sub = client.nc.subscribe(inbox, { max: 1, callback: requestCallback });
 
       const streamParams = { __stream: true, __streamSubject: streamSubject, args };
@@ -1162,7 +1167,7 @@ export class RPCClient implements RPCClientImpl {
       }
       if (!client.nc) throw new Error('Not connected');
 
-      iteratorId = generateId();
+      iteratorId = generateId(client.options.connId);
       requestSubject = `_rpc.iterator.${iteratorId}.request`;
       responseSubject = `_rpc.iterator.${iteratorId}.response`;
 
@@ -1215,7 +1220,7 @@ export class RPCClient implements RPCClientImpl {
         }
       };
 
-      inbox = createInbox();
+      inbox = scopedInbox(client.options.connId);
       sub = client.nc.subscribe(inbox, { max: 1, callback: requestCallback });
     };
 
@@ -1387,7 +1392,7 @@ export class RPCClient implements RPCClientImpl {
       }
       if (!client.nc) throw new Error('Not connected');
 
-      iteratorId = generateId();
+      iteratorId = generateId(client.options.connId);
       requestSubject = `_rpc.iterator.${iteratorId}.request`;
       responseSubject = `_rpc.iterator.${iteratorId}.response`;
       callbackSubject = `_rpc.cb.${iteratorId}`;
@@ -1480,7 +1485,7 @@ export class RPCClient implements RPCClientImpl {
         }
       };
 
-      inbox = createInbox();
+      inbox = scopedInbox(client.options.connId);
       sub = client.nc.subscribe(inbox, { max: 1, callback: requestCallback });
     };
 
@@ -1586,7 +1591,7 @@ export class RPCClient implements RPCClientImpl {
       throw new Error('Not connected');
     }
 
-    const id = generateId();
+    const id = generateId(this.options.connId);
     const callbackSubject = `rpc.cb.${id}`;
 
     // Subscribe to callback messages

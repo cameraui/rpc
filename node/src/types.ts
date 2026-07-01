@@ -68,6 +68,11 @@ export interface RPCClientOptions {
   /** Client name for identification */
   name: string;
 
+  /** Per-connection isolation token. When set, it is folded as a fixed-position
+   *  token into every caller-generated reply/callback/stream/iterator subject
+   */
+  connId?: string;
+
   /** Authentication credentials */
   auth?: RPCAuthOptions;
 
