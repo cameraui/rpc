@@ -15,9 +15,10 @@ type Channel struct {
 	channelID string
 	subject   string
 
-	mu     sync.RWMutex
-	closed bool
-	unsub  func()
+	mu            sync.RWMutex
+	closed        bool
+	unsub         func()
+	requestUnsubs []func()
 
 	onMessage func(data any)
 	onClose   func()
@@ -109,8 +110,16 @@ func (ch *Channel) Request(ctx context.Context, data any, timeout ...time.Durati
 }
 
 // OnRequest registers a handler for request/reply on this channel.
+// The subscription is tracked so Close()/cleanup releases it.
 func (ch *Channel) OnRequest(handler func(data []byte) (any, error)) (func(), error) {
-	return ch.client.OnRequest(ch.subject+".request", handler)
+	unsub, err := ch.client.OnRequest(ch.subject+".request", handler)
+	if err != nil {
+		return nil, err
+	}
+	ch.mu.Lock()
+	ch.requestUnsubs = append(ch.requestUnsubs, unsub)
+	ch.mu.Unlock()
+	return unsub, nil
 }
 
 // OnMessage sets the callback for incoming messages.
@@ -165,6 +174,15 @@ func (ch *Channel) cleanup() error {
 	ch.onClose = nil
 	ch.onError = nil
 
+	// Release request/reply subscriptions collected via OnRequest.
+	ch.mu.Lock()
+	requestUnsubs := ch.requestUnsubs
+	ch.requestUnsubs = nil
+	ch.mu.Unlock()
+	for _, unsub := range requestUnsubs {
+		unsub()
+	}
+
 	if ch.unsub != nil {
 		ch.unsub()
 		ch.unsub = nil
@@ -187,6 +205,7 @@ type PrivateChannel struct {
 	mu             sync.RWMutex
 	closed         bool
 	unsub          func()
+	requestUnsubs  []func()
 	remoteClientID string
 
 	onMessage func(data any)
@@ -343,11 +362,19 @@ func (ch *PrivateChannel) Request(ctx context.Context, data any, timeout ...time
 }
 
 // OnRequest registers a handler for request/reply on this private channel.
+// The subscription is tracked so Close()/cleanup releases it.
 func (ch *PrivateChannel) OnRequest(handler func(data []byte) (any, error)) (func(), error) {
 	ids := []string{ch.clientID, ch.targetClientID}
 	sort.Strings(ids)
 	subject := fmt.Sprintf("channel.private.%s.%s.request", ch.channelID, strings.Join(ids, "."))
-	return ch.client.OnRequest(subject, handler)
+	unsub, err := ch.client.OnRequest(subject, handler)
+	if err != nil {
+		return nil, err
+	}
+	ch.mu.Lock()
+	ch.requestUnsubs = append(ch.requestUnsubs, unsub)
+	ch.mu.Unlock()
+	return unsub, nil
 }
 
 // OnMessage sets the callback for incoming messages.
@@ -409,6 +436,15 @@ func (ch *PrivateChannel) cleanup() error {
 	ch.onMessage = nil
 	ch.onClose = nil
 	ch.onError = nil
+
+	// Release request/reply subscriptions collected via OnRequest.
+	ch.mu.Lock()
+	requestUnsubs := ch.requestUnsubs
+	ch.requestUnsubs = nil
+	ch.mu.Unlock()
+	for _, unsub := range requestUnsubs {
+		unsub()
+	}
 
 	if ch.unsub != nil {
 		ch.unsub()

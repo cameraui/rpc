@@ -8,7 +8,7 @@ import { RPCException, createError } from './errors.js';
 import { formatErrorObject, handleCallbackRequest, handleNormalRPC, handlePullCallbackRequest, handlePullIteratorRequest, handleStreamRequest } from './handler.js';
 import { RPCService } from './service.js';
 import { ERROR_CODES } from './types.js';
-import { createProxy, createServiceProxy, generateId, isPromise, sleep } from './utils.js';
+import { createProxy, createServiceProxy, generateId, sleep } from './utils.js';
 
 import type { Msg, MsgHdrs, NatsConnection, Status, Subscription } from '@nats-io/nats-core';
 import type { ServiceInfo } from '@nats-io/services';
@@ -34,6 +34,13 @@ export function createRPCClient(options: RPCClientOptions): RPCClientImpl {
   return new RPCClient(options);
 }
 
+interface SubscriptionEntry {
+  pattern: string;
+  handler: (data: any) => void | Promise<void>;
+  options?: { queue?: string };
+  sub?: Subscription;
+}
+
 function scopedInbox(connId?: string): string {
   return createInbox(connId ? `_INBOX.${connId}` : undefined);
 }
@@ -45,8 +52,9 @@ export class RPCClient implements RPCClientImpl {
   private callbackCleanups = new Map<string, () => Promise<void>>();
 
   private nc?: NatsConnection;
-  private subscriptions = new Map<string, Subscription[]>();
-  private _subscriptionMeta = new Map<string, { pattern: string; handler: (data: any) => void | Promise<void>; options?: { queue?: string } }>();
+  private subscriptionSeq = 0;
+  private subscriptionEntries = new Map<number, SubscriptionEntry>();
+  private pullIteratorSettles = new Set<() => void>();
   private _maxPayloadSize: number = 1024 * 1024; // Default 1MB
   private connectionPromise?: Promise<NatsConnection>;
   private closed = false;
@@ -59,6 +67,7 @@ export class RPCClient implements RPCClientImpl {
       resolve: (value: any) => void;
       reject: (error: any) => void;
       timeout?: NodeJS.Timeout;
+      cleanup?: () => void;
     }
   >();
 
@@ -191,6 +200,11 @@ export class RPCClient implements RPCClientImpl {
       this.connectionPromise = undefined;
     }
 
+    // A client that was disconnect()ed or abortClose()d is revivable by an
+    // explicit connect(). Without this reset, auto-connect in _callOnce and
+    // the no-responder retry loop stay permanently disabled.
+    this.closed = false;
+
     this.service.init(this.nc);
 
     // Get max_payload from server info
@@ -204,12 +218,11 @@ export class RPCClient implements RPCClientImpl {
     // Reserve 8KB for NATS protocol overhead and MsgPack envelope per message
     this._maxPayloadSize = this._maxPayloadSize - 8192;
 
-    // Restore subscriptions after reconnect (from suspend)
-    if (this._subscriptionMeta.size > 0) {
-      const metas = [...this._subscriptionMeta.values()];
-      this._subscriptionMeta.clear();
-      for (const meta of metas) {
-        await this.subscribe(meta.pattern, meta.handler, meta.options);
+    // Restore subscriptions after reconnect (from suspend). Entries keep
+    // their identity so unsubscribe closures held by callers stay valid.
+    for (const entry of this.subscriptionEntries.values()) {
+      if (!entry.sub || entry.sub.isClosed()) {
+        this.natsSubscribe(entry);
       }
     }
 
@@ -228,6 +241,7 @@ export class RPCClient implements RPCClientImpl {
       if (pending.timeout) {
         clearTimeout(pending.timeout);
       }
+      pending.cleanup?.();
       pending.reject(createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed'));
     }
     this.pendingRequests.clear();
@@ -242,6 +256,8 @@ export class RPCClient implements RPCClientImpl {
     }
     this.streamHandlers.clear();
 
+    this.settlePullIterators();
+
     await Promise.allSettled(Array.from(this.pullIteratorCleanups.values()).map((cleanup) => cleanup()));
     this.pullIteratorCleanups.clear();
 
@@ -250,23 +266,21 @@ export class RPCClient implements RPCClientImpl {
     this.callbackCleanups.clear();
 
     // Unsubscribe all subscriptions
-    for (const subs of this.subscriptions.values()) {
-      for (const sub of subs) {
-        try {
-          sub.unsubscribe();
-        } catch {
-          // Ignore errors during cleanup
-        }
+    for (const entry of this.subscriptionEntries.values()) {
+      try {
+        entry.sub?.unsubscribe();
+      } catch {
+        // Ignore errors during cleanup
       }
     }
-    this.subscriptions.clear();
-    this._subscriptionMeta.clear();
+    this.subscriptionEntries.clear();
 
     // Clear chunking manager
     this.chunkingManager = new ChunkingManager();
 
     // Disconnect isolated clients
     await Promise.allSettled(this.isolatedClients.map((client) => client.disconnect()));
+    this.isolatedClients = [];
 
     // Drain and close connection
     if (this.nc) {
@@ -319,6 +333,11 @@ export class RPCClient implements RPCClientImpl {
    *
    * For a forced switch (e.g. endpoint host changed), use suspend() +
    * reconfigure() + connect() instead.
+   *
+   * Limitation: has no effect on a connect() that is still dialing its FIRST
+   * connection (waitOnFirstConnect) — the dial loop captured the server list
+   * at connect() time. Tear the client down (abortClose) and build a fresh
+   * one to redirect an initial dial.
    */
   public setServers(servers: string[]): void {
     this.options.servers = servers;
@@ -362,6 +381,7 @@ export class RPCClient implements RPCClientImpl {
     this.closed = true;
     for (const [, pending] of this.pendingRequests) {
       if (pending.timeout) clearTimeout(pending.timeout);
+      pending.cleanup?.();
       pending.reject(createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed'));
     }
     this.pendingRequests.clear();
@@ -374,6 +394,8 @@ export class RPCClient implements RPCClientImpl {
       }
     }
     this.streamHandlers.clear();
+
+    this.settlePullIterators();
 
     for (const cleanup of this.pullIteratorCleanups.values()) {
       try {
@@ -400,6 +422,7 @@ export class RPCClient implements RPCClientImpl {
         // ignore
       }
     }
+    this.isolatedClients = [];
     const nc = this.nc as unknown as { abortClose?: (e?: Error) => void; close: () => Promise<void> } | undefined;
     if (nc) {
       try {
@@ -422,11 +445,14 @@ export class RPCClient implements RPCClientImpl {
    * After calling suspend(), connect() will restore previous subscriptions.
    */
   public async suspend(): Promise<void> {
-    // Cleanup pending requests
+    // Cleanup pending requests. pending.cleanup drops the reply-subscription
+    // entry too — otherwise a suspended in-flight call would be restored as a
+    // dead rpc.reply.* subscription on the next connect().
     for (const [, pending] of this.pendingRequests) {
       if (pending.timeout) {
         clearTimeout(pending.timeout);
       }
+      pending.cleanup?.();
       pending.reject(createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed'));
     }
     this.pendingRequests.clear();
@@ -441,6 +467,8 @@ export class RPCClient implements RPCClientImpl {
     }
     this.streamHandlers.clear();
 
+    this.settlePullIterators();
+
     await Promise.allSettled(Array.from(this.pullIteratorCleanups.values()).map((cleanup) => cleanup()));
     this.pullIteratorCleanups.clear();
 
@@ -448,17 +476,16 @@ export class RPCClient implements RPCClientImpl {
     await Promise.allSettled(Array.from(this.callbackCleanups.values()).map((cleanup) => cleanup()));
     this.callbackCleanups.clear();
 
-    // Unsubscribe all subscriptions
-    for (const subs of this.subscriptions.values()) {
-      for (const sub of subs) {
-        try {
-          sub.unsubscribe();
-        } catch {
-          // Ignore errors during cleanup
-        }
+    // Unsubscribe all subscriptions but keep the entries — connect() restores
+    // them on the fresh transport.
+    for (const entry of this.subscriptionEntries.values()) {
+      try {
+        entry.sub?.unsubscribe();
+      } catch {
+        // Ignore errors during cleanup
       }
+      entry.sub = undefined;
     }
-    this.subscriptions.clear();
 
     // Clear chunking manager
     this.chunkingManager = new ChunkingManager();
@@ -552,27 +579,43 @@ export class RPCClient implements RPCClientImpl {
       throw new Error('Not connected');
     }
 
-    // Serialize async handlers via a per-subscription promise chain. This
-    // matches Python's behavior (client.py:434 awaits the handler) and is
-    // what backpressure-sensitive callers (e.g. pull-callback iterators)
-    // rely on: an awaiting handler blocks the next message from being
-    // dispatched, which transitively stalls the producer.
-    //
-    // Sync handlers bypass the chain and stay fire-and-forget.
+    const key = ++this.subscriptionSeq;
+    const entry: SubscriptionEntry = { pattern, handler: handler as (data: any) => void | Promise<void>, options };
+    this.subscriptionEntries.set(key, entry);
+    this.natsSubscribe(entry);
+
+    const unsubscribe = () => {
+      try {
+        entry.sub?.unsubscribe();
+      } catch {
+        // Ignore unsubscribe errors
+      } finally {
+        this.subscriptionEntries.delete(key);
+      }
+    };
+
+    // Return unsubscribe function
+    return unsubscribe;
+  }
+
+  /**
+   * Create the NATS subscription for an entry. Called from subscribe() and
+   * again from connect() when restoring entries after a suspend cycle.
+   */
+  private natsSubscribe(entry: SubscriptionEntry): void {
+    const { pattern } = entry;
+
+    // Serialize handlers via a per-subscription promise chain. This matches
+    // Python's behavior (client.py:434 awaits the handler) and is what
+    // backpressure-sensitive callers rely on: an awaiting handler blocks the
+    // next message from being dispatched, which transitively stalls the
+    // producer. The handler itself is invoked INSIDE the chain — invoking it
+    // eagerly and only chaining the completion would run handlers
+    // concurrently and out of order.
     let handlerChain: Promise<void> = Promise.resolve();
 
-    const runHandler = (data: TResponse) => {
-      let result: void | Promise<void>;
-      try {
-        result = handler(data);
-      } catch (error) {
-        console.error(`Error in handler for ${pattern}:`, error);
-        return;
-      }
-      if (isPromise(result)) {
-        const pending = result;
-        handlerChain = handlerChain.then(() => pending).catch((error) => console.error(`Error in handler for ${pattern}:`, error));
-      }
+    const runHandler = (data: unknown) => {
+      handlerChain = handlerChain.then(() => entry.handler(data)).catch((error) => console.error(`Error in handler for ${pattern}:`, error));
     };
 
     const processMessage = (err: Error | null, msg: Msg) => {
@@ -599,7 +642,7 @@ export class RPCClient implements RPCClientImpl {
             data.transferId,
             data.totalChunks,
             (assembledData) => {
-              runHandler(assembledData as TResponse);
+              runHandler(assembledData);
             },
             (error) => {
               console.error(`Error assembling chunks for ${pattern}:`, error);
@@ -634,26 +677,26 @@ export class RPCClient implements RPCClientImpl {
       }
     };
 
-    const sub = this.nc.subscribe(pattern, {
-      ...(options?.queue ? { queue: options.queue } : {}),
+    entry.sub = this.nc!.subscribe(pattern, {
+      ...(entry.options?.queue ? { queue: entry.options.queue } : {}),
       callback: processMessage,
     });
-    this.subscriptions.set(pattern, [sub]);
-    this._subscriptionMeta.set(pattern, { pattern, handler, options });
+  }
 
-    const unsubscribe = () => {
+  /**
+   * Force-settle every client-side pull iterator parked in next(). Runs on
+   * disconnect/suspend/abortClose so consumers' `for await` loops terminate
+   * with a connection error instead of hanging forever.
+   */
+  private settlePullIterators(): void {
+    for (const settle of [...this.pullIteratorSettles]) {
       try {
-        sub.unsubscribe();
+        settle();
       } catch {
-        // Ignore unsubscribe errors
-      } finally {
-        this.subscriptions.delete(pattern);
-        this._subscriptionMeta.delete(pattern);
+        // ignore
       }
-    };
-
-    // Return unsubscribe function
-    return unsubscribe;
+    }
+    this.pullIteratorSettles.clear();
   }
 
   /**
@@ -780,21 +823,6 @@ export class RPCClient implements RPCClientImpl {
       let sub: Subscription | undefined;
       let unsubscribe: (() => void) | undefined;
 
-      // Setup timeout
-      const timeoutHandle = setTimeout(() => {
-        if (this.pendingRequests.has(id)) {
-          this.pendingRequests.delete(id);
-          reject(createError(ERROR_CODES.TIMEOUT, `RPC call to "${subject}" timed out after ${timeout}ms`));
-        }
-      }, timeout);
-
-      // Store pending request
-      this.pendingRequests.set(id, {
-        resolve,
-        reject,
-        timeout: timeoutHandle,
-      });
-
       // Unsubscribe function to clean up
       const unsubscribeAll = async () => {
         if (this.pendingRequests.has(id)) {
@@ -815,6 +843,25 @@ export class RPCClient implements RPCClientImpl {
 
         unsubscribe?.();
       };
+
+      // Setup timeout. Must tear down the reply/inbox subscriptions too —
+      // a timed-out call otherwise leaks both for the client's lifetime
+      // (and they'd be restored again on every reconnect).
+      const timeoutHandle = setTimeout(() => {
+        if (this.pendingRequests.has(id)) {
+          this.pendingRequests.delete(id);
+          void unsubscribeAll();
+          reject(createError(ERROR_CODES.TIMEOUT, `RPC call to "${subject}" timed out after ${timeout}ms`));
+        }
+      }, timeout);
+
+      // Store pending request
+      this.pendingRequests.set(id, {
+        resolve,
+        reject,
+        timeout: timeoutHandle,
+        cleanup: () => void unsubscribeAll(),
+      });
 
       // Subscribe to reply
       const handleRpcResponse = async (data: any) => {
@@ -1150,9 +1197,30 @@ export class RPCClient implements RPCClientImpl {
       }
     };
 
+    // Registered with the client for the iterator's lifetime: a next() parked
+    // on the response resolver must be force-settled when the connection is
+    // torn down (disconnect/suspend/abortClose), or the consumer's `for await`
+    // hangs forever.
+    const settleOnDisconnect = (): void => {
+      if (!ended) {
+        ended = true;
+        error = createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed');
+      }
+      const r = responseResolver;
+      if (r) {
+        responseResolver = null;
+        if (error) {
+          r({ id: iteratorId, type: 'error', error: error.toJSON?.() ?? { code: ERROR_CODES.CONNECTION_CLOSED, message: 'Connection closed' } });
+        } else {
+          r({ id: iteratorId, type: 'done' });
+        }
+      }
+    };
+
     const cleanupOnce = async (): Promise<void> => {
       if (cleanedUp) return;
       cleanedUp = true;
+      client.pullIteratorSettles.delete(settleOnDisconnect);
       responseUnsub?.();
       if (sub && !sub.isClosed()) {
         try {
@@ -1177,6 +1245,8 @@ export class RPCClient implements RPCClientImpl {
         await client.connect();
       }
       if (!client.nc) throw new Error('Not connected');
+
+      client.pullIteratorSettles.add(settleOnDisconnect);
 
       iteratorId = generateId(client.options.connId);
       requestSubject = `_rpc.iterator.${iteratorId}.request`;
@@ -1374,9 +1444,28 @@ export class RPCClient implements RPCClientImpl {
       }
     };
 
+    // See callPullIterator: force-settle a parked next() on connection
+    // teardown so the consumer's `for await` terminates instead of hanging.
+    const settleOnDisconnect = (): void => {
+      if (!ended) {
+        ended = true;
+        error = createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed');
+      }
+      const r = responseResolver;
+      if (r) {
+        responseResolver = null;
+        if (error) {
+          r({ id: iteratorId, type: 'error', error: error.toJSON?.() ?? { code: ERROR_CODES.CONNECTION_CLOSED, message: 'Connection closed' } });
+        } else {
+          r({ id: iteratorId, type: 'done' });
+        }
+      }
+    };
+
     const cleanupOnce = async (): Promise<void> => {
       if (cleanedUp) return;
       cleanedUp = true;
+      client.pullIteratorSettles.delete(settleOnDisconnect);
       callbackUnsub?.();
       responseUnsub?.();
       if (sub && !sub.isClosed()) {
@@ -1402,6 +1491,8 @@ export class RPCClient implements RPCClientImpl {
         await client.connect();
       }
       if (!client.nc) throw new Error('Not connected');
+
+      client.pullIteratorSettles.add(settleOnDisconnect);
 
       iteratorId = generateId(client.options.connId);
       requestSubject = `_rpc.iterator.${iteratorId}.request`;
@@ -1671,6 +1762,7 @@ export class RPCClient implements RPCClientImpl {
 
     const unsubscribers: (() => void)[] = [];
     const pullIteratorIds: string[] = [];
+    const callbackIds: string[] = [];
 
     // Extract methods based on option
     const handlersMap = options?.withoutDecorators ? extractNestedMethodsWithoutDecorators(handlers) : extractNestedMethodsWithDecorators(handlers);
@@ -1706,7 +1798,7 @@ export class RPCClient implements RPCClientImpl {
               const pullParams = msg.params?.__pullIterator ? msg.params : msg.params[0];
               const args = pullParams.args ?? [];
               const iteratorId = pullParams.__iteratorId ?? msg.id;
-              const cleanup = await handlePullIteratorRequest(handler, args, iteratorId, client);
+              const cleanup = await handlePullIteratorRequest(handler, args, iteratorId, client, () => client.pullIteratorCleanups.delete(iteratorId));
 
               // Store cleanup function for later
               client.pullIteratorCleanups.set(iteratorId, cleanup);
@@ -1728,7 +1820,9 @@ export class RPCClient implements RPCClientImpl {
               const callbackMethods: string[] = pcParams.__callbackMethods ?? [];
               const onewayMethods: string[] = pcParams.__onewayMethods ?? [];
 
-              const cleanup = await handlePullCallbackRequest(handler, args, iteratorId, callbackSubject, callbackMethods, onewayMethods, client);
+              const cleanup = await handlePullCallbackRequest(handler, args, iteratorId, callbackSubject, callbackMethods, onewayMethods, client, () =>
+                client.pullIteratorCleanups.delete(iteratorId),
+              );
 
               client.pullIteratorCleanups.set(iteratorId, cleanup);
               pullIteratorIds.push(iteratorId);
@@ -1746,8 +1840,9 @@ export class RPCClient implements RPCClientImpl {
               const callbackSubject = cbParams.__callbackSubject;
               const cbArgs = cbParams.args ?? [];
 
-              const cleanup = await handleCallbackRequest(handler, cbArgs, callbackSubject, msg.id, client);
+              const cleanup = await handleCallbackRequest(handler, cbArgs, callbackSubject, msg.id, client, () => client.callbackCleanups.delete(msg.id));
               client.callbackCleanups.set(msg.id, cleanup);
+              callbackIds.push(msg.id);
 
               response.result = { ok: true };
               const replySubject = `rpc.reply.${msg.id}`;
@@ -1788,19 +1883,23 @@ export class RPCClient implements RPCClientImpl {
         unsub();
       }
 
-      // Cleanup pull iterators
+      // Cleanup pull iterators — only the ones this namespace created. The
+      // client maps are shared across registerHandler calls; sweeping them
+      // wholesale would kill the live sessions of every other namespace.
       await Promise.allSettled(
-        Array.from(client.pullIteratorCleanups.entries()).map(([id, cleanup]) => {
+        pullIteratorIds.map((id) => {
+          const fn = client.pullIteratorCleanups.get(id);
           client.pullIteratorCleanups.delete(id);
-          return cleanup();
+          return fn ? fn() : Promise.resolve();
         }),
       );
 
       // Cleanup callbacks
       await Promise.allSettled(
-        Array.from(client.callbackCleanups.entries()).map(([id, cleanup]) => {
+        callbackIds.map((id) => {
+          const fn = client.callbackCleanups.get(id);
           client.callbackCleanups.delete(id);
-          return cleanup();
+          return fn ? fn() : Promise.resolve();
         }),
       );
 

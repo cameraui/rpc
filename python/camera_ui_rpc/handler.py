@@ -170,6 +170,7 @@ async def handle_pull_iterator_request(
     iterator_id: str,
     client: RPCClient,
     io_pool: ThreadPoolExecutor,
+    on_finished: Callable[[], Any] | None = None,
 ) -> Callable[[], Coroutine[Any, Any, None]]:
     """Handle pull-based iterator request."""
     generator: AsyncGenerator[Any, None]
@@ -229,7 +230,28 @@ async def handle_pull_iterator_request(
 
     # Track if iterator is active
     active = True
-    unsub_func = None
+    finished = False
+    unsub_func: Callable[[], Coroutine[Any, Any, None]] | None = None
+
+    def finish() -> None:
+        """Natural end (done/cancel/error): drop the request subscription and
+        let the owner remove its cleanup-map entry via on_finished. Without
+        this, every finished session leaves its `_rpc.iterator.*.request`
+        subscription and cleanup closure behind until the whole client
+        disconnects. The unsubscribe is scheduled as a task —
+        Subscription.unsubscribe() cancels the message task this handler runs
+        in, so it must not be awaited from here.
+        """
+        nonlocal active, finished
+        if finished:
+            return
+        finished = True
+        active = False
+        if on_finished is not None:
+            with contextlib.suppress(Exception):
+                on_finished()
+        if unsub_func is not None:
+            asyncio.create_task(unsub_func())
 
     # Subscribe to iterator requests
     async def handle_pull_request(msg: PullIteratorRequest) -> None:
@@ -248,7 +270,10 @@ async def handle_pull_iterator_request(
                     "id": iterator_id,
                     "type": "done",
                 }
-                await client.publish(response_subject, response)
+                try:
+                    await client.publish(response_subject, response)
+                finally:
+                    finish()
             elif msg.get("type") == "next":
                 try:
                     value = await generator.__anext__()
@@ -264,7 +289,10 @@ async def handle_pull_iterator_request(
                         "id": iterator_id,
                         "type": "done",
                     }
-                    await client.publish(response_subject, done_response)
+                    try:
+                        await client.publish(response_subject, done_response)
+                    finally:
+                        finish()
 
         except Exception as e:
             active = False
@@ -273,14 +301,18 @@ async def handle_pull_iterator_request(
                 "type": "error",
                 "error": format_error_dict(e),
             }
-            await client.publish(response_subject, error_response)
+            try:
+                await client.publish(response_subject, error_response)
+            finally:
+                finish()
 
     unsub_func = await client.subscribe(request_subject, handle_pull_request)
 
     # Return cleanup function
     async def cleanup() -> None:
-        nonlocal active
+        nonlocal active, finished
         active = False
+        finished = True
         if unsub_func is not None:
             await unsub_func()
         # Ensure generator is closed
@@ -330,6 +362,7 @@ async def handle_pull_callback_request(
     oneway_methods: list[str],
     client: RPCClient,
     io_pool: ThreadPoolExecutor,
+    on_finished: Callable[[], Any] | None = None,
 ) -> Callable[[], Coroutine[Any, Any, None]]:
     """Handle a pull-iterator-with-callbacks request.
 
@@ -398,7 +431,26 @@ async def handle_pull_callback_request(
     response_subject = f"_rpc.iterator.{iterator_id}.response"
 
     active = True
+    finished = False
     unsub_func: Callable[[], Coroutine[Any, Any, None]] | None = None
+
+    def finish() -> None:
+        """Natural end: see handle_pull_iterator_request — drop the request
+        subscription and the owner's cleanup-map entry per finished session.
+        Unsubscribe is scheduled as a task because Subscription.unsubscribe()
+        cancels the message task this handler runs in.
+        """
+        nonlocal active, finished
+        if finished:
+            return
+        finished = True
+        active = False
+        invoker.active = False
+        if on_finished is not None:
+            with contextlib.suppress(Exception):
+                on_finished()
+        if unsub_func is not None:
+            asyncio.create_task(unsub_func())
 
     async def handle_pull_request(msg: PullIteratorRequest) -> None:
         nonlocal active
@@ -416,7 +468,10 @@ async def handle_pull_callback_request(
                     "id": iterator_id,
                     "type": "done",
                 }
-                await client.publish(response_subject, response)
+                try:
+                    await client.publish(response_subject, response)
+                finally:
+                    finish()
             elif msg.get("type") == "next":
                 try:
                     # Drive the generator to its next yield. The yielded
@@ -434,7 +489,10 @@ async def handle_pull_callback_request(
                         "id": iterator_id,
                         "type": "done",
                     }
-                    await client.publish(response_subject, done_response)
+                    try:
+                        await client.publish(response_subject, done_response)
+                    finally:
+                        finish()
 
         except Exception as e:
             active = False
@@ -444,13 +502,17 @@ async def handle_pull_callback_request(
                 "type": "error",
                 "error": format_error_dict(e),
             }
-            await client.publish(response_subject, error_response)
+            try:
+                await client.publish(response_subject, error_response)
+            finally:
+                finish()
 
     unsub_func = await client.subscribe(request_subject, handle_pull_request)
 
     async def cleanup() -> None:
-        nonlocal active
+        nonlocal active, finished
         active = False
+        finished = True
         invoker.active = False
         if unsub_func is not None:
             await unsub_func()
@@ -468,6 +530,7 @@ async def handle_callback_request(
     request_id: str,
     client: RPCClient,
     io_pool: ThreadPoolExecutor,
+    on_finished: Callable[[], Any] | None = None,
 ) -> Callable[[], Coroutine[Any, Any, None]]:
     """Handle callback subscription request."""
 
@@ -510,9 +573,26 @@ async def handle_callback_request(
             else:
                 handler_cleanup()
 
+    # Handler cleanup must run exactly once — the cancel message and a later
+    # register_handler/disconnect cleanup would otherwise both invoke it.
+    cleaned_up = False
+
+    async def run_handler_cleanup() -> None:
+        nonlocal cleaned_up
+        if cleaned_up:
+            return
+        cleaned_up = True
+        await invoke_cleanup()
+
     # Subscribe to cancel subject
     async def on_cancel(_msg: Any) -> None:
-        await invoke_cleanup()
+        if on_finished is not None:
+            with contextlib.suppress(Exception):
+                on_finished()
+        await run_handler_cleanup()
+        # Unsubscribe outside this callback's own message task —
+        # Subscription.unsubscribe() cancels the task it is called from.
+        asyncio.create_task(cancel_unsub())
 
     cancel_unsub = await client.subscribe(
         f"{callback_subject}.cancel",
@@ -522,6 +602,6 @@ async def handle_callback_request(
     # Return combined cleanup
     async def cleanup() -> None:
         await cancel_unsub()
-        await invoke_cleanup()
+        await run_handler_cleanup()
 
     return cleanup

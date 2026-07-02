@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/nats-io/nats.go"
 )
@@ -240,8 +241,18 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 
 	ch := make(chan PullValue, 1)
 
+	// Registered with the client for the iterator's lifetime: a consumer
+	// parked in a next() wait must be force-settled when the connection is
+	// torn down (Disconnect/Suspend), or it hangs forever.
+	disconnected := make(chan struct{})
+	var settleOnce sync.Once
+	c.pullIteratorSettles.Store(iteratorID, func() {
+		settleOnce.Do(func() { close(disconnected) })
+	})
+
 	go func() {
 		defer close(ch)
+		defer c.pullIteratorSettles.Delete(iteratorID)
 
 		// Subscribe to responses
 		respCh := make(chan PullIteratorResponse, 8)
@@ -267,6 +278,17 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 			_ = c.Publish(requestSubject, cancelReq)
 		}
 
+		// sendDisconnected delivers the connection error to a parked
+		// consumer without blocking; if nobody is waiting, the closed
+		// channel terminates the consumer's range loop instead.
+		sendDisconnected := func() {
+			ended = true
+			select {
+			case ch <- PullValue{Error: NewRPCException(ErrCodeConnectionClosed, "Connection closed")}:
+			default:
+			}
+		}
+
 		// sendToConsumer wraps a channel send in a ctx-aware select so
 		// a consumer that has stopped reading doesn't permanently park
 		// the goroutine. See client_pull_callback.go for rationale.
@@ -276,6 +298,9 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 				return true
 			case <-ctx.Done():
 				sendCancel()
+				ended = true
+				return false
+			case <-disconnected:
 				ended = true
 				return false
 			}
@@ -315,6 +340,9 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 			case <-ctx.Done():
 				sendCancel()
 				ended = true
+				return
+			case <-disconnected:
+				sendDisconnected()
 				return
 			}
 		}

@@ -104,30 +104,54 @@ export class ChunkAssembler {
  * Manager for handling multiple chunk transfers
  */
 export class ChunkingManager {
+  private static readonly STALE_TRANSFER_TTL_MS = 30_000;
+
   private assemblers = new Map<string, ChunkAssembler>();
   private completedCallbacks = new Map<string, (data: any) => void>();
   private errorCallbacks = new Map<string, (error: Error) => void>();
+  private lastActivity = new Map<string, number>();
 
   /**
    * Start receiving chunks for a transfer.
    * Pre-allocates buffer for direct chunk writing.
    */
   public startReceiving(id: string, totalChunks: number, onComplete: (data: any) => void, onError: (error: Error) => void, totalSize: number, chunkSize?: number): void {
+    this.sweepStale();
     const assembler = new ChunkAssembler(id, totalSize, totalChunks, chunkSize);
     this.assemblers.set(id, assembler);
     this.completedCallbacks.set(id, onComplete);
     this.errorCallbacks.set(id, onError);
+    this.lastActivity.set(id, Date.now());
+  }
+
+  private sweepStale(): void {
+    if (this.lastActivity.size === 0) return;
+    const cutoff = Date.now() - ChunkingManager.STALE_TRANSFER_TTL_MS;
+    for (const [id, activity] of this.lastActivity) {
+      if (activity < cutoff) {
+        const errorCallback = this.errorCallbacks.get(id);
+        this.assemblers.delete(id);
+        this.completedCallbacks.delete(id);
+        this.errorCallbacks.delete(id);
+        this.lastActivity.delete(id);
+        if (errorCallback) {
+          errorCallback(new Error('Transfer timed out'));
+        }
+      }
+    }
   }
 
   /**
    * Process an incoming chunk
    */
   public processChunk(chunk: ChunkMessage): void {
+    this.sweepStale();
     const assembler = this.assemblers.get(chunk.id);
     if (!assembler) {
       console.warn(`Received chunk for unknown transfer: ${chunk.id}`);
       return;
     }
+    this.lastActivity.set(chunk.id, Date.now());
 
     try {
       const isComplete = assembler.addChunk(chunk);
@@ -139,6 +163,7 @@ export class ChunkingManager {
         this.assemblers.delete(chunk.id);
         this.completedCallbacks.delete(chunk.id);
         this.errorCallbacks.delete(chunk.id);
+        this.lastActivity.delete(chunk.id);
 
         // Notify completion
         if (callback) {
@@ -152,6 +177,7 @@ export class ChunkingManager {
       this.assemblers.delete(chunk.id);
       this.completedCallbacks.delete(chunk.id);
       this.errorCallbacks.delete(chunk.id);
+      this.lastActivity.delete(chunk.id);
 
       // Notify error
       if (errorCallback) {
@@ -169,6 +195,7 @@ export class ChunkingManager {
     this.assemblers.delete(id);
     this.completedCallbacks.delete(id);
     this.errorCallbacks.delete(id);
+    this.lastActivity.delete(id);
 
     if (errorCallback) {
       errorCallback(new Error('Transfer cancelled'));

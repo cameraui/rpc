@@ -41,14 +41,20 @@ class RPCService:
         self.__client: RPCClient = client
         self.__svc: Svcm | None = None
         self.__services: list[NATSService] = []
-        self.__initialized: bool = False
+        self.__nc: NATSClient | None = None
 
     def init(self, nc: NATSClient) -> None:
-        """Initialize the service manager."""
-        if self.__initialized:
+        """Initialize the service manager.
+
+        Re-initializes when the underlying connection changed (suspend() +
+        connect() creates a fresh NATS connection) — a Svcm bound to the old,
+        closed connection would break service registration after every
+        reconnect cycle.
+        """
+        if self.__nc is nc:
             return
 
-        self.__initialized = True
+        self.__nc = nc
         self.__svc = Svcm(nc)
         self.__services = []
 
@@ -162,6 +168,7 @@ class RPCService:
                                 iterator_id,
                                 service_client,
                                 service_client.io_pool,
+                                on_finished=lambda iid=iterator_id: pull_iterator_cleanups.pop(iid, None),
                             )
 
                             # Store cleanup function for later

@@ -23,7 +23,7 @@ type ServiceConfig struct {
 type RPCService struct {
 	client   *Client
 	mu       sync.Mutex
-	services []micro.Service
+	services []*Service
 }
 
 // NewRPCService creates a new service manager.
@@ -68,9 +68,10 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 		return nil, fmt.Errorf("add service: %w", err)
 	}
 
-	s.mu.Lock()
-	s.services = append(s.services, svc)
-	s.mu.Unlock()
+	// Track pull iterator cleanups for this service only — scoped so that
+	// stopping one service never tears down another service's live sessions.
+	var pullCleanupsMu sync.Mutex
+	pullIteratorCleanups := make(map[string]func())
 
 	// Create groups for nested paths
 	groups := make(map[string]micro.Group)
@@ -116,14 +117,20 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 			// Handle pull iterator
 			if isPullIteratorRequest(msg.Params) {
 				iteratorID, args := extractPullIteratorParams(msg.Params, msg.ID)
-				cleanup, err := handlePullIteratorRequestGo(fnCopy, args, iteratorID, client)
+				cleanup, err := handlePullIteratorRequestGo(fnCopy, args, iteratorID, client, func() {
+					pullCleanupsMu.Lock()
+					delete(pullIteratorCleanups, iteratorID)
+					pullCleanupsMu.Unlock()
+				})
 				if err != nil {
 					response.Error = FormatErrorObject(err)
 					replySubject := fmt.Sprintf("%s.reply.%s", subject, msg.ID)
 					_ = client.Publish(replySubject, response)
 					return
 				}
-				client.pullIteratorCleanups.Store(iteratorID, cleanup)
+				pullCleanupsMu.Lock()
+				pullIteratorCleanups[iteratorID] = cleanup
+				pullCleanupsMu.Unlock()
 				response.Result = map[string]any{"iteratorId": iteratorID}
 				replySubject := fmt.Sprintf("%s.reply.%s", subject, msg.ID)
 				_ = client.Publish(replySubject, response)
@@ -195,14 +202,35 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 			processMessage(req.Data(), req.Subject())
 		}))
 		if err != nil {
+			_ = svc.Stop()
 			return nil, fmt.Errorf("add endpoint %s: %w", methodName, err)
 		}
 	}
 
-	wrapped := &Service{svc: svc}
+	wrapped := &Service{
+		svc: svc,
+		// Stop() runs the pull-iterator cleanups this service accumulated.
+		stopCleanups: func() {
+			pullCleanupsMu.Lock()
+			fns := make([]func(), 0, len(pullIteratorCleanups))
+			for _, fn := range pullIteratorCleanups {
+				fns = append(fns, fn)
+			}
+			pullIteratorCleanups = make(map[string]func())
+			pullCleanupsMu.Unlock()
+			for _, fn := range fns {
+				fn()
+			}
+		},
+	}
 	if len(isolated) > 0 && isolated[0] {
 		wrapped.isolatedClient = client
 	}
+
+	s.mu.Lock()
+	s.services = append(s.services, wrapped)
+	s.mu.Unlock()
+
 	return wrapped, nil
 }
 
@@ -269,6 +297,7 @@ func (s *RPCService) Stop(name string) error {
 type Service struct {
 	svc            micro.Service
 	isolatedClient *Client
+	stopCleanups   func()
 }
 
 // Info returns the service information.
@@ -281,8 +310,11 @@ func (s *Service) Stats() micro.Stats {
 	return s.svc.Stats()
 }
 
-// Stop stops the service.
+// Stop stops the service and cleans up its pull-iterator sessions.
 func (s *Service) Stop() error {
+	if s.stopCleanups != nil {
+		s.stopCleanups()
+	}
 	err := s.svc.Stop()
 	if s.isolatedClient != nil {
 		_ = s.isolatedClient.Disconnect()

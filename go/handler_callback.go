@@ -3,12 +3,15 @@ package rpc
 import (
 	"fmt"
 	"reflect"
+	"sync"
 )
 
 // handleCallbackRequestGo handles a callback subscription request.
 // It creates a wrapper function matching the handler's func(T) parameter,
 // calls the handler with it, and manages the subscription lifecycle.
-func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requestID string, client *Client) (func(), error) {
+// onFinished is invoked when the client cancels the subscription so the
+// caller can drop its cleanup-map entry for this session.
+func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requestID string, client *Client, onFinished func()) (func(), error) {
 	fnType := fn.Type()
 
 	// Find the func(T) parameter position
@@ -86,25 +89,45 @@ func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requ
 		}
 	}
 
-	// Subscribe to cancel subject for cleanup
-	cancelUnsub, err := client.Subscribe(callbackSubject+".cancel", func(data []byte) {
-		if handlerCleanup != nil {
-			handlerCleanup()
+	// Handler cleanup must run exactly once — the cancel message and a later
+	// RegisterHandler/Disconnect cleanup would otherwise both invoke it.
+	var cleanupOnce sync.Once
+	runHandlerCleanup := func() {
+		cleanupOnce.Do(func() {
+			if handlerCleanup != nil {
+				handlerCleanup()
+			}
+		})
+	}
+
+	// Subscribe to cancel subject for cleanup. cancelUnsub is assigned after
+	// Subscribe returns but read from the NATS callback goroutine — guard it.
+	var cancelUnsubMu sync.Mutex
+	var cancelUnsub func()
+	unsub, err := client.Subscribe(callbackSubject+".cancel", func(data []byte) {
+		cancelUnsubMu.Lock()
+		u := cancelUnsub
+		cancelUnsubMu.Unlock()
+		if u != nil {
+			u()
 		}
+		if onFinished != nil {
+			onFinished()
+		}
+		runHandlerCleanup()
 	})
 	if err != nil {
-		if handlerCleanup != nil {
-			handlerCleanup()
-		}
+		runHandlerCleanup()
 		return nil, fmt.Errorf("failed to setup cancel listener: %w", err)
 	}
+	cancelUnsubMu.Lock()
+	cancelUnsub = unsub
+	cancelUnsubMu.Unlock()
 
 	// Return combined cleanup
 	cleanup := func() {
-		cancelUnsub()
-		if handlerCleanup != nil {
-			handlerCleanup()
-		}
+		unsub()
+		runHandlerCleanup()
 	}
 
 	return cleanup, nil

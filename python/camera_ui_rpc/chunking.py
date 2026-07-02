@@ -1,5 +1,6 @@
 """Optimized chunking system for large message handling."""
 
+import time
 from collections.abc import Callable, Generator
 from typing import Any
 
@@ -180,11 +181,18 @@ class ChunkAssembler:
 class ChunkingManager:
     """Manages multiple concurrent chunk transfers."""
 
+    # Incomplete transfers hold their full pre-allocated buffer. If a single
+    # chunk is lost (sender reconnected mid-transfer), the assembler would
+    # otherwise sit in memory until the whole client disconnects — so stale
+    # transfers are swept lazily on every start_receiving/process_chunk call.
+    _STALE_TRANSFER_TTL: float = 30.0
+
     def __init__(self) -> None:
         self.assemblers: dict[str, ChunkAssembler] = {}
         self.completed_callbacks: dict[str, Callable[[Any], None]] = {}
         self.error_callbacks: dict[str, Callable[[Exception], None]] = {}
         self._assembler_pool: list[ChunkAssembler] = []
+        self._last_activity: dict[str, float] = {}
 
     def _get_assembler(self, transfer_id: str) -> ChunkAssembler:
         """Get a reusable assembler from a pool or create a new one."""
@@ -228,14 +236,34 @@ class ChunkingManager:
             on_error: Callback to execute if an error occurs.
             total_size: The total size of the final data for pre-allocation.
         """
+        self._sweep_stale()
         assembler = self._get_assembler(transfer_id)
         assembler.set_expected_chunks(total_chunks, total_size, chunk_size)
         self.assemblers[transfer_id] = assembler
         self.completed_callbacks[transfer_id] = on_complete
         self.error_callbacks[transfer_id] = on_error
+        self._last_activity[transfer_id] = time.monotonic()
+
+    def _sweep_stale(self) -> None:
+        """Drop incomplete transfers with no activity for _STALE_TRANSFER_TTL."""
+        if not self._last_activity:
+            return
+        cutoff = time.monotonic() - self._STALE_TRANSFER_TTL
+        stale = [tid for tid, ts in self._last_activity.items() if ts < cutoff]
+        for transfer_id in stale:
+            error_callback = self.error_callbacks.pop(transfer_id, None)
+            assembler = self.assemblers.pop(transfer_id, None)
+            if assembler:
+                self._return_assembler(assembler)
+            self.completed_callbacks.pop(transfer_id, None)
+            self._last_activity.pop(transfer_id, None)
+            if error_callback:
+                error_callback(RuntimeError("Transfer timed out"))
 
     def process_chunk(self, chunk: dict[str, Any]) -> None:
         """Process an incoming chunk for a specific transfer."""
+        self._sweep_stale()
+
         transfer_id = chunk.get("id") or chunk.get("transferId")
         if not transfer_id:
             return
@@ -244,6 +272,8 @@ class ChunkingManager:
         if not assembler:
             # Received a chunk for an unknown or completed transfer.
             return
+
+        self._last_activity[transfer_id] = time.monotonic()
 
         try:
             # Normalize keys in-place to avoid allocating a new dict.
@@ -261,6 +291,7 @@ class ChunkingManager:
                 # Cleanup and return assembler to the pool
                 del self.assemblers[transfer_id]
                 self.error_callbacks.pop(transfer_id, None)
+                self._last_activity.pop(transfer_id, None)
                 self._return_assembler(assembler)
 
                 if callback:
@@ -276,6 +307,7 @@ class ChunkingManager:
         if assembler:
             self._return_assembler(assembler)
         self.completed_callbacks.pop(transfer_id, None)
+        self._last_activity.pop(transfer_id, None)
 
         if error_callback:
             error_callback(error)

@@ -3,6 +3,7 @@ package rpc
 import (
 	"fmt"
 	"reflect"
+	"sync"
 	"sync/atomic"
 )
 
@@ -48,12 +49,15 @@ func (ci *CallbackInvoker) Active() bool {
 // calls the handler with (...args, invoker), then drives the returned channel
 // from iterator `next`/`cancel` requests. The iterator response carries no
 // value — it is purely a batch-boundary signal.
+// onFinished is invoked once when the iterator ends naturally (done/cancel) so
+// the caller can drop its cleanup-map entry for this session.
 func handlePullCallbackRequestGo(
 	fn reflect.Value,
 	args []any,
 	iteratorID, callbackSubject string,
 	onewayMethods []string,
 	client *Client,
+	onFinished func(),
 ) (func(), error) {
 	onewaySet := make(map[string]struct{}, len(onewayMethods))
 	for _, m := range onewayMethods {
@@ -119,6 +123,31 @@ func handlePullCallbackRequestGo(
 
 	active := true
 
+	// subUnsub is assigned after Subscribe returns but read from the NATS
+	// callback goroutine — guard it against that race.
+	var subUnsubMu sync.Mutex
+	var subUnsub func()
+
+	// Natural end (done/cancel): see handlePullIteratorRequestGo — drop the
+	// request subscription and the caller's cleanup-map entry per finished
+	// session.
+	var finishOnce sync.Once
+	finish := func() {
+		finishOnce.Do(func() {
+			active = false
+			invoker.active.Store(false)
+			subUnsubMu.Lock()
+			u := subUnsub
+			subUnsubMu.Unlock()
+			if u != nil {
+				u()
+			}
+			if onFinished != nil {
+				onFinished()
+			}
+		})
+	}
+
 	unsub, err := client.Subscribe(requestSubject, func(data []byte) {
 		if !active || !client.IsConnected() {
 			return
@@ -131,8 +160,7 @@ func handlePullCallbackRequestGo(
 
 		switch req.Type {
 		case "cancel":
-			active = false
-			invoker.active.Store(false)
+			finish()
 			// Drain the handler channel via reflection so its producer goroutine
 			// unblocks on send and can exit. Works for any chan element type.
 			go func() {
@@ -149,8 +177,7 @@ func handlePullCallbackRequestGo(
 			// Receive the next batch-boundary signal from the handler channel.
 			_, ok := rv.Recv()
 			if !ok {
-				active = false
-				invoker.active.Store(false)
+				finish()
 				resp := PullIteratorResponse{ID: iteratorID, Type: "done"}
 				_ = client.Publish(responseSubject, resp)
 			} else {
@@ -164,11 +191,17 @@ func handlePullCallbackRequestGo(
 		invoker.active.Store(false)
 		return nil, err
 	}
+	subUnsubMu.Lock()
+	subUnsub = unsub
+	subUnsubMu.Unlock()
 
 	cleanup := func() {
-		active = false
-		invoker.active.Store(false)
-		unsub()
+		finishOnce.Do(func() {
+			active = false
+			invoker.active.Store(false)
+			unsub()
+			// No onFinished here — the caller is already sweeping its map.
+		})
 	}
 
 	return cleanup, nil

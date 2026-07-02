@@ -128,7 +128,13 @@ export function formatErrorObject(error: any): RPCError {
 /**
  * Handle pull-based iterator request
  */
-export async function handlePullIteratorRequest(handler: Function, args: any[], iteratorId: string, client: RPCClient): Promise<() => Promise<void>> {
+export async function handlePullIteratorRequest(
+  handler: Function,
+  args: any[],
+  iteratorId: string,
+  client: RPCClient,
+  onFinished?: () => void,
+): Promise<() => Promise<void>> {
   let generator: AsyncGenerator<any, void, unknown>;
 
   // Check if handler is async or sync
@@ -171,6 +177,18 @@ export async function handlePullIteratorRequest(handler: Function, args: any[], 
 
   // Track if iterator is active
   let active = true;
+  let subUnsub: (() => void) | undefined = undefined;
+
+  // Natural end (done/cancel/error): drop the request subscription and let
+  // the client remove its cleanup-map entry. Without this, every finished
+  // session leaves its `_rpc.iterator.*.request` subscription and cleanup
+  // closure behind until the whole client disconnects.
+  const finish = (): void => {
+    if (!active) return;
+    active = false;
+    subUnsub?.();
+    onFinished?.();
+  };
 
   // Subscribe to iterator requests
   const unsub = await client.subscribe(requestSubject, async (msg: PullIteratorRequest) => {
@@ -178,7 +196,7 @@ export async function handlePullIteratorRequest(handler: Function, args: any[], 
 
     try {
       if (msg.type === 'cancel') {
-        active = false;
+        finish();
         // Close the generator explicitly
         if (generator.return) {
           await generator.return();
@@ -192,7 +210,7 @@ export async function handlePullIteratorRequest(handler: Function, args: any[], 
         const { value, done } = await generator.next();
 
         if (done) {
-          active = false;
+          finish();
           const response: PullIteratorResponse = {
             id: iteratorId,
             type: 'done',
@@ -208,7 +226,7 @@ export async function handlePullIteratorRequest(handler: Function, args: any[], 
         }
       }
     } catch (error) {
-      active = false;
+      finish();
       const response: PullIteratorResponse = {
         id: iteratorId,
         type: 'error',
@@ -217,6 +235,7 @@ export async function handlePullIteratorRequest(handler: Function, args: any[], 
       await client.publish(responseSubject, response);
     }
   });
+  subUnsub = unsub;
 
   // Return cleanup function
   const cleanup = async () => {
@@ -253,6 +272,7 @@ export async function handlePullCallbackRequest(
   callbackMethods: string[],
   onewayMethods: string[],
   client: RPCClient,
+  onFinished?: () => void,
 ): Promise<() => Promise<void>> {
   // Build callback proxy. Each method publishes a CallbackInvocation oneway.
   // Methods not in onewayMethods reject with NotImplemented (request-reply is v2).
@@ -302,14 +322,24 @@ export async function handlePullCallbackRequest(
   const responseSubject = `_rpc.iterator.${iteratorId}.response`;
 
   let active = true;
+  let subUnsub: (() => void) | undefined = undefined;
+
+  // Natural end: see handlePullIteratorRequest — drop the request
+  // subscription and the client's cleanup-map entry per finished session.
+  const finish = (): void => {
+    if (!active) return;
+    active = false;
+    proxyActive = false;
+    subUnsub?.();
+    onFinished?.();
+  };
 
   const unsub = await client.subscribe(requestSubject, async (msg: PullIteratorRequest) => {
     if (!active) return;
 
     try {
       if (msg.type === 'cancel') {
-        active = false;
-        proxyActive = false;
+        finish();
         if (generator.return) {
           await generator.return();
         }
@@ -319,8 +349,7 @@ export async function handlePullCallbackRequest(
         const { done } = await generator.next();
 
         if (done) {
-          active = false;
-          proxyActive = false;
+          finish();
           const response: PullIteratorResponse = { id: iteratorId, type: 'done' };
           await client.publish(responseSubject, response);
         } else {
@@ -330,8 +359,7 @@ export async function handlePullCallbackRequest(
         }
       }
     } catch (error) {
-      active = false;
-      proxyActive = false;
+      finish();
       const response: PullIteratorResponse = {
         id: iteratorId,
         type: 'error',
@@ -340,6 +368,7 @@ export async function handlePullCallbackRequest(
       await client.publish(responseSubject, response);
     }
   });
+  subUnsub = unsub;
 
   const cleanup = async () => {
     active = false;
@@ -362,7 +391,14 @@ export async function handlePullCallbackRequest(
  * Creates a wrapper function, calls the handler with it,
  * and manages the subscription lifecycle.
  */
-export async function handleCallbackRequest(handler: Function, args: any[], callbackSubject: string, requestId: string, client: RPCClient): Promise<() => Promise<void>> {
+export async function handleCallbackRequest(
+  handler: Function,
+  args: any[],
+  callbackSubject: string,
+  requestId: string,
+  client: RPCClient,
+  onFinished?: () => void,
+): Promise<() => Promise<void>> {
   // Create wrapper callback that publishes to callbackSubject
   const wrapperCallback = async (value: any) => {
     if (!client.isConnected) return;
@@ -395,18 +431,28 @@ export async function handleCallbackRequest(handler: Function, args: any[], call
     throw error;
   }
 
-  // Subscribe to cancel subject
-  const cancelUnsub = await client.subscribe(`${callbackSubject}.cancel`, async () => {
+  // Handler cleanup must run exactly once — the cancel message and a later
+  // registerHandler/disconnect cleanup would otherwise both invoke it.
+  let cleanedUp = false;
+  const runHandlerCleanup = async (): Promise<void> => {
+    if (cleanedUp) return;
+    cleanedUp = true;
     if (handlerCleanup) {
       await handlerCleanup();
     }
+  };
+
+  // Subscribe to cancel subject
+  let cancelUnsub: (() => void) | undefined = undefined;
+  cancelUnsub = await client.subscribe(`${callbackSubject}.cancel`, async () => {
+    cancelUnsub?.();
+    onFinished?.();
+    await runHandlerCleanup();
   });
 
   // Return combined cleanup
   return async () => {
-    cancelUnsub();
-    if (handlerCleanup) {
-      await handlerCleanup();
-    }
+    cancelUnsub?.();
+    await runHandlerCleanup();
   };
 }

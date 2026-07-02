@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sync"
 )
 
 // PullCallbackMap registers callback handlers invoked by the server during
@@ -108,8 +109,17 @@ func (c *Client) CallPullIteratorWithCallback(
 	// would push batches one ahead of the consumer and break backpressure.
 	ch := make(chan PullValue)
 
+	// See CallPullIterator: force-settle a consumer parked in a next() wait
+	// when the connection tears down (Disconnect/Suspend).
+	disconnected := make(chan struct{})
+	var settleOnce sync.Once
+	c.pullIteratorSettles.Store(iteratorID, func() {
+		settleOnce.Do(func() { close(disconnected) })
+	})
+
 	go func() {
 		defer close(ch)
+		defer c.pullIteratorSettles.Delete(iteratorID)
 		defer cbUnsub()
 
 		respCh := make(chan PullIteratorResponse, 8)
@@ -161,6 +171,17 @@ func (c *Client) CallPullIteratorWithCallback(
 			}
 		}
 
+		// sendDisconnected delivers the connection error to a parked
+		// consumer without blocking; if nobody is waiting, the closed
+		// channel terminates the consumer's range loop instead.
+		sendDisconnected := func() {
+			ended = true
+			select {
+			case ch <- PullValue{Error: NewRPCException(ErrCodeConnectionClosed, "Connection closed")}:
+			default:
+			}
+		}
+
 		// sendToConsumer wraps a channel send in a ctx-aware select so that
 		// a consumer that has stopped reading doesn't permanently park the
 		// goroutine. Without this wrap, ctx cancellation would not preempt
@@ -172,6 +193,9 @@ func (c *Client) CallPullIteratorWithCallback(
 				return true
 			case <-ctx.Done():
 				sendCancel()
+				ended = true
+				return false
+			case <-disconnected:
 				ended = true
 				return false
 			}
@@ -213,6 +237,9 @@ func (c *Client) CallPullIteratorWithCallback(
 			case <-ctx.Done():
 				sendCancel()
 				ended = true
+				return
+			case <-disconnected:
+				sendDisconnected()
 				return
 			}
 		}

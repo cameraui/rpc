@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -53,6 +54,16 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 
 	var unsubscribers []func()
 
+	// Track the iterator/callback sessions created by THIS RegisterHandler
+	// call. The client maps are shared across RegisterHandler calls; sweeping
+	// them wholesale on cleanup would kill the live sessions of every other
+	// namespace.
+	var (
+		idsMu           sync.Mutex
+		pullIteratorIDs []string
+		callbackIDs     []string
+	)
+
 	for methodName, fn := range methods {
 		subject := fmt.Sprintf("rpc.%s.%s", namespace, methodName)
 		fnCopy := fn
@@ -76,7 +87,9 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 			// Check for pull iterator request
 			if isPullIteratorRequest(msg.Params) {
 				iteratorID, args := extractPullIteratorParams(msg.Params, msg.ID)
-				cleanup, err := handlePullIteratorRequestGo(fnCopy, args, iteratorID, client)
+				cleanup, err := handlePullIteratorRequestGo(fnCopy, args, iteratorID, client, func() {
+					client.pullIteratorCleanups.Delete(iteratorID)
+				})
 				if err != nil {
 					response.Error = FormatErrorObject(err)
 					replySubject := "rpc.reply." + msg.ID
@@ -84,6 +97,9 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 					return
 				}
 				client.pullIteratorCleanups.Store(iteratorID, cleanup)
+				idsMu.Lock()
+				pullIteratorIDs = append(pullIteratorIDs, iteratorID)
+				idsMu.Unlock()
 				response.Result = map[string]any{"iteratorId": iteratorID}
 				replySubject := "rpc.reply." + msg.ID
 				_ = client.Publish(replySubject, response)
@@ -93,7 +109,9 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 			// Check for pull-iterator-with-callbacks request
 			if isPullCallbackRequest(msg.Params) {
 				iteratorID, callbackSubject, oneway, args := extractPullCallbackParams(msg.Params, msg.ID)
-				cleanup, err := handlePullCallbackRequestGo(fnCopy, args, iteratorID, callbackSubject, oneway, client)
+				cleanup, err := handlePullCallbackRequestGo(fnCopy, args, iteratorID, callbackSubject, oneway, client, func() {
+					client.pullIteratorCleanups.Delete(iteratorID)
+				})
 				if err != nil {
 					response.Error = FormatErrorObject(err)
 					replySubject := "rpc.reply." + msg.ID
@@ -101,6 +119,9 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 					return
 				}
 				client.pullIteratorCleanups.Store(iteratorID, cleanup)
+				idsMu.Lock()
+				pullIteratorIDs = append(pullIteratorIDs, iteratorID)
+				idsMu.Unlock()
 				response.Result = map[string]any{"iteratorId": iteratorID}
 				replySubject := "rpc.reply." + msg.ID
 				_ = client.Publish(replySubject, response)
@@ -110,14 +131,20 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 			// Check for callback subscription request
 			if isCallbackRequest(msg.Params) {
 				callbackSubject, args := extractCallbackParams(msg.Params)
-				cleanup, err := handleCallbackRequestGo(fnCopy, args, callbackSubject, msg.ID, client)
+				requestID := msg.ID
+				cleanup, err := handleCallbackRequestGo(fnCopy, args, callbackSubject, requestID, client, func() {
+					client.callbackCleanups.Delete(requestID)
+				})
 				if err != nil {
 					response.Error = FormatErrorObject(err)
 					replySubject := "rpc.reply." + msg.ID
 					_ = client.Publish(replySubject, response)
 					return
 				}
-				client.callbackCleanups.Store(msg.ID, cleanup)
+				client.callbackCleanups.Store(requestID, cleanup)
+				idsMu.Lock()
+				callbackIDs = append(callbackIDs, requestID)
+				idsMu.Unlock()
 				response.Result = map[string]any{"ok": true}
 				replySubject := "rpc.reply." + msg.ID
 				_ = client.Publish(replySubject, response)
@@ -158,26 +185,36 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 			unsub()
 		}
 
-		// Cleanup pull iterators
-		client.pullIteratorCleanups.Range(func(key, value any) bool {
-			if fn, ok := value.(func()); ok {
-				fn()
+		idsMu.Lock()
+		pids := pullIteratorIDs
+		pullIteratorIDs = nil
+		cids := callbackIDs
+		callbackIDs = nil
+		idsMu.Unlock()
+
+		// Cleanup pull iterators — only the sessions this RegisterHandler
+		// call created; the client maps are shared across namespaces.
+		for _, id := range pids {
+			if v, ok := client.pullIteratorCleanups.LoadAndDelete(id); ok {
+				if fn, ok := v.(func()); ok {
+					fn()
+				}
 			}
-			client.pullIteratorCleanups.Delete(key)
-			return true
-		})
+		}
 
 		// Cleanup callbacks
-		client.callbackCleanups.Range(func(key, value any) bool {
-			if fn, ok := value.(func()); ok {
-				fn()
+		for _, id := range cids {
+			if v, ok := client.callbackCleanups.LoadAndDelete(id); ok {
+				if fn, ok := v.(func()); ok {
+					fn()
+				}
 			}
-			client.callbackCleanups.Delete(key)
-			return true
-		})
+		}
 
 		if cfg.isolatedConnection {
-			return client.Disconnect()
+			err := client.Disconnect()
+			c.removeIsolatedClient(client)
+			return err
 		}
 		return nil
 	}

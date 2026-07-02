@@ -3,6 +3,7 @@ package rpc
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 // CreateChunks splits encoded data into chunks for transmission.
@@ -74,42 +75,87 @@ func (a *ChunkAssembler) Progress() (received, total int) {
 	return len(a.receivedChunks), a.totalChunks
 }
 
+// staleTransferTTL is the inactivity window after which an incomplete
+// transfer is swept. Incomplete transfers hold their full pre-allocated
+// buffer — if a single chunk is lost (sender reconnected mid-transfer), the
+// assembler would otherwise sit in memory until the whole client disconnects.
+const staleTransferTTL = 30 * time.Second
+
 // ChunkingManager manages multiple concurrent chunk transfers.
 type ChunkingManager struct {
-	mu         sync.Mutex
-	assemblers map[string]*ChunkAssembler
-	onComplete map[string]func([]byte)
-	onError    map[string]func(error)
+	mu           sync.Mutex
+	assemblers   map[string]*ChunkAssembler
+	onComplete   map[string]func([]byte)
+	onError      map[string]func(error)
+	lastActivity map[string]time.Time
 }
 
 // NewChunkingManager creates a new ChunkingManager.
 func NewChunkingManager() *ChunkingManager {
 	return &ChunkingManager{
-		assemblers: make(map[string]*ChunkAssembler),
-		onComplete: make(map[string]func([]byte)),
-		onError:    make(map[string]func(error)),
+		assemblers:   make(map[string]*ChunkAssembler),
+		onComplete:   make(map[string]func([]byte)),
+		onError:      make(map[string]func(error)),
+		lastActivity: make(map[string]time.Time),
+	}
+}
+
+// sweepStaleLocked removes transfers with no activity within staleTransferTTL.
+// Must be called with m.mu held. Returns the error callbacks of the swept
+// transfers so the caller can invoke them after releasing the lock.
+func (m *ChunkingManager) sweepStaleLocked() []func(error) {
+	if len(m.lastActivity) == 0 {
+		return nil
+	}
+	cutoff := time.Now().Add(-staleTransferTTL)
+	var staleCbs []func(error)
+	for id, activity := range m.lastActivity {
+		if activity.Before(cutoff) {
+			if errCb := m.onError[id]; errCb != nil {
+				staleCbs = append(staleCbs, errCb)
+			}
+			delete(m.assemblers, id)
+			delete(m.onComplete, id)
+			delete(m.onError, id)
+			delete(m.lastActivity, id)
+		}
+	}
+	return staleCbs
+}
+
+func notifyStale(staleCbs []func(error)) {
+	for _, cb := range staleCbs {
+		cb(fmt.Errorf("transfer timed out"))
 	}
 }
 
 // StartReceiving begins receiving chunks for a transfer.
 func (m *ChunkingManager) StartReceiving(id string, totalChunks int, onComplete func([]byte), onError func(error), totalSize, chunkSize int) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	staleCbs := m.sweepStaleLocked()
 
 	assembler := NewChunkAssembler(id, totalSize, totalChunks, chunkSize)
 	m.assemblers[id] = assembler
 	m.onComplete[id] = onComplete
 	m.onError[id] = onError
+	m.lastActivity[id] = time.Now()
+	m.mu.Unlock()
+
+	notifyStale(staleCbs)
 }
 
 // ProcessChunk processes an incoming chunk.
 func (m *ChunkingManager) ProcessChunk(chunk ChunkData) {
 	m.mu.Lock()
+	staleCbs := m.sweepStaleLocked()
+
 	assembler, ok := m.assemblers[chunk.ID]
 	if !ok {
 		m.mu.Unlock()
+		notifyStale(staleCbs)
 		return
 	}
+	m.lastActivity[chunk.ID] = time.Now()
 
 	complete, err := assembler.AddChunk(chunk)
 	if err != nil {
@@ -117,7 +163,9 @@ func (m *ChunkingManager) ProcessChunk(chunk ChunkData) {
 		delete(m.assemblers, chunk.ID)
 		delete(m.onComplete, chunk.ID)
 		delete(m.onError, chunk.ID)
+		delete(m.lastActivity, chunk.ID)
 		m.mu.Unlock()
+		notifyStale(staleCbs)
 		if errCb != nil {
 			errCb(err)
 		}
@@ -131,7 +179,9 @@ func (m *ChunkingManager) ProcessChunk(chunk ChunkData) {
 		delete(m.assemblers, chunk.ID)
 		delete(m.onComplete, chunk.ID)
 		delete(m.onError, chunk.ID)
+		delete(m.lastActivity, chunk.ID)
 		m.mu.Unlock()
+		notifyStale(staleCbs)
 
 		if err != nil {
 			if errCb != nil {
@@ -146,6 +196,7 @@ func (m *ChunkingManager) ProcessChunk(chunk ChunkData) {
 	}
 
 	m.mu.Unlock()
+	notifyStale(staleCbs)
 }
 
 // Cancel cancels a transfer.
@@ -155,6 +206,7 @@ func (m *ChunkingManager) Cancel(id string) {
 	delete(m.assemblers, id)
 	delete(m.onComplete, id)
 	delete(m.onError, id)
+	delete(m.lastActivity, id)
 	m.mu.Unlock()
 
 	if errCb != nil {

@@ -89,7 +89,8 @@ class RPCClient(RPCClientProtocol):
         self.service: RPCService = RPCService(cast(Any, self))
 
         self.nc: NATSClient | None = None
-        self.subscriptions: dict[str, list[Subscription]] = {}
+        self._subscription_seq: int = 0
+        self._subscription_entries: dict[int, dict[str, Any]] = {}
         self.chunking_manager: ChunkingManager = ChunkingManager()
         self._max_payload_size: int = 1024 * 1024  # Default 1MB
         self._connection_task: asyncio.Task[NATSClient] | None = None
@@ -99,10 +100,10 @@ class RPCClient(RPCClientProtocol):
         self.isolated_clients: list[RPCClient] = []
         self.pull_iterator_cleanups: dict[str, Callable[[], Coroutine[Any, Any, None]]] = {}
         self.callback_cleanups: dict[str, Callable[[], Coroutine[Any, Any, None]]] = {}
+        self._pull_iterator_settles: set[Callable[[], None]] = set()
 
         self._closed = False
         self._suspending = False
-        self._subscription_meta: list[dict[str, Any]] = []
 
         self.io_pool: ThreadPoolExecutor = get_executor()
 
@@ -190,6 +191,11 @@ class RPCClient(RPCClientProtocol):
 
         self.nc = await connect(**connect_opts)
 
+        # A client that was disconnect()ed is revivable by an explicit
+        # connect(). Without this reset, auto-connect in _call_once and the
+        # no-responder retry loop stay permanently disabled.
+        self._closed = False
+
         # Initialize service
         self.service.init(self.nc)
 
@@ -199,27 +205,24 @@ class RPCClient(RPCClientProtocol):
         # Reserve 8KB for NATS protocol overhead and MsgPack envelope per message
         self._max_payload_size = self._max_payload_size - 8192
 
-        # Restore subscriptions after reconnect (used by suspend/connect cycle)
-        if self._subscription_meta:
-            metas = list(self._subscription_meta)
-            self._subscription_meta.clear()
-            for meta in metas:
-                await self.subscribe(meta["pattern"], meta["handler"], **(meta.get("options") or {}))
+        # Restore subscriptions after reconnect (from suspend). Entries keep
+        # their identity so unsubscribe closures held by callers stay valid
+        # across the restore.
+        for entry in list(self._subscription_entries.values()):
+            sub = entry.get("sub")
+            if sub is None or getattr(sub, "_closed", False):
+                await self._nats_subscribe(entry)
 
         return self.nc
 
     async def disconnect(self) -> None:
         """Disconnect from NATS server."""
         self._closed = True
-        self._subscription_meta.clear()
 
-        # Cleanup pending requests
-        for pending in self.pending_requests.values():
-            if timeout_handle := pending.get("timeout"):
-                timeout_handle.cancel()
-            if reject := pending.get("reject"):
-                reject(create_error(ErrorCode.CONNECTION_CLOSED, "Connection closed"))
-        self.pending_requests.clear()
+        # Cleanup pending requests. The cleanup hook drops the reply
+        # subscription entry too — otherwise an in-flight call would leave a
+        # dead rpc.reply.* subscription behind.
+        await self._cleanup_pending_requests()
 
         # Cleanup stream handlers
         for handler in self.stream_handlers.values():
@@ -229,6 +232,8 @@ class RPCClient(RPCClientProtocol):
             except Exception:
                 pass
         self.stream_handlers.clear()
+
+        self._settle_pull_iterators()
 
         # Cleanup pull iterators
         await asyncio.gather(
@@ -243,11 +248,12 @@ class RPCClient(RPCClientProtocol):
         self.callback_cleanups.clear()
 
         # Unsubscribe all subscriptions
-        for subs in self.subscriptions.values():
-            for sub in subs:
+        for entry in list(self._subscription_entries.values()):
+            if sub := entry.get("sub"):
                 with contextlib.suppress(Exception):
                     await sub.unsubscribe()
-        self.subscriptions.clear()
+            entry["sub"] = None
+        self._subscription_entries.clear()
 
         # Clear chunking manager
         self.chunking_manager = ChunkingManager()
@@ -261,6 +267,7 @@ class RPCClient(RPCClientProtocol):
                 *[client.disconnect() for client in self.isolated_clients],
                 return_exceptions=True,
             )
+            self.isolated_clients.clear()
 
         # Close connection with timeout
         if self.nc:
@@ -271,9 +278,10 @@ class RPCClient(RPCClientProtocol):
 
     async def suspend(self) -> None:
         """Suspend the connection without marking as closed, preserving subscription metadata for reconnect."""
-        # Block on_finish-driven unsubscribe from clearing _subscription_meta
-        # while we tear the transport down — the task ending here is not a user-
-        # initiated unsubscribe.
+        # Block on_finish-driven cleanup from dropping subscription entries
+        # while we tear the transport down — the msg tasks ending here are not
+        # user-initiated unsubscribes; connect() must be able to restore the
+        # entries.
         self._suspending = True
         try:
             await self._do_suspend()
@@ -281,13 +289,10 @@ class RPCClient(RPCClientProtocol):
             self._suspending = False
 
     async def _do_suspend(self) -> None:
-        # Cleanup pending requests
-        for pending in self.pending_requests.values():
-            if timeout_handle := pending.get("timeout"):
-                timeout_handle.cancel()
-            if reject := pending.get("reject"):
-                reject(create_error(ErrorCode.CONNECTION_CLOSED, "Connection closed"))
-        self.pending_requests.clear()
+        # Cleanup pending requests. The cleanup hook drops the reply
+        # subscription entry too — otherwise a suspended in-flight call would
+        # be restored as a dead rpc.reply.* subscription on the next connect().
+        await self._cleanup_pending_requests()
 
         # Cleanup stream handlers
         for handler in self.stream_handlers.values():
@@ -297,6 +302,8 @@ class RPCClient(RPCClientProtocol):
             except Exception:
                 pass
         self.stream_handlers.clear()
+
+        self._settle_pull_iterators()
 
         # Cleanup pull iterators
         await asyncio.gather(
@@ -310,12 +317,13 @@ class RPCClient(RPCClientProtocol):
         )
         self.callback_cleanups.clear()
 
-        # Unsubscribe all subscriptions
-        for subs in self.subscriptions.values():
-            for sub in subs:
+        # Unsubscribe all subscriptions but keep the entries — connect()
+        # restores them on the fresh transport.
+        for entry in list(self._subscription_entries.values()):
+            if sub := entry.get("sub"):
                 with contextlib.suppress(Exception):
                     await sub.unsubscribe()
-        self.subscriptions.clear()
+            entry["sub"] = None
 
         # Clear chunking manager
         self.chunking_manager = ChunkingManager()
@@ -333,6 +341,35 @@ class RPCClient(RPCClientProtocol):
             with contextlib.suppress(TimeoutError, Exception):
                 await asyncio.wait_for(self.nc.close(), timeout=timeout)
             self.nc = None
+
+    async def _cleanup_pending_requests(self) -> None:
+        """Settle and tear down all in-flight call() requests.
+
+        Runs on disconnect/suspend: cancels the timeout, invokes the per-call
+        cleanup hook (which removes the reply/inbox subscriptions and their
+        entries) and rejects the awaiting caller.
+        """
+        for pending in list(self.pending_requests.values()):
+            if timeout_handle := pending.get("timeout"):
+                timeout_handle.cancel()
+            if cleanup := pending.get("cleanup"):
+                with contextlib.suppress(Exception):
+                    await cleanup()
+            future = pending.get("future")
+            if future is not None and not future.done():
+                future.set_exception(create_error(ErrorCode.CONNECTION_CLOSED, "Connection closed"))
+        self.pending_requests.clear()
+
+    def _settle_pull_iterators(self) -> None:
+        """Force-settle every client-side pull iterator parked in a queue.get().
+
+        Runs on disconnect/suspend so consumers' `async for` loops terminate
+        with a connection error instead of hanging forever.
+        """
+        for settle in list(self._pull_iterator_settles):
+            with contextlib.suppress(Exception):
+                settle()
+        self._pull_iterator_settles.clear()
 
     def reconfigure(
         self,
@@ -446,6 +483,50 @@ class RPCClient(RPCClientProtocol):
         if not self.nc:
             raise RuntimeError("Not connected")
 
+        self._subscription_seq += 1
+        key = self._subscription_seq
+        entry: dict[str, Any] = {
+            "key": key,
+            "pattern": pattern,
+            "handler": handler,
+            "queue": queue,
+            "sub": None,
+        }
+        self._subscription_entries[key] = entry
+
+        await self._nats_subscribe(entry)
+
+        async def unsubscribe() -> None:
+            # Drop bookkeeping first — the NATS-level unsubscribe below may be
+            # interrupted when it tears down the very message task calling us.
+            self._subscription_entries.pop(key, None)
+            sub: Subscription | None = entry.get("sub")
+            entry["sub"] = None
+            if sub is not None:
+                with contextlib.suppress(Exception):
+                    await sub.unsubscribe()
+
+        return unsubscribe
+
+    async def _nats_subscribe(self, entry: dict[str, Any]) -> None:
+        """Create the NATS subscription for an entry.
+
+        Called from subscribe() and again from connect() when restoring
+        entries after a suspend cycle.
+        """
+        if not self.nc:
+            raise RuntimeError("Not connected")
+
+        pattern: str = entry["pattern"]
+        handler: Callable[[Any], None] | Callable[[Any], Coroutine[Any, Any, None]] = entry["handler"]
+
+        # Payloads assembled from chunks are queued here and drained inline in
+        # the message handler below, so they run inside the same sequential
+        # per-subscription message flow as regular messages. Dispatching them
+        # eagerly (create_task) would run handlers concurrently and out of
+        # order, breaking backpressure-sensitive callers.
+        assembled_queue: list[Any] = []
+
         async def message_handler(msg: Msg) -> None:
             try:
                 chunk_type = msg.headers.get("x-chunked-transfer") if msg.headers else None
@@ -459,7 +540,7 @@ class RPCClient(RPCClientProtocol):
                         return
 
                     def on_complete(assembled_data: Any) -> None:
-                        asyncio.create_task(self._handle_assembled_data(handler, assembled_data))
+                        assembled_queue.append(assembled_data)
 
                     def on_error(error: Exception) -> None:
                         print(f"Error assembling chunks for {pattern}: {error}")
@@ -490,6 +571,11 @@ class RPCClient(RPCClientProtocol):
                         {"id": chunk_id, "chunkIndex": chunk_index, "data": msg.data, "isLast": False}
                     )
 
+                    # Drain any transfer completed by this chunk inline (see
+                    # assembled_queue above).
+                    while assembled_queue:
+                        await self._handle_assembled_data(handler, assembled_queue.pop(0))
+
                 else:
                     # Regular message - decode MessagePack data
                     data = decode(msg.data)
@@ -503,47 +589,30 @@ class RPCClient(RPCClientProtocol):
                 print(f"Error processing message for {pattern}:", e)
                 print(traceback.format_exc())
 
-        sub = await self.nc.subscribe(pattern, queue=queue, cb=message_handler)
+        sub = await self.nc.subscribe(pattern, queue=entry.get("queue") or "", cb=message_handler)
 
         # Ensure the subscription is ready
         await asyncio.sleep(0)
 
-        if pattern not in self.subscriptions:
-            self.subscriptions[pattern] = []
-        self.subscriptions[pattern].append(sub)
-
-        # Store subscription metadata for suspend/reconnect
-        options: dict[str, Any] = {}
-        if queue:
-            options["queue"] = queue
-        meta = {"pattern": pattern, "handler": handler, "options": options}
-        self._subscription_meta.append(meta)
-
-        async def unsubscribe() -> None:
-            with contextlib.suppress(Exception):
-                await sub.unsubscribe()
-
-            if pattern in self.subscriptions:
-                self.subscriptions[pattern] = [s for s in self.subscriptions[pattern] if s != sub]
-                if not self.subscriptions[pattern]:
-                    del self.subscriptions[pattern]
-
-            # During suspend the NATS msg-task ends as a side-effect of the
-            # transport teardown — we want to keep _subscription_meta so that
-            # the next connect() can restore subscriptions.
-            if not self._suspending:
-                self._subscription_meta = [m for m in self._subscription_meta if m["pattern"] != pattern]
+        entry["sub"] = sub
 
         async def on_finish(fut: asyncio.Task[None]) -> None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(fut, None)
-                await unsubscribe()
+                # The msg task also ends during suspend teardown and when the
+                # entry has already been restored onto a new subscription — in
+                # both cases the entry must survive so connect() can restore
+                # it (or keep the restored one alive).
+                if self._suspending or entry.get("sub") is not sub:
+                    return
+                entry["sub"] = None
+                self._subscription_entries.pop(entry["key"], None)
+                with contextlib.suppress(Exception):
+                    await sub.unsubscribe()
 
         msg_task: asyncio.Task[None] | None = getattr(sub, "_wait_for_msgs_task", None)
         if msg_task:
             asyncio.create_task(on_finish(msg_task))
-
-        return unsubscribe
 
     async def _handle_assembled_data(self, handler: Callable[[Any], Any], data: Any) -> None:
         """Handle assembled data from chunks."""
@@ -651,20 +720,6 @@ class RPCClient(RPCClientProtocol):
         # Create future for the response
         future: asyncio.Future[Any] = asyncio.Future()
 
-        # Setup timeout
-        def handle_timeout() -> None:
-            if request_id in self.pending_requests:
-                del self.pending_requests[request_id]
-                if not future.done():
-                    future.set_exception(
-                        errors.TimeoutError(f"RPC call to {subject!r} timed out after {timeout}ms")
-                    )
-
-        timeout_handle = asyncio.get_event_loop().call_later(timeout / 1000, handle_timeout)
-
-        # Store pending request
-        self.pending_requests[request_id] = {"future": future, "timeout": timeout_handle}
-
         # Handle no responders
         sub: Subscription | None = None
         unsubscribe: Callable[[], Coroutine[Any, Any, None]] | None = None
@@ -681,6 +736,27 @@ class RPCClient(RPCClientProtocol):
                 with contextlib.suppress(Exception):
                     await unsubscribe()
 
+        # Setup timeout. The subscriptions are torn down by the except-branch
+        # below once the future's exception propagates out of `await future`.
+        def handle_timeout() -> None:
+            if request_id in self.pending_requests:
+                del self.pending_requests[request_id]
+                if not future.done():
+                    future.set_exception(
+                        errors.TimeoutError(f"RPC call to {subject!r} timed out after {timeout}ms")
+                    )
+
+        timeout_handle = asyncio.get_event_loop().call_later(timeout / 1000, handle_timeout)
+
+        # Store pending request. disconnect()/suspend() invoke the cleanup
+        # hook so a suspended in-flight call doesn't leave its reply
+        # subscription behind (it would be restored as a dead subscription).
+        self.pending_requests[request_id] = {
+            "future": future,
+            "timeout": timeout_handle,
+            "cleanup": unsubscribe_all,
+        }
+
         # Subscribe to reply
         async def handle_rpc_response(data: Any) -> None:
             response = data  # assuming data is already parsed as RPCResponse
@@ -690,16 +766,22 @@ class RPCClient(RPCClientProtocol):
                 if pending:
                     del self.pending_requests[response["id"]]
                     pending["timeout"].cancel()
-                    await unsubscribe_all()
 
+                    # Settle the caller BEFORE tearing down subscriptions:
+                    # unsubscribing the reply subscription cancels the message
+                    # task this handler runs in, which could abort us mid-way.
                     if "error" in response:
-                        pending["future"].set_exception(RPCException.from_dict(response["error"]))
+                        if not pending["future"].done():
+                            pending["future"].set_exception(RPCException.from_dict(response["error"]))
                     else:
                         result = response.get("result")
                         # Attach __methods to result for proxy method discovery
                         if "__methods" in response and result is not None and isinstance(result, dict):
                             result["__methods"] = response["__methods"]
-                        pending["future"].set_result(result)
+                        if not pending["future"].done():
+                            pending["future"].set_result(result)
+
+                    await unsubscribe_all()
 
         async def request_callback(msg: Msg) -> None:
             # Check for no responders status (empty message with 503 status)
@@ -942,21 +1024,49 @@ class RPCClient(RPCClientProtocol):
         request_subject = f"_rpc.iterator.{iterator_id}.request"
         response_subject = f"_rpc.iterator.{iterator_id}.response"
 
-        # Initialize the pull iterator using regular call method
-        # We pass a special __pullIterator marker as the first argument
-        init_response = await self.call(
-            subject, {"__pullIterator": True, "__iteratorId": iterator_id, "args": args}
-        )
-
-        # The response should contain the iterator ID (same as we sent)
-        if not init_response or init_response.get("iteratorId") != iterator_id:
-            raise RuntimeError("Failed to initialize pull iterator")
-
-        # Subscribe to responses
         response_queue: asyncio.Queue[PullIteratorResponse] = asyncio.Queue()
         ended = False
         error: Exception | None = None
 
+        # Registered with the client for the iterator's lifetime: a consumer
+        # parked in `await response_queue.get()` must be force-settled when
+        # the connection tears down (disconnect/suspend), or its `async for`
+        # hangs forever.
+        def settle_on_disconnect() -> None:
+            nonlocal ended, error
+            if not ended:
+                ended = True
+                error = create_error(ErrorCode.CONNECTION_CLOSED, "Connection closed")
+            err = (
+                error
+                if isinstance(error, RPCException)
+                else create_error(ErrorCode.CONNECTION_CLOSED, "Connection closed")
+            )
+            settle_msg: PullIteratorResponse = {
+                "type": "error",
+                "id": iterator_id,
+                "error": err.to_dict(),
+            }
+            response_queue.put_nowait(settle_msg)
+
+        self._pull_iterator_settles.add(settle_on_disconnect)
+
+        # Initialize the pull iterator using regular call method
+        # We pass a special __pullIterator marker as the first argument
+        try:
+            init_response = await self.call(
+                subject, {"__pullIterator": True, "__iteratorId": iterator_id, "args": args}
+            )
+        except Exception:
+            self._pull_iterator_settles.discard(settle_on_disconnect)
+            raise
+
+        # The response should contain the iterator ID (same as we sent)
+        if not init_response or init_response.get("iteratorId") != iterator_id:
+            self._pull_iterator_settles.discard(settle_on_disconnect)
+            raise RuntimeError("Failed to initialize pull iterator")
+
+        # Subscribe to responses
         async def handle_response(msg: PullIteratorResponse) -> None:
             nonlocal ended, error
 
@@ -972,6 +1082,8 @@ class RPCClient(RPCClientProtocol):
         unsubscribe = await self.subscribe(response_subject, handle_response)
 
         async def cleanup() -> None:
+            self._pull_iterator_settles.discard(settle_on_disconnect)
+
             if unsubscribe is not None:
                 await unsubscribe()
 
@@ -1099,6 +1211,31 @@ class RPCClient(RPCClientProtocol):
 
         cb_unsub = await self.subscribe(callback_subject, handle_cb_msg)
 
+        response_queue: asyncio.Queue[PullIteratorResponse] = asyncio.Queue()
+        ended = False
+        error: Exception | None = None
+
+        # See call_pull_iterator: force-settle a parked queue.get() on
+        # connection teardown so the consumer's `async for` terminates.
+        def settle_on_disconnect() -> None:
+            nonlocal ended, error
+            if not ended:
+                ended = True
+                error = create_error(ErrorCode.CONNECTION_CLOSED, "Connection closed")
+            err = (
+                error
+                if isinstance(error, RPCException)
+                else create_error(ErrorCode.CONNECTION_CLOSED, "Connection closed")
+            )
+            settle_msg: PullIteratorResponse = {
+                "type": "error",
+                "id": iterator_id,
+                "error": err.to_dict(),
+            }
+            response_queue.put_nowait(settle_msg)
+
+        self._pull_iterator_settles.add(settle_on_disconnect)
+
         # Init the pull-callback session via regular RPC call.
         init_params: PullCallbackParams = {
             "__pullCallback": True,
@@ -1112,16 +1249,14 @@ class RPCClient(RPCClientProtocol):
         try:
             init_response = await self.call(subject, init_params)
         except Exception:
+            self._pull_iterator_settles.discard(settle_on_disconnect)
             await cb_unsub()
             raise
 
         if not init_response or init_response.get("iteratorId") != iterator_id:
+            self._pull_iterator_settles.discard(settle_on_disconnect)
             await cb_unsub()
             raise RuntimeError("Failed to initialize pull-callback iterator")
-
-        response_queue: asyncio.Queue[PullIteratorResponse] = asyncio.Queue()
-        ended = False
-        error: Exception | None = None
 
         async def handle_response(msg: PullIteratorResponse) -> None:
             nonlocal ended, error
@@ -1155,6 +1290,7 @@ class RPCClient(RPCClientProtocol):
         sub = await self.nc.subscribe(inbox, cb=request_callback, max_msgs=1)
 
         async def cleanup() -> None:
+            self._pull_iterator_settles.discard(settle_on_disconnect)
             await cb_unsub()
             if resp_unsub is not None:
                 await resp_unsub()
@@ -1292,6 +1428,7 @@ class RPCClient(RPCClientProtocol):
 
         unsubscribers: list[Callable[[], Coroutine[Any, Any, None]]] = []
         pull_iterator_ids: list[str] = []
+        callback_ids: list[str] = []
 
         # Extract methods based on option
         handlers_map = (
@@ -1384,6 +1521,7 @@ class RPCClient(RPCClientProtocol):
                             iterator_id,
                             client,
                             client.io_pool,
+                            on_finished=lambda iid=iterator_id: client.pull_iterator_cleanups.pop(iid, None),
                         )
 
                         # Store cleanup function for later
@@ -1409,6 +1547,9 @@ class RPCClient(RPCClientProtocol):
                             pc_oneway_methods,
                             client,
                             client.io_pool,
+                            on_finished=lambda iid=pc_iterator_id: client.pull_iterator_cleanups.pop(
+                                iid, None
+                            ),
                         )
 
                         client.pull_iterator_cleanups[pc_iterator_id] = pc_cleanup
@@ -1442,8 +1583,10 @@ class RPCClient(RPCClientProtocol):
                             message["id"],
                             client,
                             client.io_pool,
+                            on_finished=lambda cid=message["id"]: client.callback_cleanups.pop(cid, None),
                         )
                         client.callback_cleanups[message["id"]] = cb_cleanup
+                        callback_ids.append(message["id"])
 
                         response["result"] = {"ok": True}
                         reply_subject = f"rpc.reply.{message['id']}"
@@ -1482,23 +1625,23 @@ class RPCClient(RPCClientProtocol):
             # Unsubscribe all handlers
             await asyncio.gather(*(unsub() for unsub in unsubscribers), return_exceptions=True)
 
+            # Cleanup pull iterators / callbacks — only the ones THIS
+            # register_handler call created. The client maps are shared across
+            # register_handler calls; sweeping them wholesale would kill the
+            # live sessions of every other namespace.
             async def cleanup_iterator(iterator_id: str) -> None:
-                if cleanup := client.pull_iterator_cleanups.get(iterator_id):
-                    await cleanup()
-                    del client.pull_iterator_cleanups[iterator_id]
+                if fn := client.pull_iterator_cleanups.pop(iterator_id, None):
+                    await fn()
 
-            # Cleanup pull iterators
             await asyncio.gather(
                 *(cleanup_iterator(iterator_id) for iterator_id in pull_iterator_ids),
                 return_exceptions=True,
             )
 
-            # Cleanup callbacks
-            callback_cleanups = list(client.callback_cleanups.items())
-            for cb_id, cb_cleanup in callback_cleanups:
-                with contextlib.suppress(Exception):
-                    await cb_cleanup()
-                client.callback_cleanups.pop(cb_id, None)
+            for cb_id in callback_ids:
+                if cb_cleanup := client.callback_cleanups.pop(cb_id, None):
+                    with contextlib.suppress(Exception):
+                        await cb_cleanup()
 
             if isolated_connection:
                 # Disconnect isolated client if it was created

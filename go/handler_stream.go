@@ -3,6 +3,7 @@ package rpc
 import (
 	"fmt"
 	"reflect"
+	"sync"
 )
 
 // handleStreamRequestGo handles a push-based streaming request.
@@ -110,7 +111,9 @@ func iterateAndPublish(result any, requestID, streamSubject string, client *Clie
 
 // handlePullIteratorRequestGo handles a pull-based iterator request.
 // It calls the handler and sets up the request/response protocol for iteration.
-func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string, client *Client) (func(), error) {
+// onFinished is invoked once when the iterator ends naturally (done/cancel) so
+// the caller can drop its cleanup-map entry for this session.
+func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string, client *Client, onFinished func()) (func(), error) {
 	result, err := callHandler(fn, args)
 	if err != nil {
 		return nil, err
@@ -126,6 +129,31 @@ func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string
 
 	active := true
 
+	// subUnsub is assigned after Subscribe returns but read from the NATS
+	// callback goroutine — guard it against that race.
+	var subUnsubMu sync.Mutex
+	var subUnsub func()
+
+	// Natural end (done/cancel): drop the request subscription and let the
+	// caller remove its cleanup-map entry. Without this, every finished
+	// session leaves its `_rpc.iterator.*.request` subscription and cleanup
+	// closure behind until the whole client disconnects.
+	var finishOnce sync.Once
+	finish := func() {
+		finishOnce.Do(func() {
+			active = false
+			subUnsubMu.Lock()
+			u := subUnsub
+			subUnsubMu.Unlock()
+			if u != nil {
+				u()
+			}
+			if onFinished != nil {
+				onFinished()
+			}
+		})
+	}
+
 	unsub, err := client.Subscribe(requestSubject, func(data []byte) {
 		if !active || !client.IsConnected() {
 			return
@@ -138,7 +166,7 @@ func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string
 
 		switch req.Type {
 		case "cancel":
-			active = false
+			finish()
 			resp := PullIteratorResponse{
 				ID:   iteratorID,
 				Type: "done",
@@ -148,7 +176,7 @@ func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string
 		case "next":
 			val, ok := rv.Recv()
 			if !ok {
-				active = false
+				finish()
 				resp := PullIteratorResponse{
 					ID:   iteratorID,
 					Type: "done",
@@ -167,10 +195,16 @@ func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string
 	if err != nil {
 		return nil, err
 	}
+	subUnsubMu.Lock()
+	subUnsub = unsub
+	subUnsubMu.Unlock()
 
 	cleanup := func() {
-		active = false
-		unsub()
+		finishOnce.Do(func() {
+			active = false
+			unsub()
+			// No onFinished here — the caller is already sweeping its map.
+		})
 	}
 
 	return cleanup, nil

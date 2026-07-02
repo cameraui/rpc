@@ -15,19 +15,22 @@ import type { RPCResponse } from './types.js';
 export class RPCService {
   private svc?: Svcm;
   private services: NATSService[] = [];
-  private initialized = false;
+  private nc?: NatsConnection;
 
   constructor(private client: RPCClient) {}
 
   /**
-   * Initialize the service manager
+   * Initialize the service manager. Re-initializes when the underlying
+   * connection changed (suspend()+connect() creates a fresh NatsConnection) —
+   * a Svcm bound to the old, closed connection would break monitor() and
+   * service discovery after every reconnect cycle.
    */
   public init(nc: NatsConnection): void {
-    if (this.initialized) {
+    if (this.nc === nc) {
       return;
     }
 
-    this.initialized = true;
+    this.nc = nc;
     this.svc = new Svcm(nc);
     this.services = [];
   }
@@ -176,7 +179,7 @@ export class RPCService {
               const pullParams = rpcMsg.params?.__pullIterator ? rpcMsg.params : rpcMsg.params[0];
               const args = pullParams.args ?? [];
               const iteratorId = pullParams.__iteratorId ?? rpcMsg.id;
-              const cleanup = await handlePullIteratorRequest(handler, args, iteratorId, serviceClient);
+              const cleanup = await handlePullIteratorRequest(handler, args, iteratorId, serviceClient, () => pullIteratorCleanups.delete(iteratorId));
 
               // Store cleanup function for later
               pullIteratorCleanups.set(iteratorId, cleanup);

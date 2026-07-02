@@ -14,29 +14,40 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-type subscriptionMeta struct {
+// subscriptionEntry represents one Subscribe/SubscribeQueue call. Entries are
+// stable across Suspend()/Connect() cycles so the unsubscribe closure a caller
+// holds keeps working after a restore. Multiple subscribers on the same
+// pattern coexist — each gets its own entry and its own NATS subscription.
+type subscriptionEntry struct {
 	pattern string
 	queue   string
 	handler func(data []byte)
 	opts    []func(*nats.Subscription)
+	sub     *nats.Subscription
 }
 
 // Client is the main RPC client that communicates over NATS using MessagePack.
 type Client struct {
 	Options ClientOptions
 
-	nc               *nats.Conn
-	mu               sync.RWMutex
-	closed           bool
-	maxPayloadSize   int
-	chunkingManager  *ChunkingManager
-	subscriptionMeta []subscriptionMeta
+	nc              *nats.Conn
+	mu              sync.RWMutex
+	closed          bool
+	maxPayloadSize  int
+	chunkingManager *ChunkingManager
 
-	subscriptions map[string][]*nats.Subscription
-	subMu         sync.Mutex
+	subSeq      int
+	subEntries  map[int]*subscriptionEntry
+	requestSubs []*nats.Subscription
+	subMu       sync.Mutex
 
 	pendingRequests sync.Map // map[string]*pendingRequest
 	streamHandlers  sync.Map // map[string]*streamHandler
+
+	// Settle hooks for client-side pull iterators: a consumer parked in a
+	// next() wait must be force-settled when the connection tears down,
+	// otherwise it hangs forever (streamHandlers get the same treatment).
+	pullIteratorSettles sync.Map // map[string]func()
 
 	isolatedClients   []*Client
 	isolatedClientsMu sync.Mutex
@@ -46,9 +57,14 @@ type Client struct {
 }
 
 type pendingRequest struct {
-	done   chan struct{}
-	result any
-	err    error
+	done chan struct{}
+	// cleanup tears down the reply + inbox subscriptions of the call.
+	// Idempotent; invoked from the call's own exit path and from
+	// Disconnect()/Suspend() so a suspended in-flight call doesn't restore a
+	// dead rpc.reply.* subscription on the next Connect().
+	cleanup func()
+	result  any
+	err     error
 }
 
 type streamHandler struct {
@@ -72,7 +88,7 @@ func NewClient(opts ClientOptions) *Client { //nolint:gocritic // opts is copied
 		Options:         opts,
 		maxPayloadSize:  1024 * 1024, // 1MB default
 		chunkingManager: NewChunkingManager(),
-		subscriptions:   make(map[string][]*nats.Subscription),
+		subEntries:      make(map[int]*subscriptionEntry),
 	}
 }
 
@@ -159,6 +175,11 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.nc = nc
 
+	// A client that was Disconnect()ed is revivable by an explicit Connect().
+	// Without this reset, auto-connect in callOnce and the no-responder retry
+	// loop stay permanently disabled.
+	c.closed = false
+
 	// Auto-detect max_payload from server
 	if mp := nc.MaxPayload(); mp > 0 {
 		c.maxPayloadSize = int(mp)
@@ -169,24 +190,21 @@ func (c *Client) Connect(ctx context.Context) error {
 	// Reserve 8KB for NATS protocol overhead and MsgPack envelope per message
 	c.maxPayloadSize -= 8192
 
-	// Restore subscriptions from previous session (e.g. after Suspend+Connect)
-	metas := make([]subscriptionMeta, len(c.subscriptionMeta))
-	copy(metas, c.subscriptionMeta)
-	c.subscriptionMeta = nil
 	c.mu.Unlock()
 
-	for _, meta := range metas {
-		if meta.queue != "" {
-			if _, err := c.SubscribeQueue(meta.pattern, meta.queue, meta.handler); err != nil {
-				// Log but don't fail — partial restore is better than none
-				continue
-			}
-		} else {
-			if _, err := c.Subscribe(meta.pattern, meta.handler, meta.opts...); err != nil {
-				continue
-			}
+	// Restore subscriptions from previous session (e.g. after Suspend+Connect).
+	// Entries keep their identity so unsubscribe closures held by callers stay
+	// valid across the restore.
+	c.subMu.Lock()
+	for _, entry := range c.subEntries {
+		if entry.sub != nil && entry.sub.IsValid() {
+			continue
 		}
+		entry.sub = nil
+		// Ignore errors — partial restore is better than none
+		_ = c.natsSubscribe(nc, entry)
 	}
+	c.subMu.Unlock()
 
 	return nil
 }
@@ -198,14 +216,9 @@ func (c *Client) Disconnect() error {
 	nc := c.nc
 	c.mu.Unlock()
 
-	// Reject pending requests
-	c.pendingRequests.Range(func(key, value any) bool {
-		pr := value.(*pendingRequest)
-		pr.err = NewRPCException(ErrCodeConnectionClosed, "Connection closed")
-		close(pr.done)
-		c.pendingRequests.Delete(key)
-		return true
-	})
+	// Reject pending requests. pr.cleanup drops the call's reply/inbox
+	// subscriptions too — otherwise an in-flight call would leak them.
+	c.rejectPendingRequests()
 
 	// End stream handlers
 	c.streamHandlers.Range(func(key, value any) bool {
@@ -214,6 +227,9 @@ func (c *Client) Disconnect() error {
 		c.streamHandlers.Delete(key)
 		return true
 	})
+
+	// Force-settle client-side pull iterators parked in a next() wait
+	c.settlePullIterators()
 
 	// Cleanup pull iterators
 	c.pullIteratorCleanups.Range(func(key, value any) bool {
@@ -235,12 +251,16 @@ func (c *Client) Disconnect() error {
 
 	// Unsubscribe all
 	c.subMu.Lock()
-	for _, subs := range c.subscriptions {
-		for _, sub := range subs {
-			_ = sub.Unsubscribe()
+	for _, entry := range c.subEntries {
+		if entry.sub != nil {
+			_ = entry.sub.Unsubscribe()
 		}
 	}
-	c.subscriptions = make(map[string][]*nats.Subscription)
+	c.subEntries = make(map[int]*subscriptionEntry)
+	for _, sub := range c.requestSubs {
+		_ = sub.Unsubscribe()
+	}
+	c.requestSubs = nil
 	c.subMu.Unlock()
 
 	// Reset chunking manager
@@ -253,11 +273,6 @@ func (c *Client) Disconnect() error {
 	}
 	c.isolatedClients = nil
 	c.isolatedClientsMu.Unlock()
-
-	// Clear subscription metadata
-	c.mu.Lock()
-	c.subscriptionMeta = nil
-	c.mu.Unlock()
 
 	// Close NATS connection with timeout
 	if nc != nil {
@@ -283,6 +298,37 @@ func (c *Client) Disconnect() error {
 	c.mu.Unlock()
 
 	return nil
+}
+
+// rejectPendingRequests settles every in-flight call with a connection-closed
+// error and runs its cleanup (reply + inbox subscription teardown). Runs on
+// Disconnect()/Suspend(). LoadAndDelete guards against a concurrent settle by
+// the reply handler — only one side wins.
+func (c *Client) rejectPendingRequests() {
+	c.pendingRequests.Range(func(key, _ any) bool {
+		if v, ok := c.pendingRequests.LoadAndDelete(key); ok {
+			pr := v.(*pendingRequest)
+			if pr.cleanup != nil {
+				pr.cleanup()
+			}
+			pr.err = NewRPCException(ErrCodeConnectionClosed, "Connection closed")
+			close(pr.done)
+		}
+		return true
+	})
+}
+
+// settlePullIterators force-settles every client-side pull iterator parked in
+// a next() wait. Runs on Disconnect()/Suspend() so consumers terminate with a
+// connection error instead of hanging forever.
+func (c *Client) settlePullIterators() {
+	c.pullIteratorSettles.Range(func(key, value any) bool {
+		if settle, ok := value.(func()); ok {
+			settle()
+		}
+		c.pullIteratorSettles.Delete(key)
+		return true
+	})
 }
 
 // Publish sends a message to a subject with automatic chunking for large payloads.
@@ -365,6 +411,19 @@ func (c *Client) publishInternal(subject string, data any, reply string) error {
 // Subscribe subscribes to a subject pattern. The handler receives decoded MessagePack data.
 // Returns an unsubscribe function.
 func (c *Client) Subscribe(pattern string, handler func(data []byte), opts ...func(*nats.Subscription)) (func(), error) {
+	return c.subscribeEntry(&subscriptionEntry{pattern: pattern, handler: handler, opts: opts})
+}
+
+// SubscribeQueue subscribes to a subject with a queue group.
+func (c *Client) SubscribeQueue(pattern, queue string, handler func(data []byte)) (func(), error) {
+	return c.subscribeEntry(&subscriptionEntry{pattern: pattern, queue: queue, handler: handler})
+}
+
+// subscribeEntry registers a subscription entry and creates its NATS
+// subscription. The entry survives Suspend()/Connect() cycles; the returned
+// unsubscribe closure removes exactly this entry (and only this entry), even
+// after the underlying NATS subscription was replaced by a restore.
+func (c *Client) subscribeEntry(entry *subscriptionEntry) (func(), error) {
 	c.mu.RLock()
 	nc := c.nc
 	c.mu.RUnlock()
@@ -373,7 +432,40 @@ func (c *Client) Subscribe(pattern string, handler func(data []byte), opts ...fu
 		return nil, fmt.Errorf("not connected")
 	}
 
-	sub, err := nc.Subscribe(pattern, func(msg *nats.Msg) {
+	if err := c.natsSubscribe(nc, entry); err != nil {
+		return nil, err
+	}
+
+	c.subMu.Lock()
+	c.subSeq++
+	key := c.subSeq
+	c.subEntries[key] = entry
+	c.subMu.Unlock()
+
+	unsub := func() {
+		c.subMu.Lock()
+		e, ok := c.subEntries[key]
+		delete(c.subEntries, key)
+		var sub *nats.Subscription
+		if ok {
+			sub = e.sub
+		}
+		c.subMu.Unlock()
+		if sub != nil {
+			_ = sub.Unsubscribe()
+		}
+	}
+
+	return unsub, nil
+}
+
+// natsSubscribe creates the NATS subscription for an entry. Called from
+// subscribeEntry and again from Connect() when restoring entries after a
+// Suspend cycle.
+func (c *Client) natsSubscribe(nc *nats.Conn, entry *subscriptionEntry) error {
+	handler := entry.handler
+
+	msgHandler := func(msg *nats.Msg) {
 		chunkType := ""
 		if msg.Header != nil {
 			chunkType = msg.Header.Get("x-chunked-transfer")
@@ -419,141 +511,30 @@ func (c *Client) Subscribe(pattern string, handler func(data []byte), opts ...fu
 			// Regular message — pass raw bytes to handler
 			handler(msg.Data)
 		}
-	})
-	if err != nil {
-		return nil, fmt.Errorf("subscribe: %w", err)
 	}
 
-	for _, opt := range opts {
+	var sub *nats.Subscription
+	var err error
+	if entry.queue != "" {
+		sub, err = nc.QueueSubscribe(entry.pattern, entry.queue, msgHandler)
+		if err != nil {
+			return fmt.Errorf("queue subscribe: %w", err)
+		}
+		// Ensure subscription is registered on the server
+		_ = nc.Flush()
+	} else {
+		sub, err = nc.Subscribe(entry.pattern, msgHandler)
+		if err != nil {
+			return fmt.Errorf("subscribe: %w", err)
+		}
+	}
+
+	for _, opt := range entry.opts {
 		opt(sub)
 	}
 
-	c.subMu.Lock()
-	c.subscriptions[pattern] = append(c.subscriptions[pattern], sub)
-	c.subMu.Unlock()
-
-	c.mu.Lock()
-	c.subscriptionMeta = append(c.subscriptionMeta, subscriptionMeta{pattern: pattern, handler: handler, opts: opts})
-	c.mu.Unlock()
-
-	unsub := func() {
-		_ = sub.Unsubscribe()
-		c.subMu.Lock()
-		subs := c.subscriptions[pattern]
-		for i, s := range subs {
-			if s == sub {
-				c.subscriptions[pattern] = append(subs[:i], subs[i+1:]...)
-				break
-			}
-		}
-		c.subMu.Unlock()
-
-		c.mu.Lock()
-		for i, m := range c.subscriptionMeta {
-			if m.pattern == pattern {
-				c.subscriptionMeta = append(c.subscriptionMeta[:i], c.subscriptionMeta[i+1:]...)
-				break
-			}
-		}
-		c.mu.Unlock()
-	}
-
-	return unsub, nil
-}
-
-// SubscribeQueue subscribes to a subject with a queue group.
-func (c *Client) SubscribeQueue(pattern, queue string, handler func(data []byte)) (func(), error) {
-	c.mu.RLock()
-	nc := c.nc
-	c.mu.RUnlock()
-
-	if nc == nil {
-		return nil, fmt.Errorf("not connected")
-	}
-
-	sub, err := nc.QueueSubscribe(pattern, queue, func(msg *nats.Msg) {
-		chunkType := ""
-		if msg.Header != nil {
-			chunkType = msg.Header.Get("x-chunked-transfer")
-		}
-
-		switch chunkType {
-		case "header":
-			var hdr ChunkedTransferHeader
-			if err := Decode(msg.Data, &hdr); err != nil {
-				return
-			}
-			chunkID := ""
-			if msg.Header != nil {
-				chunkID = msg.Header.Get("x-chunk-id")
-			}
-			if chunkID == "" || hdr.TransferID != chunkID {
-				return
-			}
-			c.chunkingManager.StartReceiving(
-				hdr.TransferID, hdr.TotalChunks,
-				func(data []byte) { handler(data) },
-				func(err error) {},
-				hdr.TotalSize, hdr.ChunkSize,
-			)
-
-		case "chunk":
-			chunkID := ""
-			chunkIndex := 0
-			if msg.Header != nil {
-				chunkID = msg.Header.Get("x-chunk-id")
-				chunkIndex, _ = strconv.Atoi(msg.Header.Get("x-chunk-index"))
-			}
-			if chunkID == "" {
-				return
-			}
-			c.chunkingManager.ProcessChunk(ChunkData{
-				ID:         chunkID,
-				ChunkIndex: chunkIndex,
-				Data:       msg.Data,
-			})
-
-		default:
-			handler(msg.Data)
-		}
-	})
-	if err != nil {
-		return nil, fmt.Errorf("queue subscribe: %w", err)
-	}
-	// Ensure subscription is registered on the server
-	_ = nc.Flush()
-
-	c.subMu.Lock()
-	c.subscriptions[pattern] = append(c.subscriptions[pattern], sub)
-	c.subMu.Unlock()
-
-	c.mu.Lock()
-	c.subscriptionMeta = append(c.subscriptionMeta, subscriptionMeta{pattern: pattern, queue: queue, handler: handler})
-	c.mu.Unlock()
-
-	unsub := func() {
-		_ = sub.Unsubscribe()
-		c.subMu.Lock()
-		subs := c.subscriptions[pattern]
-		for i, s := range subs {
-			if s == sub {
-				c.subscriptions[pattern] = append(subs[:i], subs[i+1:]...)
-				break
-			}
-		}
-		c.subMu.Unlock()
-
-		c.mu.Lock()
-		for i, m := range c.subscriptionMeta {
-			if m.pattern == pattern && m.queue == queue {
-				c.subscriptionMeta = append(c.subscriptionMeta[:i], c.subscriptionMeta[i+1:]...)
-				break
-			}
-		}
-		c.mu.Unlock()
-	}
-
-	return unsub, nil
+	entry.sub = sub
+	return nil
 }
 
 // Request sends a native NATS request/reply, with automatic retry on no-responder errors.
@@ -675,16 +656,15 @@ func (c *Client) OnRequest(pattern string, handler func(data []byte) (any, error
 	_ = nc.Flush()
 
 	c.subMu.Lock()
-	c.subscriptions[pattern] = append(c.subscriptions[pattern], sub)
+	c.requestSubs = append(c.requestSubs, sub)
 	c.subMu.Unlock()
 
 	return func() {
 		_ = sub.Unsubscribe()
 		c.subMu.Lock()
-		subs := c.subscriptions[pattern]
-		for i, s := range subs {
+		for i, s := range c.requestSubs {
 			if s == sub {
-				c.subscriptions[pattern] = append(subs[:i], subs[i+1:]...)
+				c.requestSubs = append(c.requestSubs[:i], c.requestSubs[i+1:]...)
 				break
 			}
 		}
@@ -748,9 +728,6 @@ func (c *Client) callOnce(ctx context.Context, subject string, args ...any) (any
 		replySubject = subject + ".reply." + id
 	}
 
-	pr := &pendingRequest{done: make(chan struct{})}
-	c.pendingRequests.Store(id, pr)
-
 	// Subscribe to reply
 	unsub, err := c.Subscribe(replySubject, func(data []byte) {
 		var resp RPCResponse
@@ -772,16 +749,7 @@ func (c *Client) callOnce(ctx context.Context, subject string, args ...any) (any
 		}
 	})
 	if err != nil {
-		c.pendingRequests.Delete(id)
 		return nil, err
-	}
-	defer unsub()
-
-	// Build and send the RPC message
-	message := RPCMessage{
-		ID:     id,
-		Method: "call",
-		Params: args,
 	}
 
 	inbox := nc.NewInbox()
@@ -795,11 +763,33 @@ func (c *Client) callOnce(ctx context.Context, subject string, args ...any) (any
 		}
 	})
 	if err != nil {
-		c.pendingRequests.Delete(id)
+		unsub()
 		return nil, err
 	}
 	_ = noRespSub.AutoUnsubscribe(1)
-	defer func() { _ = noRespSub.Unsubscribe() }()
+
+	// Tear down the reply + inbox subscriptions exactly once. Runs on every
+	// exit path of this call AND from Disconnect()/Suspend() via pr.cleanup —
+	// a timed-out or suspended call must not leak its subscriptions (or have
+	// a dead rpc.reply.* entry restored on the next Connect()).
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			unsub()
+			_ = noRespSub.Unsubscribe()
+		})
+	}
+	defer cleanup()
+
+	pr := &pendingRequest{done: make(chan struct{}), cleanup: cleanup}
+	c.pendingRequests.Store(id, pr)
+
+	// Build and send the RPC message
+	message := RPCMessage{
+		ID:     id,
+		Method: "call",
+		Params: args,
+	}
 
 	if err := c.publishInternal(subject, message, inbox); err != nil {
 		c.pendingRequests.Delete(id)
@@ -880,14 +870,10 @@ func (c *Client) Suspend() error {
 	nc := c.nc
 	c.mu.Unlock()
 
-	// Reject pending requests
-	c.pendingRequests.Range(func(key, value any) bool {
-		pr := value.(*pendingRequest)
-		pr.err = NewRPCException(ErrCodeConnectionClosed, "Connection suspended")
-		close(pr.done)
-		c.pendingRequests.Delete(key)
-		return true
-	})
+	// Reject pending requests. pr.cleanup drops the call's reply-subscription
+	// entry too — otherwise a suspended in-flight call would be restored as a
+	// dead rpc.reply.* subscription on the next Connect().
+	c.rejectPendingRequests()
 
 	// End stream handlers
 	c.streamHandlers.Range(func(key, value any) bool {
@@ -896,6 +882,9 @@ func (c *Client) Suspend() error {
 		c.streamHandlers.Delete(key)
 		return true
 	})
+
+	// Force-settle client-side pull iterators parked in a next() wait
+	c.settlePullIterators()
 
 	// Cleanup pull iterators
 	c.pullIteratorCleanups.Range(func(key, value any) bool {
@@ -915,14 +904,19 @@ func (c *Client) Suspend() error {
 		return true
 	})
 
-	// Unsubscribe all
+	// Unsubscribe all subscriptions but keep the entries — Connect() restores
+	// them on the fresh transport.
 	c.subMu.Lock()
-	for _, subs := range c.subscriptions {
-		for _, sub := range subs {
-			_ = sub.Unsubscribe()
+	for _, entry := range c.subEntries {
+		if entry.sub != nil {
+			_ = entry.sub.Unsubscribe()
+			entry.sub = nil
 		}
 	}
-	c.subscriptions = make(map[string][]*nats.Subscription)
+	for _, sub := range c.requestSubs {
+		_ = sub.Unsubscribe()
+	}
+	c.requestSubs = nil
 	c.subMu.Unlock()
 
 	// Reset chunking manager
@@ -935,8 +929,6 @@ func (c *Client) Suspend() error {
 	}
 	c.isolatedClients = nil
 	c.isolatedClientsMu.Unlock()
-
-	// NOTE: subscriptionMeta is intentionally preserved for restoration on reconnect.
 
 	// Close NATS connection with timeout
 	if nc != nil {

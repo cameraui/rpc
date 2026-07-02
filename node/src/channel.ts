@@ -1,5 +1,3 @@
-import { isPromise } from './utils.js';
-
 import type { RPCClient } from './client.js';
 
 export interface ChannelMessage {
@@ -163,24 +161,15 @@ export class Channel {
     await this.cleanup();
   }
 
-  // Per-channel promise chain. Async handlers for message / close / error
-  // are serialized via this chain so dispatch stays ordered — matches
-  // Python's channel.py:_emit/_handle_close/_handle_error behavior.
-  // Sync handlers stay fire-and-forget (not chained, no overhead).
+  // Per-channel promise chain. Handlers for message / close / error are
+  // serialized via this chain so dispatch stays ordered — matches Python's
+  // channel.py:_emit/_handle_close/_handle_error behavior. The handler is
+  // invoked INSIDE the chain; invoking eagerly and only chaining the
+  // completion would run async handlers concurrently and out of order.
   private handlerChain: Promise<void> = Promise.resolve();
 
   private runHandler<Arg>(handler: (arg: Arg) => void, arg: Arg, label: string): void {
-    let result: unknown;
-    try {
-      result = handler(arg);
-    } catch (error) {
-      console.error(`Error in ${label}:`, error);
-      return;
-    }
-    if (isPromise(result)) {
-      const pending = result;
-      this.handlerChain = this.handlerChain.then(() => pending as Promise<void>).catch((error) => console.error(`Error in ${label}:`, error));
-    }
+    this.handlerChain = this.handlerChain.then(() => handler(arg)).catch((error) => console.error(`Error in ${label}:`, error));
   }
 
   protected emit(event: string, data?: any): void {
@@ -215,8 +204,10 @@ export class Channel {
     this.closeHandlers.clear();
     this.errorHandlers.clear();
 
-    // Clear subscriptions
-    await Promise.allSettled(this.subscriptions.map((unsub) => unsub));
+    // Clear subscriptions — each element is a Promise resolving to the
+    // unsubscribe function; it must be awaited AND invoked.
+    await Promise.allSettled(this.subscriptions.map(async (unsub) => (await unsub)()));
+    this.subscriptions = [];
 
     // Unsubscribe from NATS
     if (this.unsubscribe) {
