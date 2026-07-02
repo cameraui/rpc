@@ -99,6 +99,7 @@ tests=(
   "pull-callback-basic"
   "pull-callback-backpressure"
   "pull-callback-cancellation"
+  "perf-hotpath"
 )
 
 python_supports_test() {

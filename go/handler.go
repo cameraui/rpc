@@ -75,7 +75,27 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 				return
 			}
 
-			response := RPCResponse{ID: msg.ID, Methods: allMethodNames}
+			response := RPCResponse{ID: msg.ID}
+
+			// Method discovery on demand: only a request whose envelope
+			// carries __discover (a proxy with an empty method cache) pays
+			// for the namespace's method list — attaching it to every
+			// response would be dead wire weight once the proxy cache is
+			// filled. Old clients never send __discover and never read
+			// __methods on this path.
+			if msg.Discover {
+				response.Methods = allMethodNames
+			}
+
+			// setError formats err into the response and, as a diagnostic
+			// aid, attaches the method list to METHOD_NOT_FOUND errors —
+			// discovery requested or not (rare, small).
+			setError := func(err error) {
+				response.Error = FormatErrorObject(err)
+				if response.Error != nil && response.Error.Code == ErrCodeMethodNotFound {
+					response.Methods = allMethodNames
+				}
+			}
 
 			// Check for stream request
 			if isStreamRequest(msg.Params) {
@@ -91,7 +111,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 					client.pullIteratorCleanups.Delete(iteratorID)
 				})
 				if err != nil {
-					response.Error = FormatErrorObject(err)
+					setError(err)
 					replySubject := "rpc.reply." + msg.ID
 					_ = client.Publish(replySubject, response)
 					return
@@ -113,7 +133,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 					client.pullIteratorCleanups.Delete(iteratorID)
 				})
 				if err != nil {
-					response.Error = FormatErrorObject(err)
+					setError(err)
 					replySubject := "rpc.reply." + msg.ID
 					_ = client.Publish(replySubject, response)
 					return
@@ -136,7 +156,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 					client.callbackCleanups.Delete(requestID)
 				})
 				if err != nil {
-					response.Error = FormatErrorObject(err)
+					setError(err)
 					replySubject := "rpc.reply." + msg.ID
 					_ = client.Publish(replySubject, response)
 					return
@@ -154,7 +174,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 			// Normal RPC call
 			result, err := callHandler(fnCopy, msg.Params)
 			if err != nil {
-				response.Error = FormatErrorObject(err)
+				setError(err)
 			} else {
 				response.Result = result
 			}
@@ -378,11 +398,19 @@ func callHandler(fn reflect.Value, params any) (any, error) {
 		args = []any{params}
 	}
 
-	// JS `undefined` arrives as msgpackrUndefined (ext type 0). Normalize to nil
-	// deeply so it never reaches a handler as an empty struct (which would
+	// JS `undefined` arrives as msgpackrUndefined (ext type 0). Normalize to
+	// nil deeply so it never reaches a handler as an empty struct (which would
 	// serialize back out as `{}`).
+	//
+	// Gate: after a generic msgpack decode, `undefined` can only appear as the
+	// arg itself or nested inside map[string]any/[]any containers (the only
+	// container types the decoder produces for `any`). Scalar and []byte args
+	// — the NVR frame hot path — skip the recursive walk entirely.
 	for i := range args {
-		args[i] = NormalizeUndefined(args[i])
+		switch args[i].(type) {
+		case msgpackrUndefined, *msgpackrUndefined, map[string]any, []any:
+			args[i] = NormalizeUndefined(args[i])
+		}
 	}
 
 	fnType := fn.Type()

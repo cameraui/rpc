@@ -186,6 +186,9 @@ class ChunkingManager:
     # otherwise sit in memory until the whole client disconnects — so stale
     # transfers are swept lazily on every start_receiving/process_chunk call.
     _STALE_TRANSFER_TTL: float = 30.0
+    # Sweeping on every chunk of a large transfer is pure overhead — one
+    # sweep per second is more than enough for a 30s TTL.
+    _SWEEP_INTERVAL: float = 1.0
 
     def __init__(self) -> None:
         self.assemblers: dict[str, ChunkAssembler] = {}
@@ -193,6 +196,7 @@ class ChunkingManager:
         self.error_callbacks: dict[str, Callable[[Exception], None]] = {}
         self._assembler_pool: list[ChunkAssembler] = []
         self._last_activity: dict[str, float] = {}
+        self._last_sweep: float = 0.0
 
     def _get_assembler(self, transfer_id: str) -> ChunkAssembler:
         """Get a reusable assembler from a pool or create a new one."""
@@ -245,10 +249,18 @@ class ChunkingManager:
         self._last_activity[transfer_id] = time.monotonic()
 
     def _sweep_stale(self) -> None:
-        """Drop incomplete transfers with no activity for _STALE_TRANSFER_TTL."""
+        """Drop incomplete transfers with no activity for _STALE_TRANSFER_TTL.
+
+        Rate-limited to at most one sweep per _SWEEP_INTERVAL — this runs on
+        every start_receiving/process_chunk call.
+        """
         if not self._last_activity:
             return
-        cutoff = time.monotonic() - self._STALE_TRANSFER_TTL
+        now = time.monotonic()
+        if now - self._last_sweep < self._SWEEP_INTERVAL:
+            return
+        self._last_sweep = now
+        cutoff = now - self._STALE_TRANSFER_TTL
         stale = [tid for tid, ts in self._last_activity.items() if ts < cutoff]
         for transfer_id in stale:
             error_callback = self.error_callbacks.pop(transfer_id, None)

@@ -205,7 +205,9 @@ export async function handlePullIteratorRequest(
           id: iteratorId,
           type: 'done',
         };
-        await client.publish(responseSubject, response);
+        if (!client.tryPublishSync(responseSubject, response)) {
+          await client.publish(responseSubject, response);
+        }
       } else if (msg.type === 'next') {
         const { value, done } = await generator.next();
 
@@ -215,14 +217,20 @@ export async function handlePullIteratorRequest(
             id: iteratorId,
             type: 'done',
           };
-          await client.publish(responseSubject, response);
+          if (!client.tryPublishSync(responseSubject, response)) {
+            await client.publish(responseSubject, response);
+          }
         } else {
           const response: PullIteratorResponse = {
             id: iteratorId,
             type: 'value',
             value,
           };
-          await client.publish(responseSubject, response);
+          // Sync fast path for small values; large values fall back to the
+          // chunking-capable async publish.
+          if (!client.tryPublishSync(responseSubject, response)) {
+            await client.publish(responseSubject, response);
+          }
         }
       }
     } catch (error) {
@@ -232,7 +240,9 @@ export async function handlePullIteratorRequest(
         type: 'error',
         error: formatErrorObject(error),
       };
-      await client.publish(responseSubject, response);
+      if (!client.tryPublishSync(responseSubject, response)) {
+        await client.publish(responseSubject, response);
+      }
     }
   });
   subUnsub = unsub;
@@ -286,9 +296,18 @@ export async function handlePullCallbackRequest(
       callbackProxy[method] = (...a: any[]) => {
         if (!proxyActive || !client.isConnected) return;
         const msg: CallbackInvocation = { method, args: a };
-        client.publish(callbackSubject, msg).catch(() => {
+        try {
+          // Sync fast path: small payloads publish without any promise
+          // overhead — this is the per-frame hot path. Oversized payloads
+          // fall back to the chunking-capable async publish.
+          if (!client.tryPublishSync(callbackSubject, msg)) {
+            client.publish(callbackSubject, msg).catch(() => {
+              // Swallow publish errors (disconnect mid-flight, client already gone).
+            });
+          }
+        } catch {
           // Swallow publish errors (disconnect mid-flight, client already gone).
-        });
+        }
       };
     } else {
       callbackProxy[method] = () => {
@@ -344,18 +363,25 @@ export async function handlePullCallbackRequest(
           await generator.return();
         }
         const response: PullIteratorResponse = { id: iteratorId, type: 'done' };
-        await client.publish(responseSubject, response);
+        if (!client.tryPublishSync(responseSubject, response)) {
+          await client.publish(responseSubject, response);
+        }
       } else if (msg.type === 'next') {
         const { done } = await generator.next();
 
         if (done) {
           finish();
           const response: PullIteratorResponse = { id: iteratorId, type: 'done' };
-          await client.publish(responseSubject, response);
+          if (!client.tryPublishSync(responseSubject, response)) {
+            await client.publish(responseSubject, response);
+          }
         } else {
           // Batch boundary reached. Value is ignored by the protocol.
+          // Boundary responses are tiny — always hit the sync fast path.
           const response: PullIteratorResponse = { id: iteratorId, type: 'value' };
-          await client.publish(responseSubject, response);
+          if (!client.tryPublishSync(responseSubject, response)) {
+            await client.publish(responseSubject, response);
+          }
         }
       }
     } catch (error) {
@@ -365,7 +391,9 @@ export async function handlePullCallbackRequest(
         type: 'error',
         error: formatErrorObject(error),
       };
-      await client.publish(responseSubject, response);
+      if (!client.tryPublishSync(responseSubject, response)) {
+        await client.publish(responseSubject, response);
+      }
     }
   });
   subUnsub = unsub;

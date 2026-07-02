@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,8 +23,13 @@ type subscriptionEntry struct {
 	pattern string
 	queue   string
 	handler func(data []byte)
-	opts    []func(*nats.Subscription)
-	sub     *nats.Subscription
+	// rawHandler switches the entry to raw mode: it receives the undecoded
+	// *nats.Msg (with headers and subject) instead of decoded payload data.
+	// No chunk reassembly — used by the muxed reply inbox, which routes
+	// chunks itself. Mutually exclusive with handler.
+	rawHandler func(msg *nats.Msg)
+	opts       []func(*nats.Subscription)
+	sub        *nats.Subscription
 }
 
 // Client is the main RPC client that communicates over NATS using MessagePack.
@@ -40,6 +46,26 @@ type Client struct {
 	subEntries  map[int]*subscriptionEntry
 	requestSubs []*nats.Subscription
 	subMu       sync.Mutex
+
+	// replyPrefix is the first dot-separated segment of every id this client
+	// generates. Equals Options.ConnID when configured (firewall allowlists
+	// `rpc.reply.<connId>.>` for such clients), otherwise a local random
+	// prefix. All reply subjects derived from those ids therefore fall under
+	// one wildcard: `rpc.reply.<replyPrefix>.>` — the muxed reply inbox.
+	replyPrefix string
+
+	// muxEntry is the single persistent reply-mux subscription entry
+	// (wildcard `rpc.reply.<replyPrefix>.>`). Lives in subEntries so
+	// Suspend()/Connect() restore it like any other subscription.
+	// Guarded by subMu.
+	muxEntry *subscriptionEntry
+
+	// statusHandlers holds 503/no-responder handlers keyed by reply-subject
+	// suffix (the part after `rpc.reply.`). Used by pull-iterator/stream
+	// paths whose per-message reply subject only ever carries no-responder
+	// statuses. One-shot: the mux dispatcher removes an entry when it fires
+	// (mirrors the previous per-iterator `AutoUnsubscribe(1)` inboxes).
+	statusHandlers sync.Map // map[string]func(error)
 
 	pendingRequests sync.Map // map[string]*pendingRequest
 	streamHandlers  sync.Map // map[string]*streamHandler
@@ -58,11 +84,15 @@ type Client struct {
 
 type pendingRequest struct {
 	done chan struct{}
-	// cleanup tears down the reply + inbox subscriptions of the call.
-	// Idempotent; invoked from the call's own exit path and from
+	// cleanup tears down per-call subscriptions. Only the legacy service
+	// path (`<subject>.reply.<id>`) still holds any — mux-path calls leave
+	// it nil. Idempotent; invoked from the call's own exit path and from
 	// Disconnect()/Suspend() so a suspended in-flight call doesn't restore a
-	// dead rpc.reply.* subscription on the next Connect().
+	// dead reply subscription on the next Connect().
 	cleanup func()
+	// subject is the request subject — used for the no-responder error
+	// message when a 503 status arrives on the call's muxed reply subject.
+	subject string
 	result  any
 	err     error
 }
@@ -84,12 +114,28 @@ func NewClient(opts ClientOptions) *Client { //nolint:gocritic // opts is copied
 	if opts.ReconnectWait == 0 {
 		opts.ReconnectWait = 2 * time.Second
 	}
+	// With a ConnID the prefix MUST be exactly the ConnID — a server-side
+	// firewall may allowlist `rpc.reply.<connId>.>` for such clients.
+	replyPrefix := opts.ConnID
+	if replyPrefix == "" {
+		replyPrefix = GenerateReplyPrefix()
+	}
 	return &Client{
 		Options:         opts,
 		maxPayloadSize:  1024 * 1024, // 1MB default
 		chunkingManager: NewChunkingManager(),
 		subEntries:      make(map[int]*subscriptionEntry),
+		replyPrefix:     replyPrefix,
 	}
+}
+
+// generateID returns a fresh call/iterator/stream id carrying the client's
+// replyPrefix as its first dot-separated segment. The reply subject derived
+// from such an id (`rpc.reply.<id>` — pure string concatenation, the wire
+// contract with every responder implementation) therefore falls under the
+// muxed reply inbox wildcard `rpc.reply.<replyPrefix>.>`.
+func (c *Client) generateID() string {
+	return c.replyPrefix + "." + GenerateID()
 }
 
 // IsConnected returns true if the client is connected to NATS.
@@ -192,6 +238,11 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.mu.Unlock()
 
+	// Register the muxed reply inbox (idempotent). Registered as a normal
+	// subscription entry so the restore loop below (re-)subscribes it on
+	// first connect and after every suspend cycle alike.
+	c.ensureMuxSubscription(false)
+
 	// Restore subscriptions from previous session (e.g. after Suspend+Connect).
 	// Entries keep their identity so unsubscribe closures held by callers stay
 	// valid across the restore.
@@ -216,9 +267,10 @@ func (c *Client) Disconnect() error {
 	nc := c.nc
 	c.mu.Unlock()
 
-	// Reject pending requests. pr.cleanup drops the call's reply/inbox
+	// Reject pending requests. pr.cleanup drops the service path's per-call
 	// subscriptions too — otherwise an in-flight call would leak them.
 	c.rejectPendingRequests()
+	c.clearStatusHandlers()
 
 	// End stream handlers
 	c.streamHandlers.Range(func(key, value any) bool {
@@ -257,6 +309,8 @@ func (c *Client) Disconnect() error {
 		}
 	}
 	c.subEntries = make(map[int]*subscriptionEntry)
+	// Entries were dropped — a revive-Connect() must re-register the mux.
+	c.muxEntry = nil
 	for _, sub := range c.requestSubs {
 		_ = sub.Unsubscribe()
 	}
@@ -318,6 +372,16 @@ func (c *Client) rejectPendingRequests() {
 	})
 }
 
+// clearStatusHandlers drops every registered 503/no-responder status handler.
+// Runs on Disconnect()/Suspend() — a torn-down connection can't deliver
+// statuses anymore, and the iterator/stream owners are settled separately.
+func (c *Client) clearStatusHandlers() {
+	c.statusHandlers.Range(func(key, _ any) bool {
+		c.statusHandlers.Delete(key)
+		return true
+	})
+}
+
 // settlePullIterators force-settles every client-side pull iterator parked in
 // a next() wait. Runs on Disconnect()/Suspend() so consumers terminate with a
 // connection error instead of hanging forever.
@@ -346,10 +410,16 @@ func (c *Client) publishInternal(subject string, data any, reply string) error {
 		return fmt.Errorf("not connected")
 	}
 
-	encoded, err := Encode(data)
+	encoded, release, err := encodePooled(data)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
+	// Safe to release when this function returns: nats.go copies the payload
+	// synchronously into its flush buffer inside Publish/PublishRequest/
+	// PublishMsg (headers included) and never retains the slice. The chunking
+	// path below references sub-slices of `encoded` until its last PublishMsg,
+	// which this defer runs after. See encodeBufPool for the full invariant.
+	defer release()
 
 	// Small enough to send directly
 	if len(encoded) <= maxPayload {
@@ -463,6 +533,24 @@ func (c *Client) subscribeEntry(entry *subscriptionEntry) (func(), error) {
 // subscribeEntry and again from Connect() when restoring entries after a
 // Suspend cycle.
 func (c *Client) natsSubscribe(nc *nats.Conn, entry *subscriptionEntry) error {
+	// Raw mode (muxed reply inbox): hand the undecoded *nats.Msg to the
+	// handler — it needs headers (503 status, chunk markers) and the subject,
+	// and does its own chunk reassembly and routing.
+	if entry.rawHandler != nil {
+		sub, err := nc.Subscribe(entry.pattern, entry.rawHandler)
+		if err != nil {
+			return fmt.Errorf("subscribe: %w", err)
+		}
+		// Every RPC reply of the client shares this one subscription; a burst
+		// of large chunked responses would blow through nats.go's default
+		// pending limits (64MB) and get dropped as "slow consumer". Lift the
+		// limits — memory stays bounded by the client's in-flight calls
+		// (Node's mux subscription is unbounded, too).
+		_ = sub.SetPendingLimits(-1, -1)
+		entry.sub = sub
+		return nil
+	}
+
 	handler := entry.handler
 
 	msgHandler := func(msg *nats.Msg) {
@@ -535,6 +623,133 @@ func (c *Client) natsSubscribe(nc *nats.Conn, entry *subscriptionEntry) error {
 
 	entry.sub = sub
 	return nil
+}
+
+// ensureMuxSubscription registers (and, with subscribeNow, subscribes) the
+// single persistent wildcard subscription `rpc.reply.<replyPrefix>.>` that
+// receives every RPC reply of this client — real responses, chunked responses
+// and 503/no-responder statuses. Idempotent.
+//
+// Connect() passes subscribeNow=false: it only registers the entry and lets
+// its restore loop create the actual subscription alongside all other entries
+// (also after suspend cycles).
+func (c *Client) ensureMuxSubscription(subscribeNow bool) {
+	c.mu.RLock()
+	nc := c.nc
+	c.mu.RUnlock()
+
+	c.subMu.Lock()
+	defer c.subMu.Unlock()
+
+	if c.muxEntry == nil {
+		c.muxEntry = &subscriptionEntry{
+			pattern:    "rpc.reply." + c.replyPrefix + ".>",
+			rawHandler: c.handleMuxMessage,
+		}
+		c.subSeq++
+		c.subEntries[c.subSeq] = c.muxEntry
+	}
+	if subscribeNow && nc != nil && (c.muxEntry.sub == nil || !c.muxEntry.sub.IsValid()) {
+		// Ignore errors — the call path will surface a timeout; consistent
+		// with the Connect() restore loop.
+		_ = c.natsSubscribe(nc, c.muxEntry)
+	}
+}
+
+// handleMuxMessage dispatches a message from the muxed reply inbox by kind:
+//   - 503/no-responder status (empty payload + Status header 503): the
+//     call/iterator is identified by the SUBJECT (`rpc.reply.<suffix>`) — the
+//     server echoes the request's reply subject, there is no payload to decode.
+//   - chunked transfer header/chunk: reassemble via chunkingManager, then
+//     route the assembled response by envelope id.
+//   - regular response: decode and route by envelope id.
+func (c *Client) handleMuxMessage(msg *nats.Msg) {
+	// No-responder status. Wire detail: the reply subject of an RPC call is
+	// exactly `rpc.reply.<call id>`, so the suffix IS the call id. For
+	// iterator/stream status inboxes the suffix is the registered token.
+	if len(msg.Data) == 0 && msg.Header != nil && msg.Header.Get("Status") == "503" {
+		suffix := strings.TrimPrefix(msg.Subject, "rpc.reply.")
+
+		// One-shot (mirrors the previous per-iterator AutoUnsubscribe(1) inboxes).
+		if v, ok := c.statusHandlers.LoadAndDelete(suffix); ok {
+			if fn, ok := v.(func(error)); ok {
+				fn(NewRPCException(ErrCodeNotFound, "No responders for "+suffix))
+			}
+			return
+		}
+
+		if v, ok := c.pendingRequests.LoadAndDelete(suffix); ok {
+			pr := v.(*pendingRequest)
+			subject := pr.subject
+			if subject == "" {
+				subject = suffix
+			}
+			pr.err = NewRPCException(ErrCodeNotFound, "No responders for "+subject)
+			close(pr.done)
+		}
+		return
+	}
+
+	chunkType := ""
+	if msg.Header != nil {
+		chunkType = msg.Header.Get("x-chunked-transfer")
+	}
+
+	switch chunkType {
+	case "header":
+		var hdr ChunkedTransferHeader
+		if err := Decode(msg.Data, &hdr); err != nil {
+			return
+		}
+		chunkID := msg.Header.Get("x-chunk-id")
+		if chunkID == "" || hdr.TransferID != chunkID {
+			return
+		}
+		c.chunkingManager.StartReceiving(
+			hdr.TransferID, hdr.TotalChunks,
+			func(data []byte) { c.routeMuxResponse(data) },
+			func(err error) {},
+			hdr.TotalSize, hdr.ChunkSize,
+		)
+	case "chunk":
+		chunkID := msg.Header.Get("x-chunk-id")
+		chunkIndex, _ := strconv.Atoi(msg.Header.Get("x-chunk-index"))
+		if chunkID == "" {
+			return
+		}
+		c.chunkingManager.ProcessChunk(ChunkData{
+			ID:         chunkID,
+			ChunkIndex: chunkIndex,
+			Data:       msg.Data,
+		})
+	default:
+		c.routeMuxResponse(msg.Data)
+	}
+}
+
+// routeMuxResponse settles the pending request a (possibly reassembled) RPC
+// response belongs to. Unknown ids are dropped silently — late replies after
+// a timeout, or traffic of another client sharing the same ConnID prefix.
+func (c *Client) routeMuxResponse(data []byte) {
+	var resp RPCResponse
+	if err := Decode(data, &resp); err != nil {
+		return
+	}
+	if resp.ID == "" {
+		return
+	}
+
+	v, ok := c.pendingRequests.LoadAndDelete(resp.ID)
+	if !ok {
+		return
+	}
+	pr := v.(*pendingRequest)
+	if resp.Error != nil {
+		pr.err = RPCExceptionFromError(resp.Error)
+	} else {
+		pr.result = resp.Result
+	}
+	close(pr.done)
 }
 
 // Request sends a native NATS request/reply, with automatic retry on no-responder errors.
@@ -702,7 +917,11 @@ func (c *Client) CallWithOptions(ctx context.Context, subject string, opts *Requ
 	return result, err
 }
 
-// callOnce performs a single RPC call attempt.
+// callOnce performs a single RPC call attempt via the muxed reply inbox: the
+// reply subject is `rpc.reply.<id>` and falls under the client's persistent
+// wildcard subscription — no per-call subscriptions. Responses (plain or
+// chunked) and no-responder statuses all arrive on the mux, which settles the
+// pendingRequests entry; cleanup only has to drop the map entry.
 func (c *Client) callOnce(ctx context.Context, subject string, args ...any) (any, error) {
 	if !c.IsConnected() && !c.IsClosed() {
 		if err := c.Connect(ctx); err != nil {
@@ -717,16 +936,64 @@ func (c *Client) callOnce(ctx context.Context, subject string, args ...any) (any
 		return nil, fmt.Errorf("not connected")
 	}
 
-	id := GenerateID()
-	timeout := c.Options.Timeout
-
-	// Reply subject
-	var replySubject string
-	if len(subject) > 4 && subject[:4] == "rpc." {
-		replySubject = "rpc.reply." + id
-	} else {
-		replySubject = subject + ".reply." + id
+	// Service calls (`<subject>.reply.<id>`) keep the legacy per-call
+	// subscription flow — separate refactor later.
+	if !strings.HasPrefix(subject, "rpc.") {
+		return c.callOnceService(ctx, nc, subject, args...)
 	}
+
+	// Normally established by Connect(); covers clients whose connection was
+	// wired up out-of-band (tests). No-op when already subscribed.
+	c.ensureMuxSubscription(true)
+
+	id := c.generateID()
+	timeout := c.Options.Timeout
+	// The reply subject is derived from the id by pure string concatenation —
+	// this is the wire contract with every responder implementation (Node,
+	// Go, Python): they publish the response to `rpc.reply.<msg.ID>` and
+	// treat the id as opaque. Because the id starts with our replyPrefix,
+	// the muxed reply inbox (`rpc.reply.<replyPrefix>.>`) catches it.
+	replySubject := "rpc.reply." + id
+
+	pr := &pendingRequest{done: make(chan struct{}), subject: subject}
+	c.pendingRequests.Store(id, pr)
+
+	// Send request. `reply` is set to the call's own reply subject so the
+	// NATS server delivers a no-responder 503 status to the SAME subject the
+	// real response would use — the mux catches both.
+	message := RPCMessage{
+		ID:     id,
+		Method: "call",
+		Params: args,
+	}
+	if err := c.publishInternal(subject, message, replySubject); err != nil {
+		c.pendingRequests.Delete(id)
+		return nil, err
+	}
+
+	// Wait for response or timeout
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-pr.done:
+		return pr.result, pr.err
+	case <-timer.C:
+		c.pendingRequests.Delete(id)
+		return nil, NewRPCException(ErrCodeTimeout, fmt.Sprintf("RPC call to %q timed out after %v", subject, timeout))
+	case <-ctx.Done():
+		c.pendingRequests.Delete(id)
+		return nil, NewRPCException(ErrCodeTimeout, fmt.Sprintf("RPC call to %q context cancelled: %v", subject, ctx.Err()))
+	}
+}
+
+// callOnceService is the legacy single-attempt call for service subjects
+// (reply pattern `<subject>.reply.<id>`): per-call reply subscription plus a
+// one-shot no-responder inbox. The rpc.* path is muxed — see callOnce.
+func (c *Client) callOnceService(ctx context.Context, nc *nats.Conn, subject string, args ...any) (any, error) {
+	id := c.generateID()
+	timeout := c.Options.Timeout
+	replySubject := subject + ".reply." + id
 
 	// Subscribe to reply
 	unsub, err := c.Subscribe(replySubject, func(data []byte) {
@@ -870,10 +1137,12 @@ func (c *Client) Suspend() error {
 	nc := c.nc
 	c.mu.Unlock()
 
-	// Reject pending requests. pr.cleanup drops the call's reply-subscription
-	// entry too — otherwise a suspended in-flight call would be restored as a
-	// dead rpc.reply.* subscription on the next Connect().
+	// Reject pending requests. RPC calls are muxed (no per-call
+	// subscription); service-path calls still hold per-call subscriptions
+	// which pr.cleanup drops — otherwise a suspended in-flight call would be
+	// restored as a dead reply subscription on the next Connect().
 	c.rejectPendingRequests()
+	c.clearStatusHandlers()
 
 	// End stream handlers
 	c.streamHandlers.Range(func(key, value any) bool {

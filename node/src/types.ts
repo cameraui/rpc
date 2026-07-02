@@ -31,7 +31,12 @@ export interface RPCClient {
     options?: { isolatedConnection?: boolean; withoutDecorators?: boolean; queue?: string },
   ): Promise<() => Promise<void>>;
   callWithCallback<TResponse = any>(subject: string, args: any[], callback: (value: TResponse) => void | Promise<void>): Promise<() => void>;
-  callPullIteratorWithCallback(subject: string, callbacks: Record<string, (...a: any[]) => any>, onewayMethods: string[], ...args: any[]): AsyncGenerator<void>;
+  callPullIteratorWithCallback(
+    subject: string,
+    callbacks: Record<string, (...a: any[]) => any>,
+    onewayMethods: string[] | PullCallbackCallOptions,
+    ...args: any[]
+  ): AsyncGenerator<void>;
   channel(channelId: string, options?: { isolatedConnection?: boolean }): Promise<Channel>;
   privateChannel(channelId: string, targetClientId: string, options?: { isolatedConnection?: boolean }): Promise<PrivateChannel>;
   createProxy<T extends object>(namespace: string): Promisify<T>;
@@ -164,6 +169,16 @@ export interface RPCMessage<T = any> {
 
   /** Optional error (unused in requests) */
   error?: RPCError;
+
+  /**
+   * Method-discovery request (internal metadata for proxies). When true, the
+   * responder attaches the namespace's `__methods` list to the response.
+   * Proxies set this only while their method cache is empty — afterwards the
+   * list would be dead wire weight on every response. Lives on the envelope
+   * (not in params) so it never leaks into handler arguments; old responders
+   * ignore it.
+   */
+  __discover?: boolean;
 }
 
 /**
@@ -314,6 +329,22 @@ export interface PullCallbackParams {
 export interface CallbackInvocation {
   method: string;
   args: any[];
+}
+
+/**
+ * Options for callPullIteratorWithCallback. Passed in place of the plain
+ * onewayMethods string[] (the array form stays supported — the proxy path
+ * always uses it). Client-local behavior only, no wire/protocol change.
+ */
+export interface PullCallbackCallOptions {
+  /** Oneway callback method names (same as passing a plain string[]). */
+  onewayMethods: string[];
+
+  /** Opt-in n+1 prefetch: send the next `next` request immediately after a
+   * batch boundary (`value`) arrives, BEFORE the batch's callbacks are
+   * drained — hides one RTT per batch (matches the Go client's behavior).
+   * Default false = strict per-batch backpressure. */
+  prefetch?: boolean;
 }
 
 /**

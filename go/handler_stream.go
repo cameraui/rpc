@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 // handleStreamRequestGo handles a push-based streaming request.
@@ -22,10 +23,11 @@ func handleStreamRequestGo(fn reflect.Value, args []any, streamSubject, requestI
 		return
 	}
 
-	// Set up cancellation listener
-	cancelled := false
+	// Set up cancellation listener. atomic.Bool: written by the NATS
+	// subscription goroutine, read by this goroutine's publish loop.
+	var cancelled atomic.Bool
 	cancelUnsub, err := client.Subscribe(streamSubject+".cancel", func(data []byte) {
-		cancelled = true
+		cancelled.Store(true)
 	})
 	if err != nil {
 		errMsg := StreamMessage{
@@ -40,7 +42,7 @@ func handleStreamRequestGo(fn reflect.Value, args []any, streamSubject, requestI
 
 	// Try to iterate over the result
 	if err := iterateAndPublish(result, requestID, streamSubject, client, &cancelled); err != nil {
-		if !cancelled && client.IsConnected() {
+		if !cancelled.Load() && client.IsConnected() {
 			errMsg := StreamMessage{
 				ID:    requestID,
 				Type:  "error",
@@ -51,7 +53,7 @@ func handleStreamRequestGo(fn reflect.Value, args []any, streamSubject, requestI
 		return
 	}
 
-	if !cancelled && client.IsConnected() {
+	if !cancelled.Load() && client.IsConnected() {
 		endMsg := StreamMessage{
 			ID:   requestID,
 			Type: "end",
@@ -61,7 +63,7 @@ func handleStreamRequestGo(fn reflect.Value, args []any, streamSubject, requestI
 }
 
 // iterateAndPublish iterates over a channel or slice and publishes each value.
-func iterateAndPublish(result any, requestID, streamSubject string, client *Client, cancelled *bool) error {
+func iterateAndPublish(result any, requestID, streamSubject string, client *Client, cancelled *atomic.Bool) error {
 	if result == nil {
 		return NewRPCException(ErrCodeInternalError, "Handler must return a channel or slice for stream")
 	}
@@ -71,7 +73,7 @@ func iterateAndPublish(result any, requestID, streamSubject string, client *Clie
 	switch rv.Kind() {
 	case reflect.Chan:
 		for {
-			if *cancelled || !client.IsConnected() {
+			if cancelled.Load() || !client.IsConnected() {
 				return nil
 			}
 			val, ok := rv.Recv()
@@ -90,7 +92,7 @@ func iterateAndPublish(result any, requestID, streamSubject string, client *Clie
 
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < rv.Len(); i++ {
-			if *cancelled || !client.IsConnected() {
+			if cancelled.Load() || !client.IsConnected() {
 				return nil
 			}
 			dataMsg := StreamMessage{
@@ -127,7 +129,10 @@ func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string
 		return nil, NewRPCException(ErrCodeInternalError, "Handler must return a channel for pull iterator")
 	}
 
-	active := true
+	// atomic.Bool: written by finish()/cleanup() (NATS goroutine or an
+	// arbitrary caller goroutine), read by the request-subscription handler.
+	var active atomic.Bool
+	active.Store(true)
 
 	// subUnsub is assigned after Subscribe returns but read from the NATS
 	// callback goroutine — guard it against that race.
@@ -141,7 +146,7 @@ func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string
 	var finishOnce sync.Once
 	finish := func() {
 		finishOnce.Do(func() {
-			active = false
+			active.Store(false)
 			subUnsubMu.Lock()
 			u := subUnsub
 			subUnsubMu.Unlock()
@@ -155,7 +160,7 @@ func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string
 	}
 
 	unsub, err := client.Subscribe(requestSubject, func(data []byte) {
-		if !active || !client.IsConnected() {
+		if !active.Load() || !client.IsConnected() {
 			return
 		}
 
@@ -201,7 +206,7 @@ func handlePullIteratorRequestGo(fn reflect.Value, args []any, iteratorID string
 
 	cleanup := func() {
 		finishOnce.Do(func() {
-			active = false
+			active.Store(false)
 			unsub()
 			// No onFinished here — the caller is already sweeping its map.
 		})

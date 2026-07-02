@@ -29,6 +29,7 @@ from .handler import (
 )
 from .svcm import Svcm
 from .types import ErrorCode, RPCClientOptions
+from .utils import is_async_function
 
 if TYPE_CHECKING:
     from .client import RPCClient
@@ -119,6 +120,9 @@ class RPCService:
 
             # Add endpoint with auto-encoding/decoding
             def make_endpoint_handler(h: Callable[..., Any]) -> Callable[[Request], Awaitable[None]]:
+                # Determined once per endpoint instead of per message.
+                h_is_async = is_async_function(h)
+
                 async def handle_rpc_message(rpc_msg: dict[str, Any], original_msg: Request) -> None:
                     """Handle RPC protocol message."""
                     response = {"id": rpc_msg["id"]}
@@ -184,6 +188,7 @@ class RPCService:
                                 h,
                                 rpc_msg.get("params", []),
                                 service_client.io_pool,
+                                h_is_async,
                             )
                             response["result"] = result
 

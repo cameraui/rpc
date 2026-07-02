@@ -9,7 +9,7 @@ import (
 // The callback is invoked for each value pushed by the handler.
 // Returns an unsubscribe function.
 func CallWithCallback[T any](client *Client, subject string, args []any, callback func(T)) (func(), error) {
-	id := GenerateID()
+	id := client.generateID()
 	callbackSubject := fmt.Sprintf("rpc.cb.%s", id)
 
 	if !client.IsConnected() && !client.IsClosed() {

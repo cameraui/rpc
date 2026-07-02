@@ -30,9 +30,11 @@ class Channel:
         self._closed: bool = False
         self._initialized: bool = False
         self._unsubscribe: Callable[[], Coroutine[Any, Any, None]] | None = None
-        self.__handlers: dict[str, set[Callable[[Any], None | Awaitable[None]]]] = {}
-        self.__close_handlers: set[Callable[[], None | Awaitable[None]]] = set()
-        self.__error_handlers: set[Callable[[Exception], None | Awaitable[None]]] = set()
+        # Handler registries map handler -> is_async, so the async-ness is
+        # determined once at registration instead of per emitted message.
+        self.__handlers: dict[str, dict[Callable[[Any], None | Awaitable[None]], bool]] = {}
+        self.__close_handlers: dict[Callable[[], None | Awaitable[None]], bool] = {}
+        self.__error_handlers: dict[Callable[[Exception], None | Awaitable[None]], bool] = {}
         self.__subscriptions: list[Callable[[], Coroutine[Any, Any, None]]] = []
         self.__isolated_client: RPCClient | None = None
 
@@ -96,14 +98,15 @@ class Channel:
     def on(self, event: Literal["error"], handler: Callable[[Exception], None | Awaitable[None]]) -> None: ...
     def on(self, event: str, handler: Callable[..., None | Awaitable[None]]) -> None:
         """Listen for events."""
+        handler_is_async = is_async_function(handler)
         if event == "close":
-            self.__close_handlers.add(handler)
+            self.__close_handlers[handler] = handler_is_async
         elif event == "error":
-            self.__error_handlers.add(handler)
+            self.__error_handlers[handler] = handler_is_async
         else:
             if event not in self.__handlers:
-                self.__handlers[event] = set()
-            self.__handlers[event].add(handler)
+                self.__handlers[event] = {}
+            self.__handlers[event][handler] = handler_is_async
 
     @overload
     def off(self, event: Literal["message"], handler: Callable[[Any], None | Awaitable[None]]) -> None: ...
@@ -116,12 +119,12 @@ class Channel:
     def off(self, event: str, handler: Callable[..., None | Awaitable[None]]) -> None:
         """Remove event listener."""
         if event == "close":
-            self.__close_handlers.discard(handler)
+            self.__close_handlers.pop(handler, None)
         elif event == "error":
-            self.__error_handlers.discard(handler)
+            self.__error_handlers.pop(handler, None)
         else:
             if event in self.__handlers:
-                self.__handlers[event].discard(handler)
+                self.__handlers[event].pop(handler, None)
 
     async def close(self) -> None:
         """Close the channel gracefully."""
@@ -142,15 +145,20 @@ class Channel:
         await self._cleanup()
 
     async def _emit(self, event: str, data: Any = None) -> None:
-        """Emit an event to handlers."""
+        """Emit an event to handlers.
+
+        Sync handlers run inline on the event loop — the thread-pool hop
+        costs far more than the short callbacks used here and would break
+        per-channel message ordering.
+        """
         if event in self.__handlers:
-            for handler in self.__handlers[event]:
+            # Snapshot: an inline handler may add/remove listeners re-entrantly.
+            for handler, handler_is_async in list(self.__handlers[event].items()):
                 try:
-                    if is_async_function(handler):
+                    if handler_is_async:
                         await handler(data)  # type: ignore[misc]
                     else:
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(self._client.io_pool, handler, data)
+                        handler(data)
                 except Exception as e:
                     print(f"Error in channel handler: {e}")
 
@@ -161,25 +169,23 @@ class Channel:
 
         self._closed = True
 
-        for handler in self.__close_handlers:
+        for handler, handler_is_async in list(self.__close_handlers.items()):
             with contextlib.suppress(Exception):
-                if is_async_function(handler):
+                if handler_is_async:
                     await handler()  # type: ignore[misc]
                 else:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(self._client.io_pool, handler)
+                    handler()
 
         asyncio.create_task(self._cleanup())
 
     async def _handle_error(self, error: Exception) -> None:
         """Handle channel error."""
-        for handler in self.__error_handlers:
+        for handler, handler_is_async in list(self.__error_handlers.items()):
             with contextlib.suppress(Exception):
-                if is_async_function(handler):
+                if handler_is_async:
                     await handler(error)  # type: ignore[misc]
                 else:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(self._client.io_pool, handler, error)
+                    handler(error)
 
     async def _cleanup(self) -> None:
         """Clean up resources."""

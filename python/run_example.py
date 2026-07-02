@@ -139,6 +139,10 @@ if __name__ == "__main__":
             from examples.reconfigure import main
 
             uvloop.run(main())
+        elif example_name == "perf_hotpath":
+            from examples.perf_hotpath import main
+
+            uvloop.run(main())
         else:
             print(f"Unknown example: {example_name}")
             sys.exit(1)

@@ -86,6 +86,17 @@ func sleep(ms int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
+func waitFor(cond func() bool, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for condition")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return nil
+}
+
 type perfOp struct {
 	name     string
 	duration time.Duration
@@ -157,8 +168,7 @@ func testAllFeatures() error {
 	end()
 
 	fmt.Println("\n1. Native Request/Reply")
-	end = timer.start("Request Handler Setup & 100 calls")
-
+	// Setup (handler registration + subscription settle) outside the measurement
 	unsub1, err := server.OnRequest("echo.*", func(data []byte) (any, error) {
 		var payload map[string]any
 		if err := rpc.Decode(data, &payload); err != nil {
@@ -174,6 +184,8 @@ func testAllFeatures() error {
 	}
 	sleep(50)
 
+	end = timer.start("Request Handler Setup & 100 calls")
+
 	for i := range 100 {
 		respBytes, err := client.Request(ctx, "echo.test", map[string]any{"msg": fmt.Sprintf("Message %d", i)})
 		if err != nil {
@@ -188,12 +200,10 @@ func testAllFeatures() error {
 		}
 	}
 
-	unsub1()
 	end()
+	unsub1()
 
 	fmt.Println("\n2. Register Handlers (RPC style)")
-	end = timer.start("RPC Handler Setup & 100 calls")
-
 	handlers := map[string]any{
 		"echo": func(msg string) (string, error) {
 			return "Echo: " + msg, nil
@@ -210,6 +220,8 @@ func testAllFeatures() error {
 	sleep(50)
 
 	testProxy := client.CreateProxy("test")
+
+	end = timer.start("RPC Handler Setup & 100 calls")
 
 	for i := range 50 {
 		echoResult, err := testProxy.Invoke(ctx, "echo", fmt.Sprintf("Message %d", i))
@@ -230,12 +242,10 @@ func testAllFeatures() error {
 		}
 	}
 
-	_ = unsub2()
 	end()
+	_ = unsub2()
 
 	fmt.Println("\n3. Large Data Transfer (Auto-Chunking)")
-	end = timer.start("Large Data Transfer (10MB)")
-
 	largeHandlers := map[string]any{
 		"getLarge": func() ([]byte, error) {
 			return largeData, nil
@@ -252,6 +262,8 @@ func testAllFeatures() error {
 	sleep(50)
 
 	dataProxy := client.CreateProxy("data")
+
+	end = timer.start("Large Data Transfer (10MB)")
 
 	result, err := dataProxy.Invoke(ctx, "getLarge")
 	if err != nil {
@@ -277,12 +289,10 @@ func testAllFeatures() error {
 		return fmt.Errorf("echo data mismatch")
 	}
 
-	_ = unsub3()
 	end()
+	_ = unsub3()
 
 	fmt.Println("\n4. Channel Communication")
-	end = timer.start("Channel Setup & 1000 messages")
-
 	serverChannel, err := server.Channel("perf-channel")
 	if err != nil {
 		return fmt.Errorf("server channel: %w", err)
@@ -298,13 +308,20 @@ func testAllFeatures() error {
 	})
 	sleep(50)
 
+	end = timer.start("Channel Setup & 1000 messages")
+
 	for i := range 1000 {
 		if err := clientChannel.Send(map[string]any{"index": i, "data": fmt.Sprintf("Message %d", i)}); err != nil {
 			return fmt.Errorf("channel send %d: %w", i, err)
 		}
 	}
 
-	sleep(200)
+	// Wait for the receive counter instead of a fixed sleep
+	if err := waitFor(func() bool { return atomic.LoadInt64(&messagesReceived) >= 1000 }, 10*time.Second); err != nil {
+		return fmt.Errorf("channel messages: %w (got %d)", err, atomic.LoadInt64(&messagesReceived))
+	}
+	end()
+
 	count := atomic.LoadInt64(&messagesReceived)
 	if count != 1000 {
 		return fmt.Errorf("expected 1000 messages, got %d", count)
@@ -312,11 +329,8 @@ func testAllFeatures() error {
 
 	_ = serverChannel.Close()
 	_ = clientChannel.Close()
-	end()
 
 	fmt.Println("\n5. Private Channel Communication")
-	end = timer.start("Private Channel Setup & 100 calls")
-
 	serverPrivate, err := server.PrivateChannelConnect("perf-private", "test-client")
 	if err != nil {
 		return fmt.Errorf("server private channel: %w", err)
@@ -339,6 +353,8 @@ func testAllFeatures() error {
 		return fmt.Errorf("client private channel: %w", err)
 	}
 
+	end = timer.start("Private Channel Setup & 100 calls")
+
 	for i := range 100 {
 		respBytes, err := clientPrivate.Request(ctx, map[string]any{"value": i}, 5*time.Second)
 		if err != nil {
@@ -353,10 +369,10 @@ func testAllFeatures() error {
 		}
 	}
 
+	end()
 	unsub5()
 	_ = serverPrivate.Close()
 	_ = clientPrivate.Close()
-	end()
 
 	fmt.Println("\n6. Service Creation & Discovery")
 	end = timer.start("Service Setup")
@@ -371,6 +387,9 @@ func testAllFeatures() error {
 		return fmt.Errorf("register service: %w", err)
 	}
 
+	end()
+
+	// Verification (settle sleep + discovery) outside the measurement
 	sleep(100)
 
 	info := service.Info()
@@ -389,8 +408,6 @@ func testAllFeatures() error {
 	if infos[0].Name != "perf-service" {
 		return fmt.Errorf("discovered service name mismatch: %s", infos[0].Name)
 	}
-
-	end()
 
 	fmt.Println("\n7. Service Proxy Calls")
 	end = timer.start("Service Proxy Creation & 50 calls")
@@ -436,8 +453,6 @@ func testAllFeatures() error {
 	end()
 
 	fmt.Println("\n8b. Large Data via RPC Handler")
-	end = timer.start("Get Large Data (10MB) via RPC")
-
 	largeDataHandlers := map[string]any{
 		"getLargeData": func() ([]byte, error) {
 			return largeData, nil
@@ -451,6 +466,9 @@ func testAllFeatures() error {
 	sleep(50)
 
 	largeRpcProxy := client.CreateProxy("largedata")
+
+	end = timer.start("Get Large Data (10MB) via RPC")
+
 	largeRpcResult, err := largeRpcProxy.Invoke(ctx, "getLargeData")
 	if err != nil {
 		return fmt.Errorf("getLargeData: %w", err)
@@ -463,12 +481,10 @@ func testAllFeatures() error {
 		return fmt.Errorf("large data RPC size mismatch: got %d, want %d", len(largeRpcBytes), len(largeData))
 	}
 
-	_ = unsub8b()
 	end()
+	_ = unsub8b()
 
 	fmt.Println("\n9. Concurrent Operations")
-	end = timer.start("Concurrent Requests (500 parallel)")
-
 	unsub9, err := server.OnRequest("echo.concurrent", func(data []byte) (any, error) {
 		var payload map[string]any
 		if err := rpc.Decode(data, &payload); err != nil {
@@ -480,6 +496,8 @@ func testAllFeatures() error {
 		return fmt.Errorf("concurrent onRequest: %w", err)
 	}
 	sleep(50)
+
+	end = timer.start("Concurrent Requests (500 parallel)")
 
 	var wg sync.WaitGroup
 	var concurrentCount int64
@@ -536,8 +554,6 @@ func testAllFeatures() error {
 	end()
 
 	fmt.Println("\n11. Isolated Connection Proxy")
-	end = timer.start("Isolated Proxy Test")
-
 	handlersIsolated := map[string]any{
 		"echo": func(msg string) (string, error) {
 			return "Echo: " + msg, nil
@@ -552,6 +568,8 @@ func testAllFeatures() error {
 		return fmt.Errorf("register isolated: %w", err)
 	}
 	sleep(50)
+
+	end = timer.start("Isolated Proxy Test")
 
 	isolatedProxy, closeIsolated, err := client.CreateIsolatedProxy("test")
 	if err != nil {
@@ -569,17 +587,17 @@ func testAllFeatures() error {
 		}
 	}
 
+	end()
 	_ = closeIsolated()
 	_ = unsub11()
-	end()
 
 	fmt.Printf("\n12. Mixed Workload (Simulating Real Usage)\n")
-	end = timer.start("Mixed Operations")
-
 	testChannel, err := client.Channel("mixed-channel")
 	if err != nil {
 		return fmt.Errorf("mixed channel: %w", err)
 	}
+
+	end = timer.start("Mixed Operations")
 
 	mixedOp := func() error {
 		var ops sync.WaitGroup
@@ -637,8 +655,8 @@ func testAllFeatures() error {
 		return fmt.Errorf("mixed workload: %w", roundErr)
 	}
 
-	_ = testChannel.Close()
 	end()
+	_ = testChannel.Close()
 
 	fmt.Println("\nCleanup")
 	end = timer.start("Cleanup")

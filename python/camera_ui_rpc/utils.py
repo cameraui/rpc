@@ -1,8 +1,10 @@
 """Utility functions for the RPC library."""
 
+import inspect
+import secrets
 import time
 from collections.abc import AsyncGenerator
-from random import randint
+from random import choices
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from nats.micro.service import ServiceInfo
@@ -12,10 +14,40 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 
+# Base36 alphabet, matching the Node implementation's
+# Math.random().toString(36) suffix.
+_ID_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
-def generate_id() -> str:
-    """Generate a unique ID for requests."""
-    return f"{int(time.time() * 1000)}-{randint(100000, 999999)}"
+
+def generate_id(reply_prefix: str | None = None) -> str:
+    """Generate a unique ID for requests.
+
+    Format: ``<ms-timestamp>-<9 random base36 chars>``. Nine random
+    characters (~46 bits) keep the collision risk negligible even for
+    bursts of IDs within the same millisecond.
+
+    With ``reply_prefix``, the prefix becomes the first dot-separated
+    segment of the id (``<prefix>.<id>``) so the reply subject derived from
+    the id falls under the client's muxed reply inbox wildcard
+    (``rpc.reply.<prefix>.>``).
+    """
+    request_id = f"{int(time.time() * 1000)}-{''.join(choices(_ID_CHARS, k=9))}"
+    return f"{reply_prefix}.{request_id}" if reply_prefix else request_id
+
+
+def generate_reply_prefix() -> str:
+    """Generate a client-local reply prefix: 10 base36 chars (48 random bits).
+
+    Used as the first dot-separated segment of every call id when no conn_id
+    is configured, so all reply subjects of a client share one
+    wildcard-subscribable prefix (``rpc.reply.<prefix>.>``).
+    """
+    value = secrets.randbits(48)
+    chars: list[str] = []
+    while value:
+        value, rem = divmod(value, 36)
+        chars.append(_ID_CHARS[rem])
+    return "".join(reversed(chars)).rjust(10, "0")
 
 
 class RPCCallbacks:
@@ -80,8 +112,6 @@ def is_sync_generator(func: Any) -> bool:
         return False
 
     # Check if it's a generator function
-    import inspect
-
     return inspect.isgeneratorfunction(func) or inspect.isgenerator(func)
 
 
@@ -91,8 +121,6 @@ def is_async_generator(func: Any) -> bool:
         return False
 
     # Check if it's a coroutine function that might return an async generator
-    import inspect
-
     if inspect.isasyncgenfunction(func):
         return True
 
@@ -109,13 +137,15 @@ def is_async_generator(func: Any) -> bool:
 
 
 def is_async_function(func: Any) -> bool:
-    """Check if a function is an async function."""
+    """Check if a function is an async function.
+
+    Callers on hot paths should evaluate this once at handler-registration
+    time and reuse the result instead of re-checking per message.
+    """
     if not callable(func):
         return False
 
     # Check if it's a coroutine function
-    import inspect
-
     return inspect.iscoroutinefunction(func) or inspect.iscoroutine(func) or inspect.isawaitable(func)
 
 
@@ -149,9 +179,11 @@ def create_proxy(
 
     def strip_methods(result: Any) -> Any:
         if result is not None and isinstance(result, dict) and "__methods" in result:
+            # The decoded response dict is exclusively ours — strip the
+            # metadata key in place instead of copying the whole dict.
             r = cast(dict[str, Any], result)
-            update_cache(r["__methods"])
-            return {k: v for k, v in r.items() if k != "__methods"}
+            update_cache(r.pop("__methods"))
+            return r
         return cast(Any, result)
 
     class RPCProxy:
@@ -207,9 +239,12 @@ def create_proxy(
                     elif is_pull_iterator:
                         return client.call_pull_iterator(subject, *args)
                     else:
-                        # Wrap call to strip __methods from result
+                        # Wrap call to strip __methods from result. Discovery
+                        # is requested only while the cache is empty — once the
+                        # first response filled it, responses stay lean (no
+                        # __methods payload).
                         async def wrapped_call() -> Any:
-                            result = await client.call(subject, *args)
+                            result = await client.call(subject, *args, discover=_cache[0] is None)
                             return strip_methods(result)
 
                         return wrapped_call()

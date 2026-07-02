@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 // PullCallbackMap registers callback handlers invoked by the server during
@@ -44,10 +45,14 @@ func (c *Client) CallPullIteratorWithCallback(
 		}
 	}
 
-	iteratorID := GenerateID()
+	c.ensureMuxSubscription(true)
+
+	iteratorID := c.generateID()
 	requestSubject := fmt.Sprintf("_rpc.iterator.%s.request", iteratorID)
 	responseSubject := fmt.Sprintf("_rpc.iterator.%s.response", iteratorID)
 	callbackSubject := fmt.Sprintf("_rpc.cb.%s", iteratorID)
+	// 503 status inbox for `next` requests — see CallPullIterator.
+	statusInbox := "rpc.reply." + iteratorID
 
 	methodNames := make([]string, 0, len(callbacks))
 	for k := range callbacks {
@@ -74,6 +79,14 @@ func (c *Client) CallPullIteratorWithCallback(
 	if err != nil {
 		return nil, err
 	}
+	// The drain loop only runs at batch boundaries, so a full batch of
+	// callback messages queues up in the subscription first. With the
+	// nats.go defaults (64MB) large batches (e.g. 1000 x 100KB frames)
+	// would be silently dropped as "slow consumer". Lift the limits —
+	// memory stays bounded by the pull iterator's one-batch-in-flight
+	// granularity. Node (unbounded) and Python (128MB + continuous
+	// dispatch) do not drop here either.
+	_ = cbSub.SetPendingLimits(-1, -1)
 	cbUnsub := func() {
 		_ = cbSub.Unsubscribe()
 	}
@@ -122,15 +135,17 @@ func (c *Client) CallPullIteratorWithCallback(
 		defer c.pullIteratorSettles.Delete(iteratorID)
 		defer cbUnsub()
 
+		// ended is written by this goroutine and read by the NATS
+		// subscription goroutine — atomic.Bool avoids the race.
 		respCh := make(chan PullIteratorResponse, 8)
-		ended := false
+		var ended atomic.Bool
 
 		respUnsub, err := c.Subscribe(responseSubject, func(data []byte) {
 			var resp PullIteratorResponse
 			if err := Decode(data, &resp); err != nil {
 				return
 			}
-			if !ended {
+			if !ended.Load() {
 				respCh <- resp
 			}
 		})
@@ -139,6 +154,19 @@ func (c *Client) CallPullIteratorWithCallback(
 			return
 		}
 		defer respUnsub()
+
+		// No-responder detection for `next` requests via the muxed reply
+		// inbox (one-shot) — see CallPullIterator.
+		c.statusHandlers.Store(iteratorID, func(error) {
+			if !ended.Load() {
+				respCh <- PullIteratorResponse{
+					ID:    iteratorID,
+					Type:  "error",
+					Error: &RPCError{Code: "503", Message: "No responders for " + subject},
+				}
+			}
+		})
+		defer c.statusHandlers.Delete(iteratorID)
 
 		sendCancel := func() {
 			cancelReq := PullIteratorRequest{ID: iteratorID, Type: "cancel"}
@@ -175,7 +203,7 @@ func (c *Client) CallPullIteratorWithCallback(
 		// consumer without blocking; if nobody is waiting, the closed
 		// channel terminates the consumer's range loop instead.
 		sendDisconnected := func() {
-			ended = true
+			ended.Store(true)
 			select {
 			case ch <- PullValue{Error: NewRPCException(ErrCodeConnectionClosed, "Connection closed")}:
 			default:
@@ -193,17 +221,19 @@ func (c *Client) CallPullIteratorWithCallback(
 				return true
 			case <-ctx.Done():
 				sendCancel()
-				ended = true
+				ended.Store(true)
 				return false
 			case <-disconnected:
-				ended = true
+				ended.Store(true)
 				return false
 			}
 		}
 
 		for {
+			// `reply` points at the status inbox so a vanished responder
+			// surfaces as a 503 on the mux instead of a silent hang.
 			nextReq := PullIteratorRequest{ID: iteratorID, Type: "next"}
-			if err := c.Publish(requestSubject, nextReq); err != nil {
+			if err := c.publishInternal(requestSubject, nextReq, statusInbox); err != nil {
 				sendToConsumer(PullValue{Error: err})
 				return
 			}
@@ -236,7 +266,7 @@ func (c *Client) CallPullIteratorWithCallback(
 				}
 			case <-ctx.Done():
 				sendCancel()
-				ended = true
+				ended.Store(true)
 				return
 			case <-disconnected:
 				sendDisconnected()
@@ -246,6 +276,16 @@ func (c *Client) CallPullIteratorWithCallback(
 	}()
 
 	return ch, nil
+}
+
+// callArgsPool recycles the []reflect.Value argument slice used by
+// dispatchCallback — callbacks fire once per frame in the pull-callback hot
+// path, so the per-invocation slice allocation adds up.
+var callArgsPool = sync.Pool{
+	New: func() any {
+		s := make([]reflect.Value, 0, 8)
+		return &s
+	},
 }
 
 // dispatchCallback invokes a registered callback via reflection, coercing
@@ -258,24 +298,29 @@ func dispatchCallback(fn any, args []any) {
 	t := v.Type()
 	numIn := t.NumIn()
 
-	callArgs := make([]reflect.Value, numIn)
-	for i := range numIn {
-		paramType := t.In(i)
-		if i < len(args) {
-			callArgs[i] = coerceValue(args[i], paramType)
-		} else {
-			callArgs[i] = reflect.Zero(paramType)
-		}
-	}
+	argsPtr := callArgsPool.Get().(*[]reflect.Value)
+	callArgs := (*argsPtr)[:0]
 
 	// Recover — callback errors must not escape. Log-and-continue semantics
 	// per protocol spec (callback dispatch errors never propagate server-ward).
+	// The same defer returns the pooled slice; reflect.Value.Call copies the
+	// arguments into the new frame and does not retain the slice. Clear the
+	// values first so the pool doesn't keep the args (e.g. frames) alive.
 	defer func() {
-		if r := recover(); r != nil {
-			// swallow
-			_ = r
-		}
+		_ = recover()
+		clear(callArgs)
+		*argsPtr = callArgs[:0]
+		callArgsPool.Put(argsPtr)
 	}()
+
+	for i := range numIn {
+		paramType := t.In(i)
+		if i < len(args) {
+			callArgs = append(callArgs, coerceValue(args[i], paramType))
+		} else {
+			callArgs = append(callArgs, reflect.Zero(paramType))
+		}
+	}
 
 	_ = v.Call(callArgs)
 }

@@ -198,6 +198,12 @@ class RPCClientOptions(TypedDict):
     name: str
     """Client name for identification"""
 
+    conn_id: NotRequired[str]
+    """Connection id used as the reply prefix of every call id. When set, the
+    muxed reply inbox subscribes ``rpc.reply.<conn_id>.>`` (server-side
+    firewalls allowlist exactly that wildcard for browser clients). When
+    omitted, a random local prefix is generated instead."""
+
     auth: NotRequired[RPCAuthOptions]
     """Authentication credentials with 'user' and 'pass' keys"""
 
@@ -250,6 +256,13 @@ class RPCMessage(TypedDict):
 
     error: NotRequired[RPCError | None]
     """Optional error (unused in requests)"""
+
+    __discover: NotRequired[bool]
+    """Method-discovery request (internal metadata for proxies). When True,
+    the responder attaches the namespace's ``__methods`` list to the response.
+    Proxies set this only while their method cache is empty. Lives on the
+    envelope (not in params) so it never leaks into handler arguments; old
+    responders ignore it."""
 
 
 class RPCResponse(TypedDict):

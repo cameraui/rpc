@@ -1,7 +1,7 @@
 import asyncio
 import random
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from typing import Any
 
 from camera_ui_rpc import ErrorCode, RPCClass, RPCException, ServiceConfig, create_rpc_client
@@ -78,6 +78,14 @@ class TestService:
         return "Success"
 
 
+async def wait_for_condition(condition: Callable[[], bool], timeout: float = 10.0) -> None:
+    deadline = time.perf_counter() + timeout
+    while not condition():
+        if time.perf_counter() > deadline:
+            raise TimeoutError("Timeout waiting for condition")
+        await asyncio.sleep(0.001)
+
+
 async def test_all_features() -> None:
     print("Comprehensive RPC Performance Test\n")
 
@@ -104,39 +112,40 @@ async def test_all_features() -> None:
         await client.connect()
 
     print("\n 1. Native Request/Reply")
+
+    # Setup (handler registration + subscription settle) outside the measurement
+    async def echo_handler(data: Any) -> dict[str, Any]:
+        return {"echo": data["msg"], "timestamp": int(time.perf_counter() * 1000)}
+
+    unsub = await server.on_request("echo.*", echo_handler)
+    await asyncio.sleep(0.05)  # Let subscription settle
+
     with timer.start_operation("Request Handler Setup & 100 calls"):
-
-        async def echo_handler(data: Any) -> dict[str, Any]:
-            return {"echo": data["msg"], "timestamp": int(time.perf_counter() * 1000)}
-
-        unsub = await server.on_request("echo.*", echo_handler)
-        await asyncio.sleep(0.05)  # Let subscription settle
-
         for i in range(100):
             result = await client.request("echo.test", {"msg": f"Message {i}"})
             assert result["echo"] == f"Message {i}"
 
-        await unsub()
+    await unsub()
 
     print("\n 2. Register Handlers (RPC style)")
+
+    async def handle_echo(msg: str) -> str:
+        return f"Echo: {msg}"
+
+    async def handle_add(a: int, b: int) -> int:
+        return a + b
+
+    handlers: dict[str, Any] = {
+        "echo": handle_echo,
+        "add": handle_add,
+    }
+
+    unsub_rpc = await server.register_handler("test", handlers)
+    await asyncio.sleep(0.05)  # More time for handler setup
+
+    test_proxy = client.create_proxy("test")
+
     with timer.start_operation("RPC Handler Setup & 100 calls"):
-
-        async def handle_echo(msg: str) -> str:
-            return f"Echo: {msg}"
-
-        async def handle_add(a: int, b: int) -> int:
-            return a + b
-
-        handlers: dict[str, Any] = {
-            "echo": handle_echo,
-            "add": handle_add,
-        }
-
-        unsub_rpc = await server.register_handler("test", handlers)
-        await asyncio.sleep(0.05)  # More time for handler setup
-
-        test_proxy = client.create_proxy("test")
-
         for i in range(50):
             echo_result = await test_proxy.echo(f"Message {i}")
             assert echo_result == f"Echo: Message {i}"
@@ -144,76 +153,78 @@ async def test_all_features() -> None:
             add_result = await test_proxy.add(i, i + 1)
             assert add_result == 2 * i + 1
 
-        await unsub_rpc()
+    await unsub_rpc()
 
     print("\n 3. Large Data Transfer (Auto-Chunking)")
+
+    async def handle_large() -> bytes:
+        return large_data
+
+    async def handle_echo_data(data: bytes) -> bytes:
+        return data
+
+    large_handlers: dict[str, Any] = {
+        "get_large": handle_large,
+        "echo_data": handle_echo_data,
+    }
+
+    unsub_large = await server.register_handler("data", large_handlers)
+    await asyncio.sleep(0.05)
+
+    data_proxy = client.create_proxy("data")
+
     with timer.start_operation("Large Data Transfer (10MB)"):
-
-        async def handle_large() -> bytes:
-            return large_data
-
-        async def handle_echo_data(data: bytes) -> bytes:
-            return data
-
-        large_handlers: dict[str, Any] = {
-            "get_large": handle_large,
-            "echo_data": handle_echo_data,
-        }
-
-        unsub_large = await server.register_handler("data", large_handlers)
-        await asyncio.sleep(0.05)
-
-        data_proxy = client.create_proxy("data")
-
         result = await data_proxy.get_large()
         assert len(result) == len(large_data)
 
         echo_result = await data_proxy.echo_data(medium_data)
         assert echo_result == medium_data
 
-        await unsub_large()
+    await unsub_large()
 
     print("\n 4. Channel Communication")
+    server_channel = await server.channel("perf-channel")
+    client_channel = await client.channel("perf-channel")
+
+    messages_received: list[dict[str, Any]] = []
+
+    def on_message(msg: dict[str, Any]) -> None:
+        messages_received.append(msg)
+
+    server_channel.on("message", on_message)
+    await asyncio.sleep(0.05)
+
     with timer.start_operation("Channel Setup & 1000 messages"):
-        server_channel = await server.channel("perf-channel")
-        client_channel = await client.channel("perf-channel")
-
-        messages_received: list[dict[str, Any]] = []
-
-        def on_message(msg: dict[str, Any]) -> None:
-            messages_received.append(msg)
-
-        server_channel.on("message", on_message)
-        await asyncio.sleep(0.05)
-
         for i in range(1000):
             await client_channel.send({"index": i, "data": f"Message {i}"})
 
-        await asyncio.sleep(0.2)
-        assert len(messages_received) == 1000
+        # Wait for the receive counter instead of a fixed sleep
+        await wait_for_condition(lambda: len(messages_received) >= 1000)
 
-        await server_channel.close()
-        await client_channel.close()
+    assert len(messages_received) == 1000
+
+    await server_channel.close()
+    await client_channel.close()
 
     print("\n 5. Private Channel Communication")
+    server_private = await server.private_channel("perf-private", "test-client")
+
+    async def handle_private(data: dict[str, Any]) -> dict[str, Any]:
+        return {"processed": data["value"] * 2}
+
+    unsub_private = await server_private.on_request(handle_private)
+    await asyncio.sleep(0.05)
+
+    client_private = await client.private_channel("perf-private", "test-server")
+
     with timer.start_operation("Private Channel Setup & 100 calls"):
-        server_private = await server.private_channel("perf-private", "test-client")
-
-        async def handle_private(data: dict[str, Any]) -> dict[str, Any]:
-            return {"processed": data["value"] * 2}
-
-        unsub_private = await server_private.on_request(handle_private)
-        await asyncio.sleep(0.05)
-
-        client_private = await client.private_channel("perf-private", "test-server")
-
         for i in range(100):
             result = await client_private.request({"value": i}, timeout=5000)
             assert result["processed"] == i * 2
 
-        await unsub_private()
-        await server_private.close()
-        await client_private.close()
+    await unsub_private()
+    await server_private.close()
+    await client_private.close()
 
     print("\n 6. Service Creation & Discovery")
     with timer.start_operation("Service Setup"):
@@ -222,12 +233,13 @@ async def test_all_features() -> None:
             TestService(),
         )
 
-        await asyncio.sleep(0.1)  # Let service register
+    # Verification (settle sleep + discovery) outside the measurement
+    await asyncio.sleep(0.1)  # Let service register
 
-        monitor = client.service.monitor()
-        services = await monitor.info("perf-service")
-        assert len(services) > 0
-        assert services[0].name == "perf-service"
+    monitor = client.service.monitor()
+    services = await monitor.info("perf-service")
+    assert len(services) > 0
+    assert services[0].name == "perf-service"
 
     print("\n 7. Service Proxy Calls")
     with timer.start_operation("Service Proxy Creation & 50 calls"):
@@ -249,30 +261,32 @@ async def test_all_features() -> None:
 
     # Services don't support chunking, so large data goes via RPC
     print("\n 8b. Large Data via RPC Handler")
+
+    async def handle_get_large_data() -> bytes:
+        return large_data
+
+    large_data_handlers: dict[str, Any] = {"getLargeData": handle_get_large_data}
+
+    unsub_large_rpc = await server.register_handler("largedata", large_data_handlers)
+    await asyncio.sleep(0.05)
+
+    large_proxy = client.create_proxy("largedata")
+
     with timer.start_operation("Get Large Data (10MB) via RPC"):
-
-        async def handle_get_large_data() -> bytes:
-            return large_data
-
-        large_data_handlers: dict[str, Any] = {"getLargeData": handle_get_large_data}
-
-        unsub_large_rpc = await server.register_handler("largedata", large_data_handlers)
-        await asyncio.sleep(0.05)
-
-        large_proxy = client.create_proxy("largedata")
         large_result = await large_proxy.getLargeData()
         assert len(large_result) == len(large_data)
 
-        await unsub_large_rpc()
+    await unsub_large_rpc()
 
     print("\n 9. Concurrent Operations")
+
+    async def concurrent_handler(data: dict[str, Any]) -> dict[str, Any]:
+        return {"echo": data, "handled": True}
+
+    unsub_concurrent = await server.on_request("echo.concurrent", concurrent_handler)
+    await asyncio.sleep(0.05)
+
     with timer.start_operation("Concurrent Requests (500 parallel)"):
-
-        async def concurrent_handler(data: dict[str, Any]) -> dict[str, Any]:
-            return {"echo": data, "handled": True}
-
-        unsub_concurrent = await server.on_request("echo.concurrent", concurrent_handler)
-        await asyncio.sleep(0.05)
 
         async def concurrent_call(i: int) -> dict[str, Any]:
             return await client.request("echo.concurrent", {"index": i})
@@ -297,14 +311,14 @@ async def test_all_features() -> None:
             assert str(e.code) == "500" or e.code == ErrorCode.INTERNAL_ERROR
 
     print("\n 11. Isolated Connection Proxy")
-    with timer.start_operation("Isolated Proxy Test"):
-        handlers_isolated: dict[str, Any] = {
-            "echo": handle_echo,
-            "add": handle_add,
-        }
-        unsub_isolated = await server.register_handler("test", handlers_isolated)
-        await asyncio.sleep(0.05)
+    handlers_isolated: dict[str, Any] = {
+        "echo": handle_echo,
+        "add": handle_add,
+    }
+    unsub_isolated = await server.register_handler("test", handlers_isolated)
+    await asyncio.sleep(0.05)
 
+    with timer.start_operation("Isolated Proxy Test"):
         isolated_proxy_with_close = client.create_proxy("test", isolated_connection=True)
         isolated_proxy = isolated_proxy_with_close.proxy
 
@@ -312,12 +326,13 @@ async def test_all_features() -> None:
             result = await isolated_proxy.echo(f"Isolated {i}")
             assert result == f"Echo: Isolated {i}"
 
-        await isolated_proxy_with_close.close()
-        await unsub_isolated()
+    await isolated_proxy_with_close.close()
+    await unsub_isolated()
 
     print("\n 12. Mixed Workload (Simulating Real Usage)")
+    test_channel = await client.channel("mixed-channel")
+
     with timer.start_operation("Mixed Operations"):
-        test_channel = await client.channel("mixed-channel")
 
         async def mixed_operation():
             ops: list[asyncio.Task[Any]] = []
@@ -341,7 +356,8 @@ async def test_all_features() -> None:
             rounds.append(asyncio.create_task(mixed_operation()))
 
         await asyncio.gather(*rounds)
-        await test_channel.close()
+
+    await test_channel.close()
 
     print("\nCleanup")
     with timer.start_operation("Cleanup"):

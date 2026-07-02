@@ -15,6 +15,10 @@ export class Channel {
   protected unsubscribe?: () => void;
   protected initialized = false;
 
+  /** Cached NATS subjects — built once instead of per send/request. */
+  private readonly subject: string;
+  private readonly requestSubject: string;
+
   // Return type is `void` (consumer-void) so handlers that incidentally
   // return a value type-check. Runtime uses isPromise() on the actual
   // returned value to detect async handlers and chain them.
@@ -40,7 +44,10 @@ export class Channel {
   constructor(
     protected client: RPCClient,
     protected channelId: string,
-  ) {}
+  ) {
+    this.subject = `channel.${channelId}`;
+    this.requestSubject = `channel.${channelId}.request`;
+  }
 
   /**
    * Initialize the channel (called by RPCClient)
@@ -51,9 +58,8 @@ export class Channel {
     }
 
     this.initialized = true;
-    const subject = `channel.${this.channelId}`;
 
-    this.unsubscribe = await this.client.subscribe(subject, async (msg: ChannelMessage) => {
+    this.unsubscribe = await this.client.subscribe(this.subject, async (msg: ChannelMessage) => {
       switch (msg.type) {
         case 'message':
           this.emit('message', msg.data);
@@ -81,7 +87,7 @@ export class Channel {
       data,
     };
 
-    await this.client.publish(`channel.${this.channelId}`, msg);
+    await this.client.publish(this.subject, msg);
   }
 
   /**
@@ -92,16 +98,14 @@ export class Channel {
       throw new Error('Channel is closed');
     }
 
-    const subject = `channel.${this.channelId}.request`;
-    return this.client.request<TRequest, TResponse>(subject, data, { timeout });
+    return this.client.request<TRequest, TResponse>(this.requestSubject, data, { timeout });
   }
 
   /**
    * Setup a request handler for this channel
    */
   public async onRequest<TRequest = any, TResponse = any>(handler: (data: TRequest) => Promise<TResponse> | TResponse): Promise<() => void> {
-    const subject = `channel.${this.channelId}.request`;
-    const unsubscribe = this.client.onRequest(subject, handler);
+    const unsubscribe = this.client.onRequest(this.requestSubject, handler);
     this.subscriptions.push(unsubscribe);
     return unsubscribe;
   }
@@ -152,7 +156,7 @@ export class Channel {
     // Try to notify other side
     try {
       const msg: ChannelMessage = { type: 'close' };
-      await this.client.publish(`channel.${this.channelId}`, msg);
+      await this.client.publish(this.subject, msg);
     } catch {
       // Ignore publish errors during close
     }
@@ -238,6 +242,10 @@ export class PrivateChannel extends Channel {
   private readonly clientId: string;
   private remoteClientId?: string;
 
+  /** Cached private subjects — the sorted-id join is built once here. */
+  private readonly privateSubject: string;
+  private readonly privateRequestSubject: string;
+
   /**
    * Get the remote client ID (if connected)
    */
@@ -257,6 +265,11 @@ export class PrivateChannel extends Channel {
     const fullName = client.options.name ?? `client-${Date.now()}`;
     // Extract base name by removing any suffixes added for isolated connections
     this.clientId = fullName.replace(/-(channel|private)-.*$/, '');
+
+    // Unique subject that includes channelId and both client IDs for true privacy
+    const sortedIds = [this.clientId, this.targetClientId].sort();
+    this.privateSubject = `channel.private.${channelId}.${sortedIds.join('.')}`;
+    this.privateRequestSubject = `${this.privateSubject}.request`;
   }
 
   /**
@@ -269,11 +282,7 @@ export class PrivateChannel extends Channel {
 
     this.initialized = true;
 
-    // Use a unique subject that includes channelId and both client IDs for true privacy
-    const sortedIds = [this.clientId, this.targetClientId].sort();
-    const subject = `channel.private.${this.channelId}.${sortedIds.join('.')}`;
-
-    this.unsubscribe = await this.client.subscribe(subject, async (msg: ChannelMessage) => {
+    this.unsubscribe = await this.client.subscribe(this.privateSubject, async (msg: ChannelMessage) => {
       // Filter messages: only process if it's for us
       if (msg.sender === this.clientId) {
         // Skip our own messages
@@ -348,20 +357,14 @@ export class PrivateChannel extends Channel {
       throw new Error('Channel is closed');
     }
 
-    const sortedIds = [this.clientId, this.targetClientId].sort();
-    const subject = `channel.private.${this.channelId}.${sortedIds.join('.')}.request`;
-
-    return this.client.request(subject, data, { timeout });
+    return this.client.request(this.privateRequestSubject, data, { timeout });
   }
 
   /**
    * Setup a request handler for this private channel
    */
   public async onRequest<TRequest = any, TResponse = any>(handler: (data: TRequest) => Promise<TResponse> | TResponse): Promise<() => void> {
-    const sortedIds = [this.clientId, this.targetClientId].sort();
-    const subject = `channel.private.${this.channelId}.${sortedIds.join('.')}.request`;
-
-    return this.client.onRequest(subject, handler);
+    return this.client.onRequest(this.privateRequestSubject, handler);
   }
 
   /**
@@ -393,9 +396,6 @@ export class PrivateChannel extends Channel {
   }
 
   private async sendRaw(msg: ChannelMessage): Promise<void> {
-    // Use the same subject format as in init()
-    const sortedIds = [this.clientId, this.targetClientId].sort();
-    const subject = `channel.private.${this.channelId}.${sortedIds.join('.')}`;
-    await this.client.publish(subject, msg);
+    await this.client.publish(this.privateSubject, msg);
   }
 }

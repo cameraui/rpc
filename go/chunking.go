@@ -88,6 +88,7 @@ type ChunkingManager struct {
 	onComplete   map[string]func([]byte)
 	onError      map[string]func(error)
 	lastActivity map[string]time.Time
+	lastSweep    time.Time
 }
 
 // NewChunkingManager creates a new ChunkingManager.
@@ -103,11 +104,18 @@ func NewChunkingManager() *ChunkingManager {
 // sweepStaleLocked removes transfers with no activity within staleTransferTTL.
 // Must be called with m.mu held. Returns the error callbacks of the swept
 // transfers so the caller can invoke them after releasing the lock.
+// Time-gated to at most once per second — it runs on every chunk, and the
+// map scan under the mutex would otherwise tax the chunking hot path.
 func (m *ChunkingManager) sweepStaleLocked() []func(error) {
 	if len(m.lastActivity) == 0 {
 		return nil
 	}
-	cutoff := time.Now().Add(-staleTransferTTL)
+	now := time.Now()
+	if now.Sub(m.lastSweep) < time.Second {
+		return nil
+	}
+	m.lastSweep = now
+	cutoff := now.Add(-staleTransferTTL)
 	var staleCbs []func(error)
 	for id, activity := range m.lastActivity {
 		if activity.Before(cutoff) {

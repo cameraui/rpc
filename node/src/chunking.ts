@@ -105,11 +105,13 @@ export class ChunkAssembler {
  */
 export class ChunkingManager {
   private static readonly STALE_TRANSFER_TTL_MS = 30_000;
+  private static readonly SWEEP_INTERVAL_MS = 1_000;
 
   private assemblers = new Map<string, ChunkAssembler>();
   private completedCallbacks = new Map<string, (data: any) => void>();
   private errorCallbacks = new Map<string, (error: Error) => void>();
   private lastActivity = new Map<string, number>();
+  private lastSweep = 0;
 
   /**
    * Start receiving chunks for a transfer.
@@ -126,7 +128,12 @@ export class ChunkingManager {
 
   private sweepStale(): void {
     if (this.lastActivity.size === 0) return;
-    const cutoff = Date.now() - ChunkingManager.STALE_TRANSFER_TTL_MS;
+    // Time-gate: sweeping per chunk would iterate the activity map on every
+    // message of a large transfer. Once per second is plenty for a 30s TTL.
+    const now = Date.now();
+    if (now - this.lastSweep < ChunkingManager.SWEEP_INTERVAL_MS) return;
+    this.lastSweep = now;
+    const cutoff = now - ChunkingManager.STALE_TRANSFER_TTL_MS;
     for (const [id, activity] of this.lastActivity) {
       if (activity < cutoff) {
         const errorCallback = this.errorCallbacks.get(id);

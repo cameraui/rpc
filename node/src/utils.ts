@@ -90,15 +90,15 @@ export function createProxy<T extends object>(client: RPCClient, namespace: stri
     cache ??= new Set(methods);
   };
 
-  const stripMethods = (result: any): any => {
-    // Skip binary data types - spread operator would convert them to plain objects
-    if (result instanceof Uint8Array || result instanceof ArrayBuffer) {
-      return result;
-    }
-    if (result && typeof result === 'object' && '__methods' in result) {
-      updateCache(result.__methods);
-      const { __methods, ...rest } = result;
-      return Array.isArray(result) ? Object.assign([...result], rest) : rest;
+  // Call via the meta side channel: the response's __methods travel next to
+  // the result instead of being spliced into it, so the result object is
+  // passed through untouched (no mutation, no spread copy). Discovery is
+  // requested only while the cache is empty — once the first response filled
+  // it, responses stay lean (no __methods payload).
+  const callAndCache = async (subject: string, args: any[]): Promise<any> => {
+    const { result, methods } = await client.callWithMeta(subject, args, { discover: cache === null });
+    if (methods) {
+      updateCache(methods);
     }
     return result;
   };
@@ -159,11 +159,9 @@ export function createProxy<T extends object>(client: RPCClient, namespace: stri
           } else if (isPullIterator) {
             return client.callPullIterator(subject, ...args);
           } else {
-            // Wrap call to strip __methods from result
-            return (async () => {
-              const result = await client.call(subject, ...args);
-              return stripMethods(result);
-            })();
+            // Route through the meta channel so __methods feeds the cache
+            // without touching the result object.
+            return callAndCache(subject, args);
           }
         },
 
@@ -177,8 +175,7 @@ export function createProxy<T extends object>(client: RPCClient, namespace: stri
               if (!client.isConnected && !client.isClosed) {
                 await client.connect();
               }
-              const result = await client.call(`rpc.${namespace}.${method}`);
-              return stripMethods(result);
+              return callAndCache(`rpc.${namespace}.${method}`, []);
             })();
             // @ts-ignore
             return promise[nestedProp as keyof Promise<any>].bind(promise);
@@ -294,11 +291,113 @@ export function createServiceProxy<T extends object>(client: RPCClient, selected
   }) as Promisify<T>;
 }
 
-export function generateId(connId?: string): string {
-  const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  return connId ? `${connId}.${id}` : id;
+// 9-char base36 suffix split into a per-process random prefix (5 chars,
+// drawn once) and a monotonically increasing counter (4 chars, random start,
+// wraps at 36^4 ≈ 1.68M). Within a process ids are collision-free per
+// millisecond by construction; across processes the per-pair collision
+// probability is 36^-5 (prefix) × 36^-4 (counter) = 36^-9 — identical to the
+// previous fully random 9-char suffix, without a Math.random() per call.
+const ID_COUNTER_SPACE = 36 ** 4;
+const idPrefix = Math.floor(Math.random() * 36 ** 5)
+  .toString(36)
+  .padStart(5, '0');
+let idCounter = Math.floor(Math.random() * ID_COUNTER_SPACE);
+
+export function generateId(replyPrefix?: string): string {
+  idCounter = (idCounter + 1) % ID_COUNTER_SPACE;
+  const id = `${Date.now()}-${idPrefix}${idCounter.toString(36).padStart(4, '0')}`;
+  return replyPrefix ? `${replyPrefix}.${id}` : id;
+}
+
+/**
+ * Generate a client-local reply prefix: ~10 base36 chars (48 random bits),
+ * crypto-backed where available. Used as the first dot-separated segment of
+ * every call id when no connId is configured, so all reply subjects of a
+ * client share one wildcard-subscribable prefix (`rpc.reply.<prefix>.>`).
+ */
+export function generateReplyPrefix(): string {
+  let value: number;
+  const cryptoObj = (globalThis as { crypto?: Crypto }).crypto;
+  if (cryptoObj?.getRandomValues) {
+    const bytes = new Uint8Array(6);
+    cryptoObj.getRandomValues(bytes);
+    value = bytes.reduce((acc, b) => acc * 256 + b, 0);
+  } else {
+    value = Math.floor(Math.random() * 2 ** 48);
+  }
+  return value.toString(36).padStart(10, '0');
 }
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Per-subscription serial dispatcher with a sync fast path.
+ *
+ * Guarantees: handlers run strictly serially in dispatch order — also for
+ * mixed sync/async handlers. This matches the previous "chain every call"
+ * behavior (and Python's awaited dispatch) that backpressure-sensitive
+ * callers rely on: an awaiting handler blocks the next message.
+ *
+ * Optimization: when the chain is idle (no async handler still pending),
+ * the handler is invoked inline. Only if it returns a promise does the
+ * chain become busy; purely synchronous traffic never allocates promises.
+ * While the chain is busy, every subsequent dispatch is appended to the
+ * chain so ordering is preserved.
+ *
+ * flush() resolves once every message dispatched so far has had its
+ * handler executed (resolved immediately when the chain is idle).
+ */
+export function createSerialDispatcher(
+  handler: (data: any) => void | Promise<void>,
+  onError: (error: unknown) => void,
+): { dispatch: (data: any) => void; flush: () => Promise<void> } {
+  let chain: Promise<void> = Promise.resolve();
+  // Number of handler completions still pending in the chain.
+  let busy = 0;
+
+  const dispatch = (data: any): void => {
+    if (busy === 0) {
+      // Chain idle — run inline. Sync handlers complete right here.
+      let result: void | Promise<void>;
+      try {
+        result = handler(data);
+      } catch (error) {
+        onError(error);
+        return;
+      }
+      if (isPromise(result)) {
+        busy++;
+        chain = result.then(
+          () => {
+            busy--;
+          },
+          (error) => {
+            busy--;
+            onError(error);
+          },
+        );
+      }
+      return;
+    }
+
+    // Chain busy — append so this message runs after all previous ones.
+    busy++;
+    chain = chain
+      .then(() => handler(data))
+      .then(
+        () => {
+          busy--;
+        },
+        (error) => {
+          busy--;
+          onError(error);
+        },
+      );
+  };
+
+  const flush = (): Promise<void> => (busy === 0 ? Promise.resolve() : chain);
+
+  return { dispatch, flush };
 }

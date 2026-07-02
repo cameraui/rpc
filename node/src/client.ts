@@ -8,7 +8,7 @@ import { RPCException, createError } from './errors.js';
 import { formatErrorObject, handleCallbackRequest, handleNormalRPC, handlePullCallbackRequest, handlePullIteratorRequest, handleStreamRequest } from './handler.js';
 import { RPCService } from './service.js';
 import { ERROR_CODES } from './types.js';
-import { createProxy, createServiceProxy, generateId, sleep } from './utils.js';
+import { createProxy, createSerialDispatcher, createServiceProxy, generateId, generateReplyPrefix, sleep } from './utils.js';
 
 import type { Msg, MsgHdrs, NatsConnection, Status, Subscription } from '@nats-io/nats-core';
 import type { ServiceInfo } from '@nats-io/services';
@@ -19,6 +19,7 @@ import type {
   CallbackParams,
   ChunkedTransferHeader,
   Promisify,
+  PullCallbackCallOptions,
   PullCallbackParams,
   PullIteratorRequest,
   PullIteratorResponse,
@@ -38,7 +39,14 @@ interface SubscriptionEntry {
   pattern: string;
   handler: (data: any) => void | Promise<void>;
   options?: { queue?: string };
+  /** Raw mode: the handler receives the undecoded NATS Msg (with headers and
+   * subject) instead of decoded payload data. No chunk reassembly, no serial
+   * dispatcher — used by the muxed reply inbox which routes chunks itself. */
+  raw?: boolean;
   sub?: Subscription;
+  /** Awaits the subscription's handler chain as of call time — i.e. every
+   * message dispatched so far has had its handler executed. */
+  flush?: () => Promise<void>;
 }
 
 function scopedInbox(connId?: string): string {
@@ -55,6 +63,24 @@ export class RPCClient implements RPCClientImpl {
   private subscriptionSeq = 0;
   private subscriptionEntries = new Map<number, SubscriptionEntry>();
   private pullIteratorSettles = new Set<() => void>();
+
+  /** First dot-separated segment of every id this client generates. Equals
+   * the connId when one is configured (browser clients: the firewall
+   * allowlists `rpc.reply.<connId>.>`), otherwise a local random prefix.
+   * All reply subjects derived from those ids therefore fall under one
+   * wildcard: `rpc.reply.<replyPrefix>.>` — the muxed reply inbox. */
+  private readonly replyPrefix: string;
+
+  /** The single persistent reply-mux subscription entry (wildcard
+   * `rpc.reply.<replyPrefix>.>`). Lives in subscriptionEntries so
+   * suspend()/connect() restore it like any other subscription. */
+  private muxEntry?: SubscriptionEntry;
+
+  /** 503/no-responder handlers keyed by reply-subject suffix (the part after
+   * `rpc.reply.`). Used by pull-iterator/stream paths whose per-message
+   * `reply` subject only ever carries no-responder statuses. One-shot:
+   * the mux dispatcher removes an entry when it fires (max:1 semantics). */
+  private statusHandlers = new Map<string, (err: Error) => void>();
   private _maxPayloadSize: number = 1024 * 1024; // Default 1MB
   private connectionPromise?: Promise<NatsConnection>;
   private closed = false;
@@ -68,6 +94,9 @@ export class RPCClient implements RPCClientImpl {
       reject: (error: any) => void;
       timeout?: NodeJS.Timeout;
       cleanup?: () => void;
+      /** Request subject — used for the NoRespondersError message when a
+       * 503 status arrives on the call's muxed reply subject. */
+      subject?: string;
     }
   >();
 
@@ -141,7 +170,11 @@ export class RPCClient implements RPCClientImpl {
     }
   }
 
-  constructor(public options: RPCClientOptions) {}
+  constructor(public options: RPCClientOptions) {
+    // With a connId the prefix MUST be exactly the connId — the server-side
+    // firewall allowlists `rpc.reply.<connId>.>` for browser clients.
+    this.replyPrefix = options.connId ?? generateReplyPrefix();
+  }
 
   /**
    * Create a new isolated RPC client
@@ -218,6 +251,11 @@ export class RPCClient implements RPCClientImpl {
     // Reserve 8KB for NATS protocol overhead and MsgPack envelope per message
     this._maxPayloadSize = this._maxPayloadSize - 8192;
 
+    // Register the muxed reply inbox (idempotent). Registered as a normal
+    // subscription entry so the restore loop below (re-)subscribes it on
+    // first connect and after every suspend cycle alike.
+    this.ensureMuxSubscription(false);
+
     // Restore subscriptions after reconnect (from suspend). Entries keep
     // their identity so unsubscribe closures held by callers stay valid.
     for (const entry of this.subscriptionEntries.values()) {
@@ -245,6 +283,7 @@ export class RPCClient implements RPCClientImpl {
       pending.reject(createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed'));
     }
     this.pendingRequests.clear();
+    this.statusHandlers.clear();
 
     // Cleanup stream handlers
     for (const [, handler] of this.streamHandlers) {
@@ -274,6 +313,8 @@ export class RPCClient implements RPCClientImpl {
       }
     }
     this.subscriptionEntries.clear();
+    // Entries were dropped — a revive-connect() must re-register the mux.
+    this.muxEntry = undefined;
 
     // Clear chunking manager
     this.chunkingManager = new ChunkingManager();
@@ -385,6 +426,7 @@ export class RPCClient implements RPCClientImpl {
       pending.reject(createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed'));
     }
     this.pendingRequests.clear();
+    this.statusHandlers.clear();
 
     for (const [, handler] of this.streamHandlers) {
       try {
@@ -445,9 +487,10 @@ export class RPCClient implements RPCClientImpl {
    * After calling suspend(), connect() will restore previous subscriptions.
    */
   public async suspend(): Promise<void> {
-    // Cleanup pending requests. pending.cleanup drops the reply-subscription
-    // entry too — otherwise a suspended in-flight call would be restored as a
-    // dead rpc.reply.* subscription on the next connect().
+    // Cleanup pending requests. RPC calls are muxed (no per-call
+    // subscription); service-path calls still hold a per-call reply entry
+    // which pending.cleanup drops — otherwise a suspended in-flight call
+    // would be restored as a dead reply subscription on the next connect().
     for (const [, pending] of this.pendingRequests) {
       if (pending.timeout) {
         clearTimeout(pending.timeout);
@@ -456,6 +499,7 @@ export class RPCClient implements RPCClientImpl {
       pending.reject(createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed'));
     }
     this.pendingRequests.clear();
+    this.statusHandlers.clear();
 
     // Cleanup stream handlers
     for (const [, handler] of this.streamHandlers) {
@@ -572,9 +616,48 @@ export class RPCClient implements RPCClientImpl {
   }
 
   /**
+   * Synchronous publish fast path for small payloads.
+   *
+   * Encodes and publishes in one synchronous step — no promise allocation,
+   * no microtask hop. Returns false when the encoded payload exceeds
+   * maxPayloadSize and needs chunking; the caller must then fall back to
+   * the async publish(). Wire format is identical to publish().
+   *
+   * Internal: used by hot oneway paths (callback proxy, pull-iterator
+   * responses). Not part of the public RPCClient interface.
+   */
+  public tryPublishSync<TMessage = any>(subject: string, data: TMessage, opts?: { headers?: MsgHdrs; reply?: string }): boolean {
+    if (!this.nc) {
+      throw new Error('Not connected');
+    }
+
+    const encoded = encode(data);
+    if (encoded.length > this._maxPayloadSize) {
+      return false;
+    }
+
+    this.nc.publish(subject, encoded, opts);
+    return true;
+  }
+
+  /**
    * Public subscribe method
    */
   public async subscribe<TResponse = any>(pattern: string, handler: (data: TResponse) => void | Promise<void>, options?: { queue?: string }): Promise<() => void> {
+    const { unsubscribe } = await this.subscribeEntry(pattern, handler, options);
+    return unsubscribe;
+  }
+
+  /**
+   * Internal subscribe that also exposes the SubscriptionEntry, so callers
+   * (e.g. the pull-callback iterator) can flush the per-subscription handler
+   * chain deterministically.
+   */
+  private async subscribeEntry<TResponse = any>(
+    pattern: string,
+    handler: (data: TResponse) => void | Promise<void>,
+    options?: { queue?: string },
+  ): Promise<{ entry: SubscriptionEntry; unsubscribe: () => void }> {
     if (!this.nc) {
       throw new Error('Not connected');
     }
@@ -594,8 +677,7 @@ export class RPCClient implements RPCClientImpl {
       }
     };
 
-    // Return unsubscribe function
-    return unsubscribe;
+    return { entry, unsubscribe };
   }
 
   /**
@@ -605,18 +687,41 @@ export class RPCClient implements RPCClientImpl {
   private natsSubscribe(entry: SubscriptionEntry): void {
     const { pattern } = entry;
 
-    // Serialize handlers via a per-subscription promise chain. This matches
-    // Python's behavior (client.py:434 awaits the handler) and is what
-    // backpressure-sensitive callers rely on: an awaiting handler blocks the
-    // next message from being dispatched, which transitively stalls the
-    // producer. The handler itself is invoked INSIDE the chain — invoking it
-    // eagerly and only chaining the completion would run handlers
-    // concurrently and out of order.
-    let handlerChain: Promise<void> = Promise.resolve();
+    // Raw mode (muxed reply inbox): hand the undecoded Msg to the handler —
+    // it needs headers (503 status, chunk markers) and the subject, and does
+    // its own chunk reassembly and routing. Handlers are synchronous; no
+    // serial dispatcher needed.
+    if (entry.raw) {
+      entry.sub = this.nc!.subscribe(pattern, {
+        callback: (err, msg) => {
+          if (err) {
+            console.error(`Subscription error for ${pattern}:`, err);
+            return;
+          }
+          try {
+            entry.handler(msg);
+          } catch (error) {
+            console.error(`Error processing message for ${pattern}:`, error);
+          }
+        },
+      });
+      return;
+    }
 
-    const runHandler = (data: unknown) => {
-      handlerChain = handlerChain.then(() => entry.handler(data)).catch((error) => console.error(`Error in handler for ${pattern}:`, error));
-    };
+    // Serialize handlers per subscription. This matches Python's behavior
+    // (client.py:434 awaits the handler) and is what backpressure-sensitive
+    // callers rely on: an awaiting handler blocks the next message from
+    // being dispatched, which transitively stalls the producer.
+    //
+    // createSerialDispatcher keeps that ordering guarantee but skips the
+    // promise chain entirely while no async handler is pending — sync
+    // handlers run inline (2 fewer promises per message on the hot path).
+    const dispatcher = createSerialDispatcher(entry.handler, (error) => console.error(`Error in handler for ${pattern}:`, error));
+    const runHandler = dispatcher.dispatch;
+
+    // Expose a flush hook: awaiting it settles the chain as of call time,
+    // i.e. every message dispatched so far has had its handler executed.
+    entry.flush = dispatcher.flush;
 
     const processMessage = (err: Error | null, msg: Msg) => {
       if (err) {
@@ -681,6 +786,122 @@ export class RPCClient implements RPCClientImpl {
       ...(entry.options?.queue ? { queue: entry.options.queue } : {}),
       callback: processMessage,
     });
+  }
+
+  /**
+   * Muxed reply inbox: register (and by default subscribe) the single
+   * persistent wildcard subscription `rpc.reply.<replyPrefix>.>` that
+   * receives every RPC reply of this client — real responses, chunked
+   * responses and 503/no-responder statuses. Idempotent.
+   *
+   * connect() passes subscribeNow=false: it only registers the entry and
+   * lets its restore loop create the actual subscription alongside all
+   * other entries (also after suspend cycles).
+   */
+  private ensureMuxSubscription(subscribeNow = true): void {
+    if (!this.muxEntry) {
+      this.muxEntry = {
+        pattern: `rpc.reply.${this.replyPrefix}.>`,
+        raw: true,
+        handler: (msg: any) => this.handleMuxMessage(msg as Msg),
+      };
+      this.subscriptionEntries.set(++this.subscriptionSeq, this.muxEntry);
+    }
+    if (subscribeNow && this.nc && (!this.muxEntry.sub || this.muxEntry.sub.isClosed())) {
+      this.natsSubscribe(this.muxEntry);
+    }
+  }
+
+  /**
+   * Dispatcher for the muxed reply inbox. Routes by message kind:
+   * - 503/no-responder status (empty payload + code 503): the call/iterator
+   *   is identified by the SUBJECT (`rpc.reply.<suffix>`) — the server echoes
+   *   the request's reply subject, there is no payload to decode.
+   * - chunked transfer header/chunk: reassemble via chunkingManager, then
+   *   route the assembled response by envelope id.
+   * - regular response: decode and route by envelope id.
+   */
+  private handleMuxMessage(msg: Msg): void {
+    // No-responder status. Wire detail: the reply subject of an RPC call is
+    // exactly `rpc.reply.<call id>`, so the suffix IS the call id. For
+    // iterator/stream status inboxes the suffix is the registered token.
+    if (msg.data?.length === 0 && msg.headers?.code === 503) {
+      const suffix = msg.subject.slice('rpc.reply.'.length);
+
+      const statusHandler = this.statusHandlers.get(suffix);
+      if (statusHandler) {
+        // One-shot (mirrors the previous per-iterator `max: 1` inboxes).
+        this.statusHandlers.delete(suffix);
+        try {
+          statusHandler(new errors.NoRespondersError(suffix));
+        } catch (error) {
+          console.error('Error in no-responder status handler:', error);
+        }
+        return;
+      }
+
+      const pending = this.pendingRequests.get(suffix);
+      if (pending) {
+        this.pendingRequests.delete(suffix);
+        if (pending.timeout) clearTimeout(pending.timeout);
+        pending.reject(new errors.NoRespondersError(pending.subject ?? suffix));
+      }
+      return;
+    }
+
+    const chunkType = msg.headers?.get('x-chunked-transfer');
+
+    if (chunkType === 'header') {
+      const data = decode(msg.data);
+      const chunkId = msg.headers?.get('x-chunk-id');
+      if (!chunkId || data.transferId !== chunkId) {
+        console.error('Invalid chunk header on reply mux');
+        return;
+      }
+      this.chunkingManager.startReceiving(
+        data.transferId,
+        data.totalChunks,
+        (assembledData) => this.routeMuxResponse(assembledData),
+        (error) => console.error('Error assembling chunked RPC response:', error),
+        data.totalSize,
+        data.chunkSize,
+      );
+    } else if (chunkType === 'chunk') {
+      const chunkId = msg.headers?.get('x-chunk-id');
+      const chunkIndex = parseInt(msg.headers?.get('x-chunk-index') ?? '0');
+      if (!chunkId) {
+        console.error('Chunk missing chunk ID on reply mux');
+        return;
+      }
+      this.chunkingManager.processChunk({ id: chunkId, chunkIndex, data: msg.data, isLast: false });
+    } else {
+      this.routeMuxResponse(decode(msg.data));
+    }
+  }
+
+  /**
+   * Settle the pending request a (possibly reassembled) RPC response belongs
+   * to. Unknown ids are dropped silently — late replies after a timeout, or
+   * traffic of another client sharing the same connId prefix.
+   */
+  private routeMuxResponse(data: any): void {
+    const response = data as RPCResponse;
+    const id = response?.id;
+    if (!id) return;
+
+    const pending = this.pendingRequests.get(id);
+    if (!pending) return;
+
+    this.pendingRequests.delete(id);
+    if (pending.timeout) clearTimeout(pending.timeout);
+
+    if (response.error) {
+      pending.reject(RPCException.fromJSON(response.error));
+    } else {
+      // __methods (proxy method discovery) travels as a side channel next to
+      // the result — the result object itself stays untouched.
+      pending.resolve({ result: response.result, methods: response.__methods });
+    }
   }
 
   /**
@@ -798,13 +1019,30 @@ export class RPCClient implements RPCClientImpl {
    * Make an RPC call
    */
   public async call<TResponse = any>(subject: string, ...args: any[]): Promise<TResponse> {
-    return this.withNoResponderRetry(() => this._callOnce<TResponse>(subject, ...args));
+    const { result } = await this.withNoResponderRetry(() => this._callOnce<TResponse>(subject, args));
+    return result;
+  }
+
+  /**
+   * Make an RPC call and additionally return the response's __methods
+   * metadata as a side channel. The result object is passed through
+   * untouched — __methods is never spliced into it. Used by createProxy for
+   * method discovery; plain call() discards the metadata.
+   *
+   * With `discover: true` the request envelope carries `__discover: true`,
+   * asking the responder to attach its method list to the response. Proxies
+   * request this only while their method cache is empty.
+   *
+   * Internal: not part of the public RPCClient interface.
+   */
+  public async callWithMeta<TResponse = any>(subject: string, args: any[] = [], opts?: { discover?: boolean }): Promise<{ result: TResponse; methods?: string[] }> {
+    return this.withNoResponderRetry(() => this._callOnce<TResponse>(subject, args, opts?.discover === true));
   }
 
   /**
    * Make an RPC call (single attempt)
    */
-  private async _callOnce<TResponse = any>(subject: string, ...args: any[]): Promise<TResponse> {
+  private async _callOnce<TResponse = any>(subject: string, args: any[], discover = false): Promise<{ result: TResponse; methods?: string[] }> {
     if (!this.isConnected && !this.isClosed) {
       await this.connect();
     }
@@ -813,12 +1051,76 @@ export class RPCClient implements RPCClientImpl {
       throw new Error('Not connected');
     }
 
-    const id = generateId(this.options.connId);
-    const timeout = this.options.timeout ?? 30000;
-    // Use different reply patterns for RPC vs service calls
-    const replySubject = subject.startsWith('rpc.') ? `rpc.reply.${id}` : `${subject}.reply.${id}`;
+    // Service calls (`<subject>.reply.<id>`) keep the legacy per-call
+    // subscription flow — separate refactor later.
+    if (!subject.startsWith('rpc.')) {
+      return this._callOnceService<TResponse>(subject, args);
+    }
 
-    return new Promise<TResponse>(async (resolve, reject) => {
+    // Normally established by connect(); covers clients whose connection was
+    // wired up out-of-band (tests). No-op when already subscribed.
+    this.ensureMuxSubscription();
+
+    const id = generateId(this.replyPrefix);
+    const timeout = this.options.timeout ?? 30000;
+    // The reply subject is derived from the id by pure string concatenation —
+    // this is the wire contract with every responder implementation (Node,
+    // Go, Python): they publish the response to `rpc.reply.${msg.id}` and
+    // treat the id as opaque. Because the id starts with our replyPrefix,
+    // the muxed reply inbox (`rpc.reply.<replyPrefix>.>`) catches it.
+    const replySubject = `rpc.reply.${id}`;
+
+    return new Promise<{ result: TResponse; methods?: string[] }>((resolve, reject) => {
+      // No per-call subscriptions: responses (plain or chunked) and
+      // no-responder statuses all arrive on the muxed reply inbox, which
+      // routes them back here via pendingRequests. cleanup only has to drop
+      // the map entry and the timer.
+      const timeoutHandle = setTimeout(() => {
+        if (this.pendingRequests.delete(id)) {
+          reject(createError(ERROR_CODES.TIMEOUT, `RPC call to "${subject}" timed out after ${timeout}ms`));
+        }
+      }, timeout);
+
+      this.pendingRequests.set(id, {
+        resolve,
+        reject,
+        timeout: timeoutHandle,
+        subject,
+        cleanup: () => {
+          clearTimeout(timeoutHandle);
+          this.pendingRequests.delete(id);
+        },
+      });
+
+      // Send request. `reply` is set to the call's own reply subject so the
+      // NATS server delivers a no-responder 503 status to the SAME subject
+      // the real response would use — the mux catches both.
+      const message: RPCMessage = { id, method: 'call', params: args };
+      if (discover) {
+        // Envelope marker (never in params — must not leak into handler
+        // args): ask the responder for its __methods list.
+        message.__discover = true;
+      }
+      this.publish(subject, message, { reply: replySubject }).catch((error) => {
+        if (this.pendingRequests.delete(id)) {
+          clearTimeout(timeoutHandle);
+          reject(error);
+        }
+      });
+    });
+  }
+
+  /**
+   * Legacy single-attempt call for service subjects (reply pattern
+   * `<subject>.reply.<id>`): per-call reply subscription + one-shot
+   * no-responder inbox. The rpc.* path is muxed — see _callOnce.
+   */
+  private async _callOnceService<TResponse = any>(subject: string, args: any[]): Promise<{ result: TResponse; methods?: string[] }> {
+    const id = generateId(this.replyPrefix);
+    const timeout = this.options.timeout ?? 30000;
+    const replySubject = `${subject}.reply.${id}`;
+
+    return new Promise<{ result: TResponse; methods?: string[] }>(async (resolve, reject) => {
       // Initialize variables
       let sub: Subscription | undefined;
       let unsubscribe: (() => void) | undefined;
@@ -878,15 +1180,9 @@ export class RPCClient implements RPCClientImpl {
             if (response.error) {
               pending.reject(RPCException.fromJSON(response.error));
             } else {
-              const result = response.result;
-              // Attach __methods to result for proxy method discovery
-              // Skip binary data types (Uint8Array, ArrayBuffer)
-              const isBinaryData = result instanceof Uint8Array || result instanceof ArrayBuffer || (typeof Buffer !== 'undefined' && Buffer.isBuffer(result));
-
-              if (response.__methods && result !== null && typeof result === 'object' && !isBinaryData) {
-                result.__methods = response.__methods;
-              }
-              pending.resolve(result);
+              // __methods (proxy method discovery) travels as a side channel
+              // next to the result — the result object itself stays untouched.
+              pending.resolve({ result: response.result, methods: response.__methods });
             }
           }
         }
@@ -967,7 +1263,6 @@ export class RPCClient implements RPCClientImpl {
 
     let id = '';
     let streamSubject = '';
-    let sub: Subscription | undefined;
     let unsubscribe: (() => void) | undefined;
 
     const queue: TResponse[] = [];
@@ -1007,13 +1302,7 @@ export class RPCClient implements RPCClientImpl {
       if (cleanedUp) return;
       cleanedUp = true;
       client.streamHandlers.delete(id);
-      if (sub && !sub.isClosed()) {
-        try {
-          sub.unsubscribe();
-        } catch {
-          // ignore
-        }
-      }
+      client.statusHandlers.delete(id);
       unsubscribe?.();
       if (!ended) {
         ended = true;
@@ -1044,35 +1333,31 @@ export class RPCClient implements RPCClientImpl {
       }
     };
 
-    const requestCallback = (err: Error | null, msg: Msg): void => {
-      if (msg && msg.data?.length === 0 && msg.headers?.code === 503) {
-        const h = client.streamHandlers.get(id);
-        h?.error(new errors.NoRespondersError(subject));
-        cleanupOnce();
-      } else if (err) {
-        const h = client.streamHandlers.get(id);
-        h?.error(err);
-        cleanupOnce();
-      }
-    };
-
     const setup = async (): Promise<void> => {
       if (!client.isConnected && !client.isClosed) {
         await client.connect();
       }
       if (!client.nc) throw new Error('Not connected');
+      client.ensureMuxSubscription();
 
-      id = generateId(client.options.connId);
+      id = generateId(client.replyPrefix);
       streamSubject = `stream.${subject}.${id}`;
       client.streamHandlers.set(id, handler);
 
       unsubscribe = await client.subscribe(streamSubject, handleStreamMessage);
-      const inbox = scopedInbox(client.options.connId);
-      sub = client.nc.subscribe(inbox, { max: 1, callback: requestCallback });
+
+      // No-responder detection via the muxed reply inbox: the request's
+      // reply subject `rpc.reply.<id>` only ever carries a 503 status —
+      // stream responders never publish a direct RPC response.
+      client.statusHandlers.set(id, () => {
+        const h = client.streamHandlers.get(id);
+        h?.error(new errors.NoRespondersError(subject));
+        void cleanupOnce();
+      });
 
       const streamParams = { __stream: true, __streamSubject: streamSubject, args };
       const message: RPCMessage = { id, method: 'stream', params: streamParams };
-      await client.publish(subject, message, { reply: inbox });
+      await client.publish(subject, message, { reply: `rpc.reply.${id}` });
     };
 
     const iter: AsyncGenerator<TResponse, void, void> = {
@@ -1182,8 +1467,7 @@ export class RPCClient implements RPCClientImpl {
     let iteratorId = '';
     let requestSubject = '';
     let responseSubject = '';
-    let sub: Subscription | undefined;
-    let inbox = '';
+    let statusInbox = '';
     let responseUnsub: (() => void) | undefined;
 
     const responseQueue: PullIteratorResponse[] = [];
@@ -1221,14 +1505,8 @@ export class RPCClient implements RPCClientImpl {
       if (cleanedUp) return;
       cleanedUp = true;
       client.pullIteratorSettles.delete(settleOnDisconnect);
+      client.statusHandlers.delete(iteratorId);
       responseUnsub?.();
-      if (sub && !sub.isClosed()) {
-        try {
-          sub.unsubscribe();
-        } catch {
-          // ignore
-        }
-      }
       if (!ended) {
         ended = true;
         try {
@@ -1245,12 +1523,18 @@ export class RPCClient implements RPCClientImpl {
         await client.connect();
       }
       if (!client.nc) throw new Error('Not connected');
+      client.ensureMuxSubscription();
 
       client.pullIteratorSettles.add(settleOnDisconnect);
 
-      iteratorId = generateId(client.options.connId);
+      iteratorId = generateId(client.replyPrefix);
       requestSubject = `_rpc.iterator.${iteratorId}.request`;
       responseSubject = `_rpc.iterator.${iteratorId}.response`;
+      // 503 status inbox for `next` requests, served by the muxed reply
+      // inbox: iteratorId starts with replyPrefix, so this subject falls
+      // under the mux wildcard. Real iterator responses keep arriving on
+      // responseSubject — only no-responder statuses land here.
+      statusInbox = `rpc.reply.${iteratorId}`;
 
       const initResponse = await client.call<any>(subject, { __pullIterator: true, __iteratorId: iteratorId, args });
       if (initResponse?.iteratorId !== iteratorId) {
@@ -1273,36 +1557,23 @@ export class RPCClient implements RPCClientImpl {
         }
       });
 
-      const requestCallback = (err: Error | null, msg: Msg): void => {
-        let isError = false;
-        if (msg && msg.data?.length === 0 && msg.headers?.code === 503) {
-          const e = new errors.NoRespondersError(subject);
-          isError = true;
-          ended = true;
-          error = createError('503', e.message);
-        } else if (err) {
-          isError = true;
-          ended = true;
-          error = createError(ERROR_CODES.INTERNAL_ERROR, err.message);
+      client.statusHandlers.set(iteratorId, () => {
+        const e = new errors.NoRespondersError(subject);
+        ended = true;
+        error = createError('503', e.message);
+        const response: PullIteratorResponse<any> = {
+          type: 'error',
+          id: iteratorId,
+          error: error.toJSON(),
+        };
+        if (responseResolver) {
+          const r = responseResolver;
+          responseResolver = null;
+          r(response);
+        } else {
+          responseQueue.push(response);
         }
-        if (isError) {
-          const response: PullIteratorResponse<any> = {
-            type: 'error',
-            id: iteratorId,
-            error: error ? error.toJSON() : undefined,
-          };
-          if (responseResolver) {
-            const r = responseResolver;
-            responseResolver = null;
-            r(response);
-          } else {
-            responseQueue.push(response);
-          }
-        }
-      };
-
-      inbox = scopedInbox(client.options.connId);
-      sub = client.nc.subscribe(inbox, { max: 1, callback: requestCallback });
+      });
     };
 
     const iter: AsyncGenerator<TResponse, void, void> = {
@@ -1324,7 +1595,7 @@ export class RPCClient implements RPCClientImpl {
 
         const nextRequest: PullIteratorRequest = { id: iteratorId, type: 'next' };
         try {
-          await client.publish(requestSubject, nextRequest, { reply: inbox });
+          await client.publish(requestSubject, nextRequest, { reply: statusInbox });
         } catch (err) {
           await cleanupOnce();
           throw err;
@@ -1400,8 +1671,22 @@ export class RPCClient implements RPCClientImpl {
    * The returned async generator yields `undefined` for each batch boundary
    * the server produces. Meaningful data is dispatched through the provided
    * callback object.
+   *
+   * In place of the plain onewayMethods array, a PullCallbackCallOptions
+   * object can be passed (direct client API only — the proxy path always
+   * passes the array form). `prefetch: true` sends the next `next` request
+   * as soon as a batch boundary arrives, before the batch's callbacks are
+   * drained — hides one RTT per batch at the cost of strict backpressure.
    */
-  public callPullIteratorWithCallback(subject: string, callbacks: Record<string, (...a: any[]) => any>, onewayMethods: string[], ...args: any[]): AsyncGenerator<void> {
+  public callPullIteratorWithCallback(
+    subject: string,
+    callbacks: Record<string, (...a: any[]) => any>,
+    onewayMethods: string[] | PullCallbackCallOptions,
+    ...args: any[]
+  ): AsyncGenerator<void> {
+    const callOptions = Array.isArray(onewayMethods) ? undefined : onewayMethods;
+    const onewayMethodList = Array.isArray(onewayMethods) ? onewayMethods : onewayMethods.onewayMethods;
+    const prefetch = callOptions?.prefetch ?? false;
     // Manual iterator implementation (not `async function*`). Rationale:
     // an async generator parked at an `await` cannot be woken by
     // `iter.return()` — per spec, return() queues behind the pending
@@ -1427,14 +1712,17 @@ export class RPCClient implements RPCClientImpl {
     let requestSubject = '';
     let responseSubject = '';
     let callbackSubject = '';
-    let sub: Subscription | undefined;
-    let inbox = '';
+    let statusInbox = '';
     let callbackUnsub: (() => void) | undefined;
+    let callbackFlush: (() => Promise<void>) | undefined;
     let responseUnsub: (() => void) | undefined;
 
     const responseQueue: PullIteratorResponse[] = [];
     let responseResolver: ((value: PullIteratorResponse) => void) | null = null;
     let callbackChain: Promise<void> = Promise.resolve();
+    // True when the `next` request for the upcoming batch was already sent
+    // by the prefetch path — the following next() call must not send again.
+    let prefetched = false;
 
     const settlePendingAsDone = (): void => {
       const r = responseResolver;
@@ -1466,15 +1754,9 @@ export class RPCClient implements RPCClientImpl {
       if (cleanedUp) return;
       cleanedUp = true;
       client.pullIteratorSettles.delete(settleOnDisconnect);
+      client.statusHandlers.delete(iteratorId);
       callbackUnsub?.();
       responseUnsub?.();
-      if (sub && !sub.isClosed()) {
-        try {
-          sub.unsubscribe();
-        } catch {
-          // ignore
-        }
-      }
       if (!ended) {
         ended = true;
         try {
@@ -1491,16 +1773,19 @@ export class RPCClient implements RPCClientImpl {
         await client.connect();
       }
       if (!client.nc) throw new Error('Not connected');
+      client.ensureMuxSubscription();
 
       client.pullIteratorSettles.add(settleOnDisconnect);
 
-      iteratorId = generateId(client.options.connId);
+      iteratorId = generateId(client.replyPrefix);
       requestSubject = `_rpc.iterator.${iteratorId}.request`;
       responseSubject = `_rpc.iterator.${iteratorId}.response`;
       callbackSubject = `_rpc.cb.${iteratorId}`;
+      // 503 status inbox for `next` requests — see callPullIterator.
+      statusInbox = `rpc.reply.${iteratorId}`;
       const callbackMethods = Object.keys(callbacks).filter((k) => typeof callbacks[k] === 'function');
 
-      callbackUnsub = await client.subscribe(callbackSubject, (msg: CallbackInvocation) => {
+      const cbSubscription = await client.subscribeEntry(callbackSubject, (msg: CallbackInvocation) => {
         const fn = callbacks[msg.method];
         if (!fn) {
           console.error(`[rpc] Pull-callback: unknown method '${msg.method}'`);
@@ -1514,13 +1799,15 @@ export class RPCClient implements RPCClientImpl {
           }
         });
       });
+      callbackUnsub = cbSubscription.unsubscribe;
+      callbackFlush = () => cbSubscription.entry.flush?.() ?? Promise.resolve();
 
       const initParams: PullCallbackParams = {
         __pullCallback: true,
         __iteratorId: iteratorId,
         __callbackSubject: callbackSubject,
         __callbackMethods: callbackMethods,
-        __onewayMethods: onewayMethods,
+        __onewayMethods: onewayMethodList,
         args,
       };
 
@@ -1556,39 +1843,25 @@ export class RPCClient implements RPCClientImpl {
         }
       });
 
-      const requestCallback = (err: Error | null, msg: Msg): void => {
-        let isError = false;
+      client.statusHandlers.set(iteratorId, () => {
+        const e = new errors.NoRespondersError(subject);
+        ended = true;
+        error = createError('503', e.message);
 
-        if (msg && msg.data?.length === 0 && msg.headers?.code === 503) {
-          const e = new errors.NoRespondersError(subject);
-          isError = true;
-          ended = true;
-          error = createError('503', e.message);
-        } else if (err) {
-          isError = true;
-          ended = true;
-          error = createError(ERROR_CODES.INTERNAL_ERROR, err.message);
+        const response: PullIteratorResponse<any> = {
+          type: 'error',
+          id: iteratorId,
+          error: error.toJSON(),
+        };
+
+        if (responseResolver) {
+          const r = responseResolver;
+          responseResolver = null;
+          r(response);
+        } else {
+          responseQueue.push(response);
         }
-
-        if (isError) {
-          const response: PullIteratorResponse<any> = {
-            type: 'error',
-            id: iteratorId,
-            error: error ? error.toJSON() : undefined,
-          };
-
-          if (responseResolver) {
-            const r = responseResolver;
-            responseResolver = null;
-            r(response);
-          } else {
-            responseQueue.push(response);
-          }
-        }
-      };
-
-      inbox = scopedInbox(client.options.connId);
-      sub = client.nc.subscribe(inbox, { max: 1, callback: requestCallback });
+      });
     };
 
     const iter: AsyncGenerator<void, void, void> = {
@@ -1608,12 +1881,18 @@ export class RPCClient implements RPCClientImpl {
           }
         }
 
-        const nextRequest: PullIteratorRequest = { id: iteratorId, type: 'next' };
-        try {
-          await client.publish(requestSubject, nextRequest, { reply: inbox });
-        } catch (err) {
-          await cleanupOnce();
-          throw err;
+        if (prefetched) {
+          // The request for this batch was already sent by the prefetch
+          // path right after the previous boundary arrived.
+          prefetched = false;
+        } else {
+          const nextRequest: PullIteratorRequest = { id: iteratorId, type: 'next' };
+          try {
+            await client.publish(requestSubject, nextRequest, { reply: statusInbox });
+          } catch (err) {
+            await cleanupOnce();
+            throw err;
+          }
         }
 
         const response = await new Promise<PullIteratorResponse>((resolve, reject) => {
@@ -1642,12 +1921,42 @@ export class RPCClient implements RPCClientImpl {
           throw RPCException.fromJSON(response.error!);
         }
         if (response.type === 'done') {
+          // Drain callbacks received before the terminal response
+          // (mirrors Go's drainCallbacks() on "done").
+          await callbackFlush?.();
+          await callbackChain;
           await cleanupOnce();
           return { value: undefined, done: true };
+        }
+
+        // Opt-in n+1 prefetch: request the next batch BEFORE draining this
+        // batch's callbacks, so the server produces batch n+1 while the
+        // client processes batch n (hides one RTT per batch, Go behavior).
+        // On publish failure fall back silently — the next next() call
+        // re-sends the request and surfaces the error there.
+        if (prefetch && !ended && !returned) {
+          try {
+            const prefetchRequest: PullIteratorRequest = { id: iteratorId, type: 'next' };
+            await client.publish(requestSubject, prefetchRequest, { reply: statusInbox });
+            prefetched = true;
+          } catch {
+            prefetched = false;
+          }
         }
         // 'value' — wait for all callback handlers queued for the batch
         // to finish. A slow handler stalls here → stalls next()
         // request → server parks at its own yield. End-to-end backpressure.
+        //
+        // Flush the callback subscription's dispatch chain first: every
+        // callback message of this batch arrived before the boundary
+        // response (same connection, publish order), so it is already
+        // queued in the subscription chain — but may not have been
+        // appended to callbackChain yet, because each subscription
+        // serializes its handlers on its own chain. Without the flush the
+        // last callbacks of a batch can lose the microtask race against
+        // the boundary and leak past next() (mirrors Go's
+        // drainCallbacks() before yield).
+        await callbackFlush?.();
         await callbackChain;
         return { value: undefined, done: false };
       },
@@ -1693,7 +2002,7 @@ export class RPCClient implements RPCClientImpl {
       throw new Error('Not connected');
     }
 
-    const id = generateId(this.options.connId);
+    const id = generateId(this.replyPrefix);
     const callbackSubject = `rpc.cb.${id}`;
 
     // Subscribe to callback messages
@@ -1774,7 +2083,16 @@ export class RPCClient implements RPCClientImpl {
       const unsubscribe = await client.subscribe(
         subject,
         async (msg: RPCMessage) => {
-          const response: RPCResponse = { id: msg.id, __methods: methodNames };
+          const response: RPCResponse = { id: msg.id };
+
+          // Method discovery on demand: only a request whose envelope carries
+          // __discover (a proxy with an empty method cache) pays for the
+          // namespace's method list — attaching it to every response would be
+          // dead wire weight once the proxy cache is filled. Old clients
+          // never send __discover and never read __methods on this path.
+          if (msg.__discover === true) {
+            response.__methods = methodNames;
+          }
 
           try {
             // Handle stream request
@@ -1858,6 +2176,12 @@ export class RPCClient implements RPCClientImpl {
             }
           } catch (error) {
             response.error = formatErrorObject(error);
+
+            // Diagnostic aid: a METHOD_NOT_FOUND error always carries the
+            // method list, discovery requested or not (rare, small).
+            if (response.error.code === ERROR_CODES.METHOD_NOT_FOUND) {
+              response.__methods = methodNames;
+            }
 
             try {
               const replySubject = `rpc.reply.${msg.id}`;

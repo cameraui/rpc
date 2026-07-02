@@ -121,7 +121,10 @@ func handlePullCallbackRequestGo(
 	requestSubject := fmt.Sprintf("_rpc.iterator.%s.request", iteratorID)
 	responseSubject := fmt.Sprintf("_rpc.iterator.%s.response", iteratorID)
 
-	active := true
+	// atomic.Bool: written by finish()/cleanup() (NATS goroutine or an
+	// arbitrary caller goroutine), read by the request-subscription handler.
+	var active atomic.Bool
+	active.Store(true)
 
 	// subUnsub is assigned after Subscribe returns but read from the NATS
 	// callback goroutine — guard it against that race.
@@ -134,7 +137,7 @@ func handlePullCallbackRequestGo(
 	var finishOnce sync.Once
 	finish := func() {
 		finishOnce.Do(func() {
-			active = false
+			active.Store(false)
 			invoker.active.Store(false)
 			subUnsubMu.Lock()
 			u := subUnsub
@@ -149,7 +152,7 @@ func handlePullCallbackRequestGo(
 	}
 
 	unsub, err := client.Subscribe(requestSubject, func(data []byte) {
-		if !active || !client.IsConnected() {
+		if !active.Load() || !client.IsConnected() {
 			return
 		}
 
@@ -197,7 +200,7 @@ func handlePullCallbackRequestGo(
 
 	cleanup := func() {
 		finishOnce.Do(func() {
-			active = false
+			active.Store(false)
 			invoker.active.Store(false)
 			unsub()
 			// No onFinished here — the caller is already sweeping its map.

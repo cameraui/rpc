@@ -31,6 +31,12 @@ type ClientOptions struct {
 	// Name identifies this client.
 	Name string
 
+	// ConnID scopes the client's reply subjects: when set, it MUST be the
+	// first dot-separated segment of every generated id (a server-side
+	// firewall can then allowlist `rpc.reply.<connId>.>`). When empty, a
+	// random local prefix is generated instead. See Client.replyPrefix.
+	ConnID string
+
 	// Auth contains optional authentication credentials.
 	Auth *AuthOptions
 

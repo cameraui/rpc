@@ -104,6 +104,16 @@ async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitFor(condition: () => boolean, timeoutMs = 10000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) {
+      throw new Error('Timeout waiting for condition');
+    }
+    await sleep(1);
+  }
+}
+
 async function testAllFeatures(): Promise<void> {
   console.log('Comprehensive RPC Performance Test\n');
 
@@ -130,13 +140,14 @@ async function testAllFeatures(): Promise<void> {
   clientOp.end();
 
   console.log('\n1. Native Request/Reply');
-  const test1Op = timer.startOperation('Request Handler Setup & 100 calls');
-  test1Op.start();
-
+  // Setup (handler registration + subscription settle) outside the measurement
   const unsub1 = await server.onRequest('echo.*', async (data: any) => {
     return { echo: data.msg, timestamp: Date.now() };
   });
   await sleep(50); // Let subscription settle
+
+  const test1Op = timer.startOperation('Request Handler Setup & 100 calls');
+  test1Op.start();
 
   for (let i = 0; i < 100; i++) {
     const result = await client.request('echo.test', { msg: `Message ${i}` });
@@ -145,13 +156,10 @@ async function testAllFeatures(): Promise<void> {
     }
   }
 
-  unsub1();
   test1Op.end();
+  unsub1();
 
   console.log('\n2. Register Handlers (RPC style)');
-  const test2Op = timer.startOperation('RPC Handler Setup & 100 calls');
-  test2Op.start();
-
   const handlers = {
     echo: async (msg: string) => `Echo: ${msg}`,
     add: async (a: number, b: number) => a + b,
@@ -161,6 +169,9 @@ async function testAllFeatures(): Promise<void> {
   await sleep(50);
 
   const testProxy = client.createProxy<typeof handlers>('test');
+
+  const test2Op = timer.startOperation('RPC Handler Setup & 100 calls');
+  test2Op.start();
 
   for (let i = 0; i < 50; i++) {
     const echoResult = await testProxy.echo(`Message ${i}`);
@@ -174,13 +185,10 @@ async function testAllFeatures(): Promise<void> {
     }
   }
 
-  await unsub2();
   test2Op.end();
+  await unsub2();
 
   console.log('\n3. Large Data Transfer (Auto-Chunking)');
-  const test3Op = timer.startOperation('Large Data Transfer (10MB)');
-  test3Op.start();
-
   const largeHandlers = {
     getLarge: async () => largeData,
     echoData: async (data: Buffer) => data,
@@ -190,6 +198,9 @@ async function testAllFeatures(): Promise<void> {
   await sleep(50);
 
   const dataProxy = client.createProxy<typeof largeHandlers>('data');
+
+  const test3Op = timer.startOperation('Large Data Transfer (10MB)');
+  test3Op.start();
 
   const result = await dataProxy.getLarge();
   if (result.length !== largeData.length) {
@@ -202,13 +213,10 @@ async function testAllFeatures(): Promise<void> {
     throw new Error('Echo data mismatch');
   }
 
-  await unsub3();
   test3Op.end();
+  await unsub3();
 
   console.log('\n4. Channel Communication');
-  const test4Op = timer.startOperation('Channel Setup & 1000 messages');
-  test4Op.start();
-
   const serverChannel = await server.channel('perf-channel');
   const clientChannel = await client.channel('perf-channel');
 
@@ -219,23 +227,25 @@ async function testAllFeatures(): Promise<void> {
   });
   await sleep(50);
 
+  const test4Op = timer.startOperation('Channel Setup & 1000 messages');
+  test4Op.start();
+
   for (let i = 0; i < 1000; i++) {
     await clientChannel.send({ index: i, data: `Message ${i}` });
   }
 
-  await sleep(200);
+  // Wait for the receive counter instead of a fixed sleep
+  await waitFor(() => messagesReceived.length >= 1000);
+  test4Op.end();
+
   if (messagesReceived.length !== 1000) {
     throw new Error(`Expected 1000 messages, got ${messagesReceived.length}`);
   }
 
   await serverChannel.close();
   await clientChannel.close();
-  test4Op.end();
 
   console.log('\n5. Private Channel Communication');
-  const test5Op = timer.startOperation('Private Channel Setup & 100 calls');
-  test5Op.start();
-
   const serverPrivate = await server.privateChannel('perf-private', 'test-client');
 
   const unsub5 = await serverPrivate.onRequest(async (data: any) => {
@@ -245,6 +255,9 @@ async function testAllFeatures(): Promise<void> {
 
   const clientPrivate = await client.privateChannel('perf-private', 'test-server');
 
+  const test5Op = timer.startOperation('Private Channel Setup & 100 calls');
+  test5Op.start();
+
   for (let i = 0; i < 100; i++) {
     const result = await clientPrivate.request({ value: i }, 5000);
     if (result.processed !== i * 2) {
@@ -252,10 +265,10 @@ async function testAllFeatures(): Promise<void> {
     }
   }
 
+  test5Op.end();
   unsub5();
   await serverPrivate.close();
   await clientPrivate.close();
-  test5Op.end();
 
   console.log('\n6. Service Creation & Discovery');
   const test6Op = timer.startOperation('Service Setup');
@@ -270,6 +283,9 @@ async function testAllFeatures(): Promise<void> {
     new TestService(),
   );
 
+  test6Op.end();
+
+  // Verification (settle sleep + discovery) outside the measurement
   await sleep(100);
 
   const services = server.service.getAllInfo();
@@ -279,8 +295,6 @@ async function testAllFeatures(): Promise<void> {
   if (services[0].name !== 'perf-service') {
     throw new Error('Service name mismatch');
   }
-
-  test6Op.end();
 
   console.log('\n7. Service Proxy Calls');
   const test7Op = timer.startOperation('Service Proxy Creation & 50 calls');
@@ -315,9 +329,6 @@ async function testAllFeatures(): Promise<void> {
 
   // Services don't support chunking; use an RPC handler for large data
   console.log('\n8b. Large Data via RPC Handler');
-  const test8bOp = timer.startOperation('Get Large Data (10MB) via RPC');
-  test8bOp.start();
-
   const largeDataHandlers = {
     getLargeData: async () => largeData,
   };
@@ -326,22 +337,26 @@ async function testAllFeatures(): Promise<void> {
   await sleep(50);
 
   const largeProxy = client.createProxy<typeof largeDataHandlers>('largedata');
+
+  const test8bOp = timer.startOperation('Get Large Data (10MB) via RPC');
+  test8bOp.start();
+
   const largeResult = await largeProxy.getLargeData();
   if (largeResult.length !== largeData.length) {
     throw new Error('Large data RPC size mismatch');
   }
 
-  await unsub8b();
   test8bOp.end();
+  await unsub8b();
 
   console.log('\n9. Concurrent Operations');
-  const test9Op = timer.startOperation('Concurrent Requests (500 parallel)');
-  test9Op.start();
-
   const unsub9 = await server.onRequest('echo.concurrent', async (data: any) => {
     return { echo: data, handled: true };
   });
   await sleep(50);
+
+  const test9Op = timer.startOperation('Concurrent Requests (500 parallel)');
+  test9Op.start();
 
   const concurrentCall = async (i: number) => {
     return await client.request('echo.concurrent', { index: i });
@@ -378,9 +393,6 @@ async function testAllFeatures(): Promise<void> {
   test10Op.end();
 
   console.log('\n11. Isolated Connection Proxy');
-  const test11Op = timer.startOperation('Isolated Proxy Test');
-  test11Op.start();
-
   const handlersIsolated = {
     echo: async (msg: string) => `Echo: ${msg}`,
     add: async (a: number, b: number) => a + b,
@@ -388,6 +400,9 @@ async function testAllFeatures(): Promise<void> {
 
   const unsub11 = await server.registerHandler('test', handlersIsolated);
   await sleep(50);
+
+  const test11Op = timer.startOperation('Isolated Proxy Test');
+  test11Op.start();
 
   const isolatedProxyWithClose = client.createProxy<typeof handlersIsolated>('test', { isolatedConnection: true });
 
@@ -398,15 +413,15 @@ async function testAllFeatures(): Promise<void> {
     }
   }
 
+  test11Op.end();
   await isolatedProxyWithClose.close();
   await unsub11();
-  test11Op.end();
 
   console.log('\n12. Mixed Workload (Simulating Real Usage)');
+  const testChannel = await client.channel('mixed-channel');
+
   const test12Op = timer.startOperation('Mixed Operations');
   test12Op.start();
-
-  const testChannel = await client.channel('mixed-channel');
 
   const mixedOperation = async () => {
     const ops: Promise<any>[] = [];
@@ -431,8 +446,8 @@ async function testAllFeatures(): Promise<void> {
   }
 
   await Promise.all(rounds);
-  await testChannel.close();
   test12Op.end();
+  await testChannel.close();
 
   console.log('\nCleanup');
   const cleanupOp = timer.startOperation('Cleanup');

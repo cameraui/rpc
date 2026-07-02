@@ -14,16 +14,17 @@ from camera_ui_rpc.utils import (
     rpc_callbacks,
 )
 
-ID_PATTERN = re.compile(r"^\d+-\d{6}$")
+ID_PATTERN = re.compile(r"^\d+-[0-9a-z]{9}$")
 
 
 def test_generate_id_format() -> None:
     assert ID_PATTERN.match(generate_id())
 
 
-def test_generate_id_random_suffix_in_range() -> None:
-    suffix = int(generate_id().split("-")[1])
-    assert 100000 <= suffix <= 999999
+def test_generate_id_random_suffix_charset() -> None:
+    suffix = generate_id().split("-")[1]
+    assert len(suffix) == 9
+    assert all(c in "0123456789abcdefghijklmnopqrstuvwxyz" for c in suffix)
 
 
 def test_generate_id_uniqueness() -> None:

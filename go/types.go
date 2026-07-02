@@ -1,10 +1,17 @@
 package rpc
 
 // RPCMessage is the wire-format for an RPC request.
+//
+// Discover is the method-discovery request marker (internal metadata for
+// proxies): when true, the responder attaches the namespace's method list
+// (__methods) to the response. Client proxies set it only while their method
+// cache is empty. It lives on the envelope (not in params) so it never leaks
+// into handler arguments; old responders ignore it.
 type RPCMessage struct {
-	ID     string `msgpack:"id"`
-	Method string `msgpack:"method"`
-	Params any    `msgpack:"params"`
+	ID       string `msgpack:"id"`
+	Method   string `msgpack:"method"`
+	Params   any    `msgpack:"params"`
+	Discover bool   `msgpack:"__discover,omitempty"`
 }
 
 // RPCResponse is the wire-format for an RPC response.

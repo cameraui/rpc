@@ -4,8 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"github.com/nats-io/nats.go"
+	"sync/atomic"
 )
 
 // StreamValue is a single value received from a push-based stream.
@@ -65,27 +64,39 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 		return nil, fmt.Errorf("not connected")
 	}
 
-	id := GenerateID()
+	c.ensureMuxSubscription(true)
+
+	id := c.generateID()
 	streamSubject := fmt.Sprintf("stream.%s.%s", subject, id)
 
 	ch := make(chan StreamValue, 64)
-	ended := false
+
+	// statusDone releases the late-503 watcher goroutine below when the
+	// stream terminates through any other path (end/error/ctx cancel) —
+	// the previous per-call inbox achieved that via AutoUnsubscribe(1).
+	statusDone := make(chan struct{})
+	var statusOnce sync.Once
+	closeStatus := func() { statusOnce.Do(func() { close(statusDone) }) }
+
+	// ended is shared between the NATS subscription goroutine (push/end/error),
+	// the ctx-cancellation goroutine below, and Disconnect()/Suspend() (which
+	// call sh.end() via streamHandlers). CompareAndSwap makes close(ch)
+	// happen exactly once regardless of which side settles first.
+	var ended atomic.Bool
 
 	sh := &streamHandler{
 		push: func(v any) {
-			if !ended {
+			if !ended.Load() {
 				ch <- StreamValue{Data: v}
 			}
 		},
 		end: func() {
-			if !ended {
-				ended = true
+			if ended.CompareAndSwap(false, true) {
 				close(ch)
 			}
 		},
 		error: func(err error) {
-			if !ended {
-				ended = true
+			if ended.CompareAndSwap(false, true) {
 				ch <- StreamValue{Error: err}
 				close(ch)
 			}
@@ -115,6 +126,8 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 		case "end":
 			handler.end()
 			c.streamHandlers.Delete(msg.ID)
+			c.statusHandlers.Delete(msg.ID)
+			closeStatus()
 		case "error":
 			if msg.Error != nil {
 				handler.error(RPCExceptionFromError(msg.Error))
@@ -122,6 +135,8 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 				handler.error(NewRPCException(ErrCodeStreamError, "Unknown stream error"))
 			}
 			c.streamHandlers.Delete(msg.ID)
+			c.statusHandlers.Delete(msg.ID)
+			closeStatus()
 		}
 	})
 	if err != nil {
@@ -135,29 +150,28 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 		<-ctx.Done()
 		if _, ok := c.streamHandlers.LoadAndDelete(id); ok {
 			_ = c.Publish(streamSubject+".cancel", map[string]any{"id": id})
-			if !ended {
-				ended = true
+			if ended.CompareAndSwap(false, true) {
 				close(ch)
 			}
 		}
+		c.statusHandlers.Delete(id)
+		closeStatus()
 		unsub()
 	}()
 
-	// Send request — use a channel to detect 503 synchronously before returning
+	// No-responder detection via the muxed reply inbox: the request's reply
+	// subject `rpc.reply.<id>` only ever carries a 503 status — stream
+	// responders never publish a direct RPC response. One-shot: the mux
+	// removes the handler when it fires. The buffered channel lets us detect
+	// the common synchronous case (no responders at publish time) below and
+	// return an error the retry wrapper can act on.
 	noRespCh := make(chan error, 1)
-	inbox := nc.NewInbox()
-	noRespSub, err := nc.Subscribe(inbox, func(msg *nats.Msg) {
-		if len(msg.Data) == 0 && msg.Header != nil && msg.Header.Get("Status") == "503" {
-			noRespCh <- NewRPCException(ErrCodeNotFound, "No responders for "+subject)
+	c.statusHandlers.Store(id, func(error) {
+		select {
+		case noRespCh <- NewRPCException(ErrCodeNotFound, "No responders for "+subject):
+		default:
 		}
 	})
-	if err != nil {
-		c.streamHandlers.Delete(id)
-		unsub()
-		close(ch)
-		return nil, err
-	}
-	_ = noRespSub.AutoUnsubscribe(1)
 
 	streamParams := StreamParams{
 		Stream:        true,
@@ -170,10 +184,11 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 		Params: streamParams,
 	}
 
-	if err := c.publishInternal(subject, message, inbox); err != nil {
+	if err := c.publishInternal(subject, message, "rpc.reply."+id); err != nil {
 		c.streamHandlers.Delete(id)
+		c.statusHandlers.Delete(id)
+		closeStatus()
 		unsub()
-		_ = noRespSub.Unsubscribe()
 		close(ch)
 		return nil, err
 	}
@@ -185,20 +200,25 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 	select {
 	case noRespErr := <-noRespCh:
 		c.streamHandlers.Delete(id)
+		c.statusHandlers.Delete(id)
+		closeStatus()
 		unsub()
-		_ = noRespSub.Unsubscribe()
 		close(ch)
 		return nil, noRespErr
 	default:
 	}
 
-	// Wire up the 503 handler for late arrivals (edge case)
+	// Wire up the 503 handler for late arrivals (edge case: the status
+	// delivery raced the flush). statusDone reclaims the goroutine when the
+	// stream terminates normally.
 	go func() {
-		if noRespErr, ok := <-noRespCh; ok {
+		select {
+		case noRespErr := <-noRespCh:
 			if v, loaded := c.streamHandlers.LoadAndDelete(id); loaded {
 				handler := v.(*streamHandler)
 				handler.error(noRespErr)
 			}
+		case <-statusDone:
 		}
 	}()
 
@@ -215,9 +235,16 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 		}
 	}
 
-	iteratorID := GenerateID()
+	c.ensureMuxSubscription(true)
+
+	iteratorID := c.generateID()
 	requestSubject := fmt.Sprintf("_rpc.iterator.%s.request", iteratorID)
 	responseSubject := fmt.Sprintf("_rpc.iterator.%s.response", iteratorID)
+	// 503 status inbox for `next` requests, served by the muxed reply inbox:
+	// iteratorID starts with replyPrefix, so this subject falls under the mux
+	// wildcard. Real iterator responses keep arriving on responseSubject —
+	// only no-responder statuses land here.
+	statusInbox := "rpc.reply." + iteratorID
 
 	// Initialize the pull iterator
 	initParams := PullIteratorParams{
@@ -254,16 +281,17 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 		defer close(ch)
 		defer c.pullIteratorSettles.Delete(iteratorID)
 
-		// Subscribe to responses
+		// Subscribe to responses. ended is written by this goroutine and read
+		// by the NATS subscription goroutine — atomic.Bool avoids the race.
 		respCh := make(chan PullIteratorResponse, 8)
-		ended := false
+		var ended atomic.Bool
 
 		unsub, err := c.Subscribe(responseSubject, func(data []byte) {
 			var resp PullIteratorResponse
 			if err := Decode(data, &resp); err != nil {
 				return
 			}
-			if !ended {
+			if !ended.Load() {
 				respCh <- resp
 			}
 		})
@@ -272,6 +300,21 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 			return
 		}
 		defer unsub()
+
+		// No-responder detection for `next` requests via the muxed reply
+		// inbox (one-shot; replaces the previous lack of any detection /
+		// Node's per-iterator max:1 status inbox). The handler feeds an
+		// error response into the regular response path.
+		c.statusHandlers.Store(iteratorID, func(error) {
+			if !ended.Load() {
+				respCh <- PullIteratorResponse{
+					ID:    iteratorID,
+					Type:  "error",
+					Error: &RPCError{Code: "503", Message: "No responders for " + subject},
+				}
+			}
+		})
+		defer c.statusHandlers.Delete(iteratorID)
 
 		sendCancel := func() {
 			cancelReq := PullIteratorRequest{ID: iteratorID, Type: "cancel"}
@@ -282,7 +325,7 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 		// consumer without blocking; if nobody is waiting, the closed
 		// channel terminates the consumer's range loop instead.
 		sendDisconnected := func() {
-			ended = true
+			ended.Store(true)
 			select {
 			case ch <- PullValue{Error: NewRPCException(ErrCodeConnectionClosed, "Connection closed")}:
 			default:
@@ -298,21 +341,23 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 				return true
 			case <-ctx.Done():
 				sendCancel()
-				ended = true
+				ended.Store(true)
 				return false
 			case <-disconnected:
-				ended = true
+				ended.Store(true)
 				return false
 			}
 		}
 
 		for {
-			// Send next request
+			// Send next request. `reply` points at the status inbox so a
+			// vanished responder surfaces as a 503 on the mux instead of a
+			// silent hang.
 			nextReq := PullIteratorRequest{
 				ID:   iteratorID,
 				Type: "next",
 			}
-			if err := c.Publish(requestSubject, nextReq); err != nil {
+			if err := c.publishInternal(requestSubject, nextReq, statusInbox); err != nil {
 				sendToConsumer(PullValue{Error: err})
 				return
 			}
@@ -339,7 +384,7 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 				}
 			case <-ctx.Done():
 				sendCancel()
-				ended = true
+				ended.Store(true)
 				return
 			case <-disconnected:
 				sendDisconnected()

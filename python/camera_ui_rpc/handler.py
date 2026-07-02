@@ -138,19 +138,27 @@ async def handle_normal_rpc(
     handler: Callable[..., Any],
     params: Any,
     io_pool: ThreadPoolExecutor,
+    handler_is_async: bool | None = None,
 ) -> Any:
-    """Handle normal RPC call - common logic for client and service."""
+    """Handle normal RPC call - common logic for client and service.
+
+    ``handler_is_async`` lets callers on hot paths pass the async-ness
+    determined once at registration time instead of re-inspecting per call.
+    Sync handlers run inline on the event loop — the thread-pool hop costs
+    far more than the short callbacks used in this system, and inline
+    execution preserves per-subscription ordering.
+    """
     # Ensure params is a list
     if not isinstance(params, list):
         params = [params] if params is not None else []
 
+    if handler_is_async is None:
+        handler_is_async = is_async_function(handler)
+
     # Call the handler
-    if is_async_function(handler):
+    if handler_is_async:
         return await handler(*params)
-    else:
-        loop = asyncio.get_event_loop()
-        func = partial(handler, *params)
-        return await loop.run_in_executor(io_pool, func)
+    return handler(*params)
 
 
 def format_error_dict(e: Exception) -> RPCError:

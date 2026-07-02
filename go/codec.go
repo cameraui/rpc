@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -31,6 +32,53 @@ func (u *msgpackrUndefined) UnmarshalMsgpack(b []byte) error {
 // Compatible with msgpackr (useRecords=false, bundleStrings=false).
 func Encode(v any) ([]byte, error) {
 	return msgpack.Marshal(v)
+}
+
+// encodeBufPool recycles encode buffers for the hot publish path so that
+// per-publish encoding (e.g. NVR frame rates) does not allocate a fresh
+// []byte per call.
+//
+// INVARIANT (pool safety): a buffer handed out by encodePooled may be
+// returned to the pool ONLY once no in-flight publish still references its
+// bytes. nats.go copies the payload synchronously into the connection's
+// flush buffer *inside* Publish/PublishRequest/PublishMsg (a bufio-style
+// write happens before the call returns — the headers variant included) and
+// never retains the caller's slice afterwards. Releasing after the last
+// publish call has returned is therefore safe. The chunking path keeps
+// sub-slices of the encoded buffer alive until its last PublishMsg — release
+// only after that.
+var encodeBufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// maxPooledEncodeBuf caps the capacity of buffers returned to the pool so a
+// single oversized payload does not pin memory for the process lifetime.
+const maxPooledEncodeBuf = 4 << 20 // 4MB
+
+// encodePooled serializes data exactly like Encode but into a pooled buffer.
+// The returned release func must be called exactly once, and only when the
+// returned bytes are no longer referenced (see encodeBufPool invariant).
+func encodePooled(v any) (encoded []byte, release func(), err error) {
+	buf := encodeBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	// Encoder.Reset resets all encoder state (flags, structTag, dict), so a
+	// pooled encoder behaves identically to msgpack.Marshal.
+	enc := msgpack.GetEncoder()
+	enc.Reset(buf)
+	err = enc.Encode(v)
+	msgpack.PutEncoder(enc)
+
+	release = func() {
+		if buf.Cap() <= maxPooledEncodeBuf {
+			encodeBufPool.Put(buf)
+		}
+	}
+	if err != nil {
+		release()
+		return nil, nil, err
+	}
+	return buf.Bytes(), release, nil
 }
 
 func Decode(data []byte, v any) error {

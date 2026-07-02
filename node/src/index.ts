@@ -23,6 +23,7 @@ export type {
   CallbackMessage,
   CallbackParams,
   ErrorCode,
+  PullCallbackCallOptions,
   PullCallbackParams,
   RPCAuthOptions,
   RPCClient,

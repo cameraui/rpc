@@ -6,6 +6,15 @@ from typing import Any
 
 import ormsgpack
 
+# Precomputed option masks — avoids re-evaluating the flag OR on every call.
+# OPT_DATETIME_AS_TIMESTAMP_EXT: (De)serialize datetime as MessagePack timestamp extension
+# OPT_NON_STR_KEYS: Allow non-string dict keys
+# OPT_PASSTHROUGH_ENUM: Pass enums to default handler
+_PACK_OPTS: int = (
+    ormsgpack.OPT_NON_STR_KEYS | ormsgpack.OPT_DATETIME_AS_TIMESTAMP_EXT | ormsgpack.OPT_PASSTHROUGH_ENUM
+)
+_UNPACK_OPTS: int = ormsgpack.OPT_DATETIME_AS_TIMESTAMP_EXT | ormsgpack.OPT_NON_STR_KEYS
+
 
 def _default_handler(obj: Any) -> Any:
     """Default handler for custom types."""
@@ -33,16 +42,7 @@ def encode(data: Any) -> bytes:
         MessagePack encoded binary data
     """
     # Use ormsgpack with proper options for cross-language compatibility
-    # OPT_DATETIME_AS_TIMESTAMP_EXT: Encode datetime as MessagePack timestamp extension
-    # OPT_NON_STR_KEYS: Allow non-string dict keys
-    # OPT_PASSTHROUGH_ENUM: Pass enums to default handler
-    return ormsgpack.packb(
-        data,
-        default=_default_handler,
-        option=ormsgpack.OPT_NON_STR_KEYS
-        | ormsgpack.OPT_DATETIME_AS_TIMESTAMP_EXT
-        | ormsgpack.OPT_PASSTHROUGH_ENUM,
-    )
+    return ormsgpack.packb(data, default=_default_handler, option=_PACK_OPTS)
 
 
 def _ext_hook(_code: int, _data: bytes) -> Any:
@@ -62,12 +62,5 @@ def decode(data: bytes | bytearray | memoryview) -> Any:
     Returns:
         Decoded data
     """
-    # Use ormsgpack with proper options
-    # OPT_DATETIME_AS_TIMESTAMP_EXT: Deserialize timestamp extension objects to datetime
-    # OPT_NON_STR_KEYS: Allow non-string dict keys
     # ext_hook: Handle extension types from Node.js msgpackr
-    return ormsgpack.unpackb(
-        data,
-        option=ormsgpack.OPT_DATETIME_AS_TIMESTAMP_EXT | ormsgpack.OPT_NON_STR_KEYS,
-        ext_hook=_ext_hook,
-    )
+    return ormsgpack.unpackb(data, option=_UNPACK_OPTS, ext_hook=_ext_hook)
