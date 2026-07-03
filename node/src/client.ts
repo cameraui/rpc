@@ -1155,7 +1155,7 @@ export class RPCClient implements RPCClientImpl {
       const timeoutHandle = setTimeout(() => {
         if (this.pendingRequests.has(id)) {
           this.pendingRequests.delete(id);
-          void unsubscribeAll();
+          unsubscribeAll();
           reject(createError(ERROR_CODES.TIMEOUT, `RPC call to "${subject}" timed out after ${timeout}ms`));
         }
       }, timeout);
@@ -1165,7 +1165,7 @@ export class RPCClient implements RPCClientImpl {
         resolve,
         reject,
         timeout: timeoutHandle,
-        cleanup: () => void unsubscribeAll(),
+        cleanup: () => unsubscribeAll(),
       });
 
       // Subscribe to reply
@@ -1355,7 +1355,7 @@ export class RPCClient implements RPCClientImpl {
       client.statusHandlers.set(id, () => {
         const h = client.streamHandlers.get(id);
         h?.error(new errors.NoRespondersError(subject));
-        void cleanupOnce();
+        cleanupOnce();
       });
 
       const streamParams = { __stream: true, __streamSubject: streamSubject, args };
