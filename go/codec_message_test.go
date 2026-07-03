@@ -594,3 +594,68 @@ func BenchmarkDecodePlain100KB(b *testing.B) {
 		}
 	}
 }
+
+// Regression: sdk-style subscribers decode into concretely typed structs
+// (e.g. detectionEventMessage with a nested Thumbnail []byte). The direct
+// envelope decode chokes on the placeholder map in a typed []byte position;
+// DecodeMessageInto must fall back to the generic-restore-reencode path.
+func TestDecodeMessageIntoTypedByteFields(t *testing.T) {
+	type typedSegment struct {
+		Thumbnail []byte `msgpack:"thumbnail"`
+		StartTime int64  `msgpack:"startTime"`
+	}
+	type typedEvent struct {
+		ID       string         `msgpack:"id"`
+		Segments []typedSegment `msgpack:"segments"`
+	}
+	type typedMessage struct {
+		Type string     `msgpack:"type"`
+		Data typedEvent `msgpack:"data"`
+	}
+
+	thumb := bytes.Repeat([]byte{0xAB}, binaryExtractThreshold+123)
+	src := typedMessage{
+		Type: "update",
+		Data: typedEvent{
+			ID:       "evt-1",
+			Segments: []typedSegment{{Thumbnail: thumb, StartTime: 1783012908256}},
+		},
+	}
+
+	frame := mustEncodeMessage(t, src)
+	if !bytes.Equal(frame[:4], cuibMagic[:]) {
+		t.Fatalf("expected a CUIB frame (binary above threshold)")
+	}
+
+	var out typedMessage
+	if err := DecodeMessageInto(frame, &out); err != nil {
+		t.Fatalf("typed decode failed: %v", err)
+	}
+	if out.Type != "update" || out.Data.ID != "evt-1" || len(out.Data.Segments) != 1 {
+		t.Fatalf("typed decode mangled envelope: %+v", out)
+	}
+	if !bytes.Equal(out.Data.Segments[0].Thumbnail, thumb) {
+		t.Fatalf("typed decode lost the extracted binary: got %d bytes", len(out.Data.Segments[0].Thumbnail))
+	}
+	if out.Data.Segments[0].StartTime != 1783012908256 {
+		t.Fatalf("typed decode mangled sibling field: %d", out.Data.Segments[0].StartTime)
+	}
+}
+
+// Small binaries stay inline — the typed fast path must not regress.
+func TestDecodeMessageIntoTypedInlineBinary(t *testing.T) {
+	type typedMessage struct {
+		Type string `msgpack:"type"`
+		Blob []byte `msgpack:"blob"`
+	}
+	src := typedMessage{Type: "x", Blob: bytes.Repeat([]byte{7}, 128)}
+	frame := mustEncodeMessage(t, src)
+
+	var out typedMessage
+	if err := DecodeMessageInto(frame, &out); err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if !bytes.Equal(out.Blob, src.Blob) {
+		t.Fatalf("inline binary mangled")
+	}
+}

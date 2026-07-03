@@ -641,9 +641,13 @@ func DecodeMessage(data []byte) (any, error) {
 // then every placeholder in v's decoded `any` positions (maps, slices,
 // interface-typed struct fields) is replaced by a zero-copy view into data.
 //
-// Restored binaries land in positions that can hold a []byte — i.e. `any`
-// values. Decoding a frame into a target whose placeholder position is a
-// concretely typed field is not supported and returns an error.
+// Typed targets whose placeholder positions are concrete fields (e.g. a
+// struct with a `Thumbnail []byte` field) cannot take the direct path — the
+// envelope decode chokes on the placeholder map before restoration can run.
+// Those fall back to a generic decode + restore + re-encode with the
+// binaries inlined + typed decode. Costs one extra codec round-trip and a
+// copy of the binaries; only paid for typed targets on frames that actually
+// extracted segments.
 func DecodeMessageInto(data []byte, v any) error {
 	if len(data) < cuibHeaderSize ||
 		data[0] != cuibMagic[0] || data[1] != cuibMagic[1] ||
@@ -657,10 +661,23 @@ func DecodeMessageInto(data []byte, v any) error {
 		return fmt.Errorf("invalid CUIB frame: envelope length %d exceeds payload size %d", envLen, len(data))
 	}
 
-	if err := Decode(data[cuibHeaderSize:segmentBase], v); err != nil {
+	envelope := data[cuibHeaderSize:segmentBase]
+	if err := Decode(envelope, v); err == nil {
+		return restoreBinaries(v, data, segmentBase)
+	}
+
+	var generic any
+	if err := Decode(envelope, &generic); err != nil {
 		return err
 	}
-	return restoreBinaries(v, data, segmentBase)
+	if err := restoreBinaries(&generic, data, segmentBase); err != nil {
+		return err
+	}
+	inlined, err := Encode(generic)
+	if err != nil {
+		return err
+	}
+	return Decode(inlined, v)
 }
 
 // placeholderRef records one placeholder found in the decoded envelope: its
