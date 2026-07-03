@@ -478,13 +478,16 @@ func (c *Client) publishInternal(subject string, data any, reply string) error {
 	return nil
 }
 
-// Subscribe subscribes to a subject pattern. The handler receives decoded MessagePack data.
-// Returns an unsubscribe function.
+// Subscribe subscribes to a subject pattern. The handler receives raw wire
+// bytes (chunked transfers arrive reassembled) — decode them with
+// DecodeMessageInto, NOT Decode: publishers extract large binaries into CUIB
+// frames, which plain Decode cannot parse. Returns an unsubscribe function.
 func (c *Client) Subscribe(pattern string, handler func(data []byte), opts ...func(*nats.Subscription)) (func(), error) {
 	return c.subscribeEntry(&subscriptionEntry{pattern: pattern, handler: handler, opts: opts})
 }
 
-// SubscribeQueue subscribes to a subject with a queue group.
+// SubscribeQueue subscribes to a subject with a queue group. See Subscribe
+// for the handler's decode contract (DecodeMessageInto, not Decode).
 func (c *Client) SubscribeQueue(pattern, queue string, handler func(data []byte)) (func(), error) {
 	return c.subscribeEntry(&subscriptionEntry{pattern: pattern, queue: queue, handler: handler})
 }
@@ -830,7 +833,9 @@ func (c *Client) requestOnce(ctx context.Context, subject string, data any, time
 	return msg.Data, nil
 }
 
-// OnRequest registers a handler for native NATS request/reply on the given pattern.
+// OnRequest registers a handler for native NATS request/reply on the given
+// pattern. The handler receives raw wire bytes — decode them with
+// DecodeMessageInto, NOT Decode (see Subscribe).
 func (c *Client) OnRequest(pattern string, handler func(data []byte) (any, error)) (func(), error) {
 	c.mu.RLock()
 	nc := c.nc
