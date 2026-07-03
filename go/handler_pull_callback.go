@@ -157,7 +157,7 @@ func handlePullCallbackRequestGo(
 		}
 
 		var req PullIteratorRequest
-		if err := Decode(data, &req); err != nil {
+		if err := DecodeMessageInto(data, &req); err != nil {
 			return
 		}
 

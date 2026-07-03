@@ -71,7 +71,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 
 		msgHandler := func(data []byte) {
 			var msg RPCMessage
-			if err := Decode(data, &msg); err != nil {
+			if err := DecodeMessageInto(data, &msg); err != nil {
 				return
 			}
 

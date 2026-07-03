@@ -19,7 +19,7 @@ from nats.micro.service import (
     Service as NATSService,
 )
 
-from .codec import decode, encode
+from .codec import decode, decode_message, encode
 from .decorators import extract_nested_methods_with_decorators
 from .handler import (
     format_error_dict,
@@ -258,8 +258,9 @@ class RPCService:
                                 }
                             )
                         else:
-                            # Regular message - decode as RPC message
-                            decoded = decode(msg.data)
+                            # Regular message - decode wire message (zero-copy
+                            # binary views into msg.data)
+                            decoded = decode_message(msg.data)
                             await handle_rpc_message(decoded, msg)
                     except Exception as e:
                         # Send error response

@@ -1,4 +1,4 @@
-import { decode } from './codec.js';
+import { decodeMessage } from './codec.js';
 
 /**
  * Message types for chunked transfers
@@ -80,13 +80,16 @@ export class ChunkAssembler {
 
   /**
    * Get the reassembled data.
-   * Buffer is already complete, just decode - no copy needed.
+   * Buffer is already complete, just decode - no copy needed. Chunked
+   * payloads are always full wire messages, so this goes through
+   * decodeMessage: a reassembled CUIB frame yields zero-copy views into
+   * the assembly buffer.
    */
   public getData<T = any>(): T {
     if (!this.isComplete()) {
       throw new Error('Not all chunks received');
     }
-    return decode(this.buffer);
+    return decodeMessage(this.buffer);
   }
 
   /**

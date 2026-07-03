@@ -101,7 +101,7 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 		// processMessage handles a fully decoded RPC message for this endpoint.
 		processMessage := func(data []byte, subject string) {
 			var msg RPCMessage
-			if err := Decode(data, &msg); err != nil {
+			if err := DecodeMessageInto(data, &msg); err != nil {
 				return
 			}
 

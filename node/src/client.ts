@@ -2,7 +2,7 @@ import { connect, createInbox, errors, headers } from '@nats-io/transport-node';
 
 import { Channel, PrivateChannel } from './channel.js';
 import { ChunkingManager, createChunks } from './chunking.js';
-import { decode, encode } from './codec.js';
+import { decode, decodeMessage, encode, encodeMessage } from './codec.js';
 import { extractNestedMethodsWithDecorators, extractNestedMethodsWithoutDecorators } from './decorators.js';
 import { RPCException, createError } from './errors.js';
 import { formatErrorObject, handleCallbackRequest, handleNormalRPC, handlePullCallbackRequest, handlePullIteratorRequest, handleStreamRequest } from './handler.js';
@@ -566,7 +566,7 @@ export class RPCClient implements RPCClientImpl {
       throw new Error('Not connected');
     }
 
-    const encoded = encode(data);
+    const encoded = encodeMessage(data);
 
     // Small enough to send directly
     if (encoded.length <= this._maxPayloadSize) {
@@ -631,7 +631,7 @@ export class RPCClient implements RPCClientImpl {
       throw new Error('Not connected');
     }
 
-    const encoded = encode(data);
+    const encoded = encodeMessage(data);
     if (encoded.length > this._maxPayloadSize) {
       return false;
     }
@@ -773,8 +773,10 @@ export class RPCClient implements RPCClientImpl {
             isLast: false, // Determined by total chunks from header
           });
         } else {
-          // Regular message - decode MessagePack data
-          const data = decode(msg.data);
+          // Regular message - decode wire message (zero-copy views into
+          // msg.data for out-of-band binaries; nats.js allocates one buffer
+          // per message, so the views are safe).
+          const data = decodeMessage(msg.data);
           runHandler(data);
         }
       } catch (error) {
@@ -875,7 +877,7 @@ export class RPCClient implements RPCClientImpl {
       }
       this.chunkingManager.processChunk({ id: chunkId, chunkIndex, data: msg.data, isLast: false });
     } else {
-      this.routeMuxResponse(decode(msg.data));
+      this.routeMuxResponse(decodeMessage(msg.data));
     }
   }
 
@@ -940,7 +942,7 @@ export class RPCClient implements RPCClientImpl {
     }
 
     const timeout = options?.timeout ?? 5000;
-    const encoded = encode(data);
+    const encoded = encodeMessage(data);
 
     try {
       // Use native NATS request
@@ -959,7 +961,7 @@ export class RPCClient implements RPCClientImpl {
         // Try to decode error data
         if (msg.data) {
           try {
-            errorData = decode(msg.data);
+            errorData = decodeMessage(msg.data);
           } catch {
             // Ignore decoding errors
           }
@@ -968,7 +970,7 @@ export class RPCClient implements RPCClientImpl {
         throw createError(errorCode, errorMsg, errorData);
       }
 
-      const decoded = decode(msg.data);
+      const decoded = decodeMessage(msg.data);
 
       // Check if response contains an error field (for request handlers)
       if (decoded?.error) {
@@ -2255,20 +2257,20 @@ export class RPCClient implements RPCClientImpl {
         (async () => {
           try {
             // Decode request
-            const data = decode(msg.data);
+            const data = decodeMessage(msg.data);
 
             // Call handler with subject
             const result = await handler(data);
 
             // Send response
             if (msg.reply) {
-              const response = encode(result);
+              const response = encodeMessage(result);
               msg.respond(response);
             }
           } catch (error) {
             // Send error response
             if (msg.reply) {
-              const errorResponse = encode({
+              const errorResponse = encodeMessage({
                 error: error instanceof Error ? error.message : 'Internal error',
                 code: error instanceof RPCException ? error.code : ERROR_CODES.INTERNAL_ERROR,
               });

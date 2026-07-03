@@ -410,7 +410,7 @@ func (c *Client) publishInternal(subject string, data any, reply string) error {
 		return fmt.Errorf("not connected")
 	}
 
-	encoded, release, err := encodePooled(data)
+	encoded, release, err := encodeMessagePooled(data)
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
@@ -732,7 +732,7 @@ func (c *Client) handleMuxMessage(msg *nats.Msg) {
 // a timeout, or traffic of another client sharing the same ConnID prefix.
 func (c *Client) routeMuxResponse(data []byte) {
 	var resp RPCResponse
-	if err := Decode(data, &resp); err != nil {
+	if err := DecodeMessageInto(data, &resp); err != nil {
 		return
 	}
 	if resp.ID == "" {
@@ -798,10 +798,13 @@ func (c *Client) requestOnce(ctx context.Context, subject string, data any, time
 		t = timeout[0]
 	}
 
-	encoded, err := Encode(data)
+	// nc.Request copies the payload into the connection's flush buffer before
+	// returning, so releasing the pooled buffer afterwards is safe.
+	encoded, release, err := encodeMessagePooled(data)
 	if err != nil {
 		return nil, fmt.Errorf("encode: %w", err)
 	}
+	defer release()
 
 	msg, err := nc.Request(subject, encoded, t)
 	if err != nil {
@@ -858,7 +861,7 @@ func (c *Client) OnRequest(pattern string, handler func(data []byte) (any, error
 			_ = nc.Publish(msg.Reply, respData)
 			return
 		}
-		respData, encErr := Encode(result)
+		respData, encErr := EncodeMessage(result)
 		if encErr != nil {
 			return
 		}
@@ -998,7 +1001,7 @@ func (c *Client) callOnceService(ctx context.Context, nc *nats.Conn, subject str
 	// Subscribe to reply
 	unsub, err := c.Subscribe(replySubject, func(data []byte) {
 		var resp RPCResponse
-		if err := Decode(data, &resp); err != nil {
+		if err := DecodeMessageInto(data, &resp); err != nil {
 			return
 		}
 		if resp.ID != id {

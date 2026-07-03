@@ -107,7 +107,7 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 	// Subscribe to stream messages
 	unsub, err := c.Subscribe(streamSubject, func(data []byte) {
 		var msg StreamMessage
-		if err := Decode(data, &msg); err != nil {
+		if err := DecodeMessageInto(data, &msg); err != nil {
 			return
 		}
 		if msg.ID != id {
@@ -288,7 +288,7 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 
 		unsub, err := c.Subscribe(responseSubject, func(data []byte) {
 			var resp PullIteratorResponse
-			if err := Decode(data, &resp); err != nil {
+			if err := DecodeMessageInto(data, &resp); err != nil {
 				return
 			}
 			if !ended.Load() {

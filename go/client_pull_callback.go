@@ -142,7 +142,7 @@ func (c *Client) CallPullIteratorWithCallback(
 
 		respUnsub, err := c.Subscribe(responseSubject, func(data []byte) {
 			var resp PullIteratorResponse
-			if err := Decode(data, &resp); err != nil {
+			if err := DecodeMessageInto(data, &resp); err != nil {
 				return
 			}
 			if !ended.Load() {
@@ -188,7 +188,7 @@ func (c *Client) CallPullIteratorWithCallback(
 					return
 				}
 				var inv CallbackInvocation
-				if err := Decode(msg.Data, &inv); err != nil {
+				if err := DecodeMessageInto(msg.Data, &inv); err != nil {
 					continue
 				}
 				fn, ok := callbacks[inv.Method]

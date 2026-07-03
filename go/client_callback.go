@@ -21,7 +21,7 @@ func CallWithCallback[T any](client *Client, subject string, args []any, callbac
 	// Subscribe to callback messages
 	unsub, err := client.Subscribe(callbackSubject, func(data []byte) {
 		var msg CallbackMessage
-		if err := Decode(data, &msg); err != nil {
+		if err := DecodeMessageInto(data, &msg); err != nil {
 			return
 		}
 		if msg.Type == "data" {

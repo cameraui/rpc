@@ -20,7 +20,7 @@ from nats.js.api import Header
 
 from .channel import Channel, PrivateChannel
 from .chunking import ChunkingManager, create_chunks
-from .codec import decode, encode
+from .codec import decode, decode_message, encode, encode_message
 from .decorators import extract_nested_methods_with_decorators, extract_nested_methods_without_decorators
 from .errors import RPCException, create_error
 from .executor import get_executor
@@ -468,7 +468,7 @@ class RPCClient(RPCClientProtocol):
         if not self.nc:
             raise RuntimeError("Not connected")
 
-        encoded = encode(data)
+        encoded = encode_message(data)
 
         replyTo = reply if reply else ""
 
@@ -634,10 +634,13 @@ class RPCClient(RPCClientProtocol):
                         await self._handle_assembled_data(handler, assembled_queue.pop(0), handler_is_async)
 
                 else:
-                    # Regular message - decode MessagePack data. Sync handlers
-                    # run inline on the event loop — the thread-pool hop costs
+                    # Regular message - decode wire message (zero-copy
+                    # memoryview slices into msg.data for out-of-band
+                    # binaries; nats-py delivers one bytes object per
+                    # message, so the views are safe). Sync handlers run
+                    # inline on the event loop — the thread-pool hop costs
                     # far more than the short callbacks used in this system.
-                    data = decode(msg.data)
+                    data = decode_message(msg.data)
                     if handler_is_async:
                         await handler(data)  # type: ignore[misc]
                     else:
@@ -786,7 +789,7 @@ class RPCClient(RPCClientProtocol):
                 {"id": chunk_id, "chunkIndex": chunk_index, "data": data, "isLast": False}
             )
         else:
-            self._route_mux_response(decode(data))
+            self._route_mux_response(decode_message(data))
 
     def _route_mux_response(self, data: Any) -> None:
         """Settle the pending request a (possibly reassembled) response belongs to.
@@ -860,7 +863,7 @@ class RPCClient(RPCClientProtocol):
             raise RuntimeError("Not connected")
 
         timeout_sec = (timeout or 5000) / 1000  # Convert to seconds
-        encoded = encode(data)
+        encoded = encode_message(data)
 
         try:
             msg = await self.nc.request(subject, encoded, timeout=timeout_sec, headers=headers)
@@ -873,10 +876,10 @@ class RPCClient(RPCClientProtocol):
                 error_data = None
                 if msg.data:
                     with contextlib.suppress(Exception):
-                        error_data = decode(msg.data)
+                        error_data = decode_message(msg.data)
                 raise create_error(error_code, error_msg, error_data)
 
-            decoded = decode(msg.data)
+            decoded = decode_message(msg.data)
 
             # Check if response contains an error field (for request handlers)
             if isinstance(decoded, dict) and "error" in decoded:
@@ -1967,8 +1970,8 @@ class RPCClient(RPCClientProtocol):
 
         async def handle_request(msg: Msg) -> None:
             try:
-                # Decode request
-                data = decode(msg.data)
+                # Decode request (zero-copy binary views into msg.data)
+                data = decode_message(msg.data)
 
                 # Call handler with subject. Sync handlers run inline —
                 # cheaper than the thread-pool hop and preserves ordering.
@@ -1979,13 +1982,13 @@ class RPCClient(RPCClientProtocol):
 
                 # Send response
                 if msg.reply:
-                    response = encode(result)
+                    response = encode_message(result)
                     await msg.respond(response)
 
             except Exception as e:
                 # Send error response
                 if msg.reply:
-                    error_response = encode(
+                    error_response = encode_message(
                         {
                             "error": str(e),
                             "code": e.code if isinstance(e, RPCException) else ErrorCode.INTERNAL_ERROR.value,

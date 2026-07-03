@@ -4,7 +4,7 @@ import time
 from collections.abc import Callable, Generator
 from typing import Any
 
-from .codec import decode
+from .codec import decode_message
 from .types import ChunkData
 
 
@@ -153,10 +153,13 @@ class ChunkAssembler:
             raise RuntimeError("Cannot get data: Not all chunks have been received.")
 
         if self.buffer is not None:
-            # Optimal path: The buffer is already fully assembled.
-            # We create a memoryview to avoid copying the buffer before decoding.
+            # Optimal path: The buffer is already fully assembled. Chunked
+            # payloads are always full wire messages, so this goes through
+            # decode_message: a reassembled CUIB frame yields zero-copy
+            # memoryview slices into the assembly buffer (the views keep the
+            # bytearray alive after the assembler is pooled/reset).
             data_view = memoryview(self.buffer)
-            return decode(data_view)
+            return decode_message(data_view)
         else:
             # Fallback path: Manually combine chunks from temporary storage.
             # This path involves a final copy operation.
@@ -168,7 +171,7 @@ class ChunkAssembler:
                 chunk_len = len(chunk)
                 combined[offset : offset + chunk_len] = chunk
                 offset += chunk_len
-            return decode(combined)
+            return decode_message(combined)
 
     def get_progress(self) -> dict[str, int | float]:
         """Get the current progress of the chunk transfer."""

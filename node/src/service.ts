@@ -1,6 +1,6 @@
 import { Svcm } from '@nats-io/services';
 
-import { decode } from './codec.js';
+import { decode, decodeMessage } from './codec.js';
 import { extractNestedMethodsWithDecorators } from './decorators.js';
 import { formatErrorObject, handleNormalRPC, handlePullIteratorRequest, handleStreamRequest } from './handler.js';
 
@@ -150,8 +150,8 @@ export class RPCService {
               isLast: false, // Determined by total chunks from header
             });
           } else {
-            // Regular message - decode MessagePack data
-            const rpcMsg = decode(msg.data);
+            // Regular message - decode wire message (zero-copy binary views)
+            const rpcMsg = decodeMessage(msg.data);
             await processRPCMessage(rpcMsg, msg);
           }
         } catch (error) {

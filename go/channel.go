@@ -52,7 +52,7 @@ func (ch *Channel) IsClosed() bool {
 func (ch *Channel) Init() error {
 	unsub, err := ch.client.Subscribe(ch.subject, func(data []byte) {
 		var msg ChannelMessage
-		if err := Decode(data, &msg); err != nil {
+		if err := DecodeMessageInto(data, &msg); err != nil {
 			return
 		}
 
@@ -263,7 +263,7 @@ func (ch *PrivateChannel) IsClosed() bool {
 func (ch *PrivateChannel) Init() error {
 	unsub, err := ch.client.Subscribe(ch.subject, func(data []byte) {
 		var msg ChannelMessage
-		if err := Decode(data, &msg); err != nil {
+		if err := DecodeMessageInto(data, &msg); err != nil {
 			return
 		}
 
