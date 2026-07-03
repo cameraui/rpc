@@ -85,6 +85,13 @@ export interface RPCClientOptions {
   /** Default RPC call timeout in milliseconds */
   timeout?: number;
 
+  /**
+   * Per-dial-attempt connect timeout in milliseconds (NATS `timeout`).
+   * Bounds how long a single (re)connect attempt may hang before the dial
+   * loop retries. Distinct from `timeout`, which is the RPC call timeout.
+   */
+  connectTimeout?: number;
+
   /** Enable automatic reconnection */
   reconnect?: boolean;
 

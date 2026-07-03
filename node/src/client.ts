@@ -206,6 +206,7 @@ export class RPCClient implements RPCClientImpl {
       name: this.options.name,
       inboxPrefix: this.options.connId ? `_INBOX.${this.options.connId}` : undefined,
       reconnect: this.options.reconnect ?? true,
+      timeout: this.options.connectTimeout ?? 10_000,
       maxPingOut: this.options.maxPingOut ?? 2,
       maxReconnectAttempts: this.options.maxReconnectAttempts ?? -1,
       reconnectTimeWait: this.options.reconnectTimeWait ?? 2000,
