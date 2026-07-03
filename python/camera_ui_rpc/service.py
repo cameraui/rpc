@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 from collections.abc import Awaitable, Callable, Coroutine
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 from nats.aio.client import Client as NATSClient
@@ -172,7 +173,7 @@ class RPCService:
                                 iterator_id,
                                 service_client,
                                 service_client.io_pool,
-                                on_finished=lambda iid=iterator_id: pull_iterator_cleanups.pop(iid, None),
+                                on_finished=partial(pull_iterator_cleanups.pop, iterator_id, None),
                             )
 
                             # Store cleanup function for later

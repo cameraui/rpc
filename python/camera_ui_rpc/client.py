@@ -6,6 +6,7 @@ import ssl
 import traceback
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any, Generic, Literal, TypeVar, cast, overload
 
 from nats import (
@@ -1822,7 +1823,7 @@ class RPCClient(RPCClientProtocol):
                             iterator_id,
                             client,
                             client.io_pool,
-                            on_finished=lambda iid=iterator_id: client.pull_iterator_cleanups.pop(iid, None),
+                            on_finished=partial(client.pull_iterator_cleanups.pop, iterator_id, None),
                         )
 
                         # Store cleanup function for later
@@ -1848,9 +1849,7 @@ class RPCClient(RPCClientProtocol):
                             pc_oneway_methods,
                             client,
                             client.io_pool,
-                            on_finished=lambda iid=pc_iterator_id: client.pull_iterator_cleanups.pop(
-                                iid, None
-                            ),
+                            on_finished=partial(client.pull_iterator_cleanups.pop, pc_iterator_id, None),
                         )
 
                         client.pull_iterator_cleanups[pc_iterator_id] = pc_cleanup
@@ -1884,7 +1883,7 @@ class RPCClient(RPCClientProtocol):
                             message["id"],
                             client,
                             client.io_pool,
-                            on_finished=lambda cid=message["id"]: client.callback_cleanups.pop(cid, None),
+                            on_finished=partial(client.callback_cleanups.pop, message["id"], None),
                         )
                         client.callback_cleanups[message["id"]] = cb_cleanup
                         callback_ids.append(message["id"])
