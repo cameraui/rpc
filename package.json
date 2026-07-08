@@ -44,15 +44,15 @@
   "devDependencies": {
     "@camera.ui/nats": "^2.14.3",
     "@stylistic/eslint-plugin": "^5.10.0",
-    "@types/node": "^26.1.0",
-    "@typescript-eslint/parser": "^8.62.1",
+    "@types/node": "^26.1.1",
+    "@typescript-eslint/parser": "^8.63.0",
     "eslint": "9.39.2",
     "globals": "^17.7.0",
     "prettier": "^3.9.4",
     "rimraf": "^6.1.3",
     "tsx": "^4.23.0",
     "typescript": "5.9.3",
-    "typescript-eslint": "^8.62.1",
+    "typescript-eslint": "^8.63.0",
     "updates": "^17.18.2"
   }
 }
