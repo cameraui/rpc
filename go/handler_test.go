@@ -91,6 +91,35 @@ func TestExtractMethodsMap(t *testing.T) {
 	}
 }
 
+type allowlistHandler struct{}
+
+func (h *allowlistHandler) Exposed() string     { return "exposed" }
+func (h *allowlistHandler) AlsoExposed() string { return "also" }
+func (h *allowlistHandler) Hidden() string      { return "hidden" }
+func (h *allowlistHandler) RPCMethods() []string {
+	return []string{"exposed", "alsoExposed"}
+}
+
+func TestExtractMethodsAllowlist(t *testing.T) {
+	methods := ExtractMethods(&allowlistHandler{})
+
+	if _, ok := methods["exposed"]; !ok {
+		t.Error("allowlisted method 'exposed' missing")
+	}
+	if _, ok := methods["alsoExposed"]; !ok {
+		t.Error("allowlisted method 'alsoExposed' missing")
+	}
+	if _, ok := methods["hidden"]; ok {
+		t.Error("non-allowlisted method 'hidden' was exposed")
+	}
+	if _, ok := methods["rpcMethods"]; ok {
+		t.Error("the RPCMethods marker itself must not be exposed")
+	}
+	if len(methods) != 2 {
+		t.Errorf("expected exactly 2 exposed methods, got %d: %v", len(methods), methodNames(methods))
+	}
+}
+
 func TestCallHandler(t *testing.T) {
 	handler := &testHandler{DB: &testDBHandler{}}
 	methods := ExtractMethods(handler)

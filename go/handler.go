@@ -12,6 +12,17 @@ import (
 // CleanupFunc is returned by RegisterHandler to clean up subscriptions.
 type CleanupFunc func() error
 
+// RPCMethodAllowlist lets a struct handler restrict which of its exported
+// methods are reachable over RPC. When a handler implements it, only the
+// returned wire names (camelCase, e.g. "getValue") are registered; every other
+// exported method — including RPCMethods itself — stays callable in-process but
+// is not exposed on the wire. Handlers that do not implement it expose all
+// exported methods (the default). This mirrors the opt-in @RPCMethod decorator
+// used by the node/python runtimes.
+type RPCMethodAllowlist interface {
+	RPCMethods() []string
+}
+
 // RegisterHandler registers all exported methods of handler as RPC endpoints
 // under the given namespace. Methods are converted to camelCase wire names.
 //
@@ -305,6 +316,17 @@ func extractMethodsRecursive(handler any, prefix string, methods map[string]refl
 		return
 	}
 
+	// A handler may narrow its exposed surface via RPCMethodAllowlist; without
+	// it, every exported method is exposed (default).
+	var allowed map[string]bool
+	if provider, ok := handler.(RPCMethodAllowlist); ok {
+		names := provider.RPCMethods()
+		allowed = make(map[string]bool, len(names))
+		for _, n := range names {
+			allowed[n] = true
+		}
+	}
+
 	// Extract exported methods from the method set of the original (possibly pointer) type
 	methodType := reflect.ValueOf(handler).Type()
 	for i := 0; i < methodType.NumMethod(); i++ {
@@ -313,6 +335,9 @@ func extractMethodsRecursive(handler any, prefix string, methods map[string]refl
 			continue
 		}
 		wireName := toCamelCase(m.Name)
+		if allowed != nil && !allowed[wireName] {
+			continue
+		}
 		fullName := wireName
 		if prefix != "" {
 			fullName = prefix + "." + wireName
