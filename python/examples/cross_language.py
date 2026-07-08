@@ -73,6 +73,10 @@ async def run_python_server(targets: list[str]):
         print(f"[Python] Echoing data: {data}")
         return data
 
+    async def raise_error(message: str) -> Any:
+        print(f"[Python] Raising error: {message}")
+        raise RuntimeError(message)
+
     async def get_large_data() -> dict[str, Any]:
         print("[Python] Creating 20MB test data...")
         size = 20 * 1024 * 1024  # 20MB
@@ -130,6 +134,7 @@ async def run_python_server(targets: list[str]):
         "calculate": calculate,
         "getPythonInfo": get_python_info,
         "echoData": echo_data,
+        "raiseError": raise_error,
         "getLargeData": get_large_data,
         "verifyLargeData": verify_large_data,
         "onStatusUpdates": on_status_updates,
@@ -253,6 +258,20 @@ async def run_python_server(targets: list[str]):
 
             traceback.print_exc()
             failures += 1
+
+        # Error propagation: the peer handler raises; it must reach us as an
+        # exception carrying the same message, not a silent success.
+        err_token = f"boom python->{target}"
+        try:
+            await getattr(proxy, "raiseError")(err_token)
+            print(f"{target} raiseError did NOT propagate an error")
+            failures += 1
+        except Exception as e:
+            if err_token in str(e):
+                print(f"{target} error propagation: PASSED")
+            else:
+                print(f"{target} error propagation: wrong message: {e}")
+                failures += 1
 
         print()
 

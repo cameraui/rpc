@@ -82,6 +82,11 @@ async function runNodeServer() {
       return data;
     },
 
+    raiseError: async (message: string) => {
+      console.log(`Raising error: ${message}`);
+      throw new Error(message);
+    },
+
     getLargeData: async () => {
       console.log('Creating 20MB test data...');
       const size = 20 * 1024 * 1024; // 20MB
@@ -239,6 +244,23 @@ async function runNodeServer() {
     } catch (error) {
       console.error(`Error calling ${target}:`, error);
       failures++;
+    }
+
+    // Error propagation: the peer handler throws; it must reach us as a
+    // rejected call carrying the same message, not a silent success.
+    const errToken = `boom node->${target}`;
+    try {
+      await (proxy as any).raiseError(errToken);
+      console.error(`${target} raiseError did NOT propagate an error`);
+      failures++;
+    } catch (err: any) {
+      const message = err?.message ?? String(err);
+      if (message.includes(errToken)) {
+        console.log(`${target} error propagation: PASSED`);
+      } else {
+        console.error(`${target} error propagation: wrong message: ${message}`);
+        failures++;
+      }
     }
 
     console.log();

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -108,6 +109,11 @@ func main() {
 	handlers["echoData"] = func(data any) (any, error) {
 		fmt.Printf("Echoing data: %v\n", truncate(data))
 		return data, nil
+	}
+
+	handlers["raiseError"] = func(message string) (any, error) {
+		fmt.Printf("Raising error: %s\n", message)
+		return nil, errors.New(message)
 	}
 
 	handlers["getLargeData"] = func() (map[string]any, error) {
@@ -334,6 +340,19 @@ func main() {
 			}
 			cbUnsub()
 			fmt.Printf("Callback subscription test with %s: %d events received\n", target, cbCount)
+		}
+
+		// Error propagation: the peer handler returns/raises an error; it must
+		// reach us as an error carrying the same message, not a silent success.
+		errToken := fmt.Sprintf("boom go->%s", target)
+		if _, errPropErr := proxy.Invoke(ctx, "raiseError", errToken); errPropErr == nil {
+			fmt.Printf("%s raiseError did NOT propagate an error\n", target)
+			failures++
+		} else if strings.Contains(errPropErr.Error(), errToken) {
+			fmt.Printf("%s error propagation: PASSED\n", target)
+		} else {
+			fmt.Printf("%s error propagation: wrong message: %v\n", target, errPropErr)
+			failures++
 		}
 
 		fmt.Println()
