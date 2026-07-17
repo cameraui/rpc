@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ssl
 from collections.abc import AsyncIterator, Callable, Coroutine
-from enum import Enum
+from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -336,7 +336,7 @@ class PullIteratorResponse(TypedDict):
     """Error information (for 'error' type)"""
 
 
-class ErrorCode(str, Enum):
+class ErrorCode(StrEnum):
     """Standard error codes."""
 
     METHOD_NOT_FOUND = "METHOD_NOT_FOUND"

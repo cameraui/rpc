@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import asyncio
-import time
 from collections.abc import AsyncGenerator
 from typing import Any
 

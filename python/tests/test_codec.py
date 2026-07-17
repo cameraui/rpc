@@ -1,8 +1,8 @@
 """Tests for the MessagePack codec round-trips."""
 
 import struct
-from datetime import date, datetime, time, timezone
-from enum import Enum
+from datetime import UTC, date, datetime, time
+from enum import Enum, StrEnum
 from typing import Any
 
 import pytest
@@ -128,7 +128,7 @@ def test_decode_accepts_memoryview() -> None:
 
 
 def test_enum_encoded_as_value() -> None:
-    class Color(str, Enum):
+    class Color(StrEnum):
         RED = "red"
 
     assert roundtrip(Color.RED) == "red"
@@ -142,7 +142,7 @@ def test_int_enum_encoded_as_value() -> None:
 
 
 def test_datetime_roundtrip() -> None:
-    value = datetime(2026, 6, 15, 12, 30, 45, tzinfo=timezone.utc)
+    value = datetime(2026, 6, 15, 12, 30, 45, tzinfo=UTC)
     result = decode(encode(value))
     assert isinstance(result, datetime)
     assert result == value

@@ -17,7 +17,7 @@
     "install-updates": "npm i --save && npm run install-updates --if-present --prefix node && cd go && go mod tidy && cd ..",
     "lint:node": "npm --prefix node run format && npm --prefix node run lint",
     "lint:go": "cd go && staticcheck ./... && golangci-lint run ./... && cd ..",
-    "lint:python": "cd python && mypy --config-file ./mypy.ini camera_ui_rpc && cd ..",
+    "lint:python": "cd python && ruff check --fix && mypy --config-file ./mypy.ini camera_ui_rpc && cd ..",
     "lint": "npm run lint:node && npm run lint:go && npm run lint:python",
     "test:unit:node": "npm --prefix node test",
     "test:unit:go": "cd go && go test ./...",

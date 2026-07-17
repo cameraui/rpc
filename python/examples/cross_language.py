@@ -263,7 +263,7 @@ async def run_python_server(targets: list[str]):
         # exception carrying the same message, not a silent success.
         err_token = f"boom python->{target}"
         try:
-            await getattr(proxy, "raiseError")(err_token)
+            await proxy.raiseError(err_token)
             print(f"{target} raiseError did NOT propagate an error")
             failures += 1
         except Exception as e:
