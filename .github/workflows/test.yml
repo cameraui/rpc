@@ -103,7 +103,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: swift/.build
           key: swift-${{ runner.os }}-${{ hashFiles('swift/Package.resolved') }}
@@ -131,7 +131,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: swift/.build
           key: swift-release-${{ runner.os }}-${{ hashFiles('swift/Package.resolved') }}
