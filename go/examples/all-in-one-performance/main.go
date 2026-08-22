@@ -302,9 +302,9 @@ func testAllFeatures() error {
 		return fmt.Errorf("client channel: %w", err)
 	}
 
-	var messagesReceived int64
+	var messagesReceived atomic.Int64
 	serverChannel.OnMessage(func(data any) {
-		atomic.AddInt64(&messagesReceived, 1)
+		messagesReceived.Add(1)
 	})
 	sleep(50)
 
@@ -317,12 +317,12 @@ func testAllFeatures() error {
 	}
 
 	// Wait for the receive counter instead of a fixed sleep
-	if err := waitFor(func() bool { return atomic.LoadInt64(&messagesReceived) >= 1000 }, 10*time.Second); err != nil {
-		return fmt.Errorf("channel messages: %w (got %d)", err, atomic.LoadInt64(&messagesReceived))
+	if err := waitFor(func() bool { return messagesReceived.Load() >= 1000 }, 10*time.Second); err != nil {
+		return fmt.Errorf("channel messages: %w (got %d)", err, messagesReceived.Load())
 	}
 	end()
 
-	count := atomic.LoadInt64(&messagesReceived)
+	count := messagesReceived.Load()
 	if count != 1000 {
 		return fmt.Errorf("expected 1000 messages, got %d", count)
 	}

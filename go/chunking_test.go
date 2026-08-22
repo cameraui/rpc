@@ -2,6 +2,7 @@ package rpc
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 )
 
@@ -66,8 +67,8 @@ func TestChunkAssemblerOutOfOrder(t *testing.T) {
 	assembler := NewChunkAssembler("ooo-id", len(original), len(chunks), chunkSize)
 
 	// Add in reverse order
-	for i := len(chunks) - 1; i >= 0; i-- {
-		_, err := assembler.AddChunk(chunks[i])
+	for _, chunk := range slices.Backward(chunks) {
+		_, err := assembler.AddChunk(chunk)
 		if err != nil {
 			t.Fatal(err)
 		}

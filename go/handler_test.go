@@ -295,8 +295,8 @@ func TestCallbackHandlerParamDetection(t *testing.T) {
 	// Verify the function has a func parameter
 	fnType := fn.Type()
 	hasFuncParam := false
-	for i := 0; i < fnType.NumIn(); i++ {
-		if fnType.In(i).Kind() == reflect.Func {
+	for in := range fnType.Ins() {
+		if in.Kind() == reflect.Func {
 			hasFuncParam = true
 			break
 		}

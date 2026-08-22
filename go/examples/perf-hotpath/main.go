@@ -67,13 +67,13 @@ func waitFor(cond func() bool, timeout time.Duration) error {
 // runOneway runs one pull-callback iteration; returns (elapsedMs, bytesReceived).
 func runOneway(ctx context.Context, proxy *rpc.Proxy, frameSize, batches, framesPerBatch int) (float64, int64, error) {
 	expected := int64(batches * framesPerBatch)
-	var frames int64
-	var totalBytes int64
+	var frames atomic.Int64
+	var totalBytes atomic.Int64
 
 	callbacks := rpc.PullCallbackMap{
 		"onFrame": func(frame []byte) {
-			atomic.AddInt64(&frames, 1)
-			atomic.AddInt64(&totalBytes, int64(len(frame)))
+			frames.Add(1)
+			totalBytes.Add(int64(len(frame)))
 		},
 	}
 
@@ -89,19 +89,19 @@ func runOneway(ctx context.Context, proxy *rpc.Proxy, frameSize, batches, frames
 			return 0, 0, fmt.Errorf("iterator error: %w", v.Error)
 		}
 	}
-	if err := waitFor(func() bool { return atomic.LoadInt64(&frames) >= expected }, 30*time.Second); err != nil {
-		return 0, 0, fmt.Errorf("oneway frames: %w (got %d of %d)", err, atomic.LoadInt64(&frames), expected)
+	if err := waitFor(func() bool { return frames.Load() >= expected }, 30*time.Second); err != nil {
+		return 0, 0, fmt.Errorf("oneway frames: %w (got %d of %d)", err, frames.Load(), expected)
 	}
 	elapsedMs := float64(time.Since(start).Microseconds()) / 1000
 
-	if got := atomic.LoadInt64(&frames); got != expected {
+	if got := frames.Load(); got != expected {
 		return 0, 0, fmt.Errorf("oneway frame count mismatch: got %d, expected %d", got, expected)
 	}
-	if got := atomic.LoadInt64(&totalBytes); got != expected*int64(frameSize) {
+	if got := totalBytes.Load(); got != expected*int64(frameSize) {
 		return 0, 0, fmt.Errorf("oneway byte count mismatch: got %d, expected %d", got, expected*int64(frameSize))
 	}
 
-	return elapsedMs, atomic.LoadInt64(&totalBytes), nil
+	return elapsedMs, totalBytes.Load(), nil
 }
 
 func run() error {
@@ -248,9 +248,9 @@ func run() error {
 		return fmt.Errorf("client channel: %w", err)
 	}
 
-	var channelReceived int64
+	var channelReceived atomic.Int64
 	serverChannel.OnMessage(func(data any) {
-		atomic.AddInt64(&channelReceived, 1)
+		channelReceived.Add(1)
 	})
 	time.Sleep(50 * time.Millisecond) // Let subscription settle
 
@@ -260,19 +260,19 @@ func run() error {
 			return fmt.Errorf("channel warmup send %d: %w", i, err)
 		}
 	}
-	if err := waitFor(func() bool { return atomic.LoadInt64(&channelReceived) >= 10 }, 30*time.Second); err != nil {
+	if err := waitFor(func() bool { return channelReceived.Load() >= 10 }, 30*time.Second); err != nil {
 		return fmt.Errorf("channel warmup: %w", err)
 	}
 
-	channelTarget := atomic.LoadInt64(&channelReceived) + channelMessages
+	channelTarget := channelReceived.Load() + channelMessages
 	channelStart := time.Now()
 	for i := range channelMessages {
 		if err := clientChannel.Send(map[string]any{"index": i}); err != nil {
 			return fmt.Errorf("channel send %d: %w", i, err)
 		}
 	}
-	if err := waitFor(func() bool { return atomic.LoadInt64(&channelReceived) >= channelTarget }, 30*time.Second); err != nil {
-		return fmt.Errorf("channel messages: %w (got %d of %d)", err, atomic.LoadInt64(&channelReceived), channelTarget)
+	if err := waitFor(func() bool { return channelReceived.Load() >= channelTarget }, 30*time.Second); err != nil {
+		return fmt.Errorf("channel messages: %w (got %d of %d)", err, channelReceived.Load(), channelTarget)
 	}
 	channelMs := float64(time.Since(channelStart).Microseconds()) / 1000
 	usPerMsg := channelMs * 1000 / float64(channelMessages)
