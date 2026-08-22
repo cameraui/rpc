@@ -176,3 +176,35 @@ func TestEncodeDecodeChannelMessage(t *testing.T) {
 		t.Errorf("Sender = %v, want client-1", decoded.Sender)
 	}
 }
+
+func TestDecodeFallbackIntoPartiallyFilledStruct(t *testing.T) {
+	type entry struct {
+		Value     any   `msgpack:"value"`
+		Timestamp int64 `msgpack:"timestamp"`
+	}
+
+	// the float timestamp forces the coercion fallback, and the first attempt
+	// has already put a bool behind the any field by then
+	encoded, err := Encode([]any{
+		map[string]any{"value": true, "timestamp": float64(1755800000000)},
+		map[string]any{"value": false, "timestamp": float64(1755800001000)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var entries []entry
+	if err := Decode(encoded, &entries); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("len = %d, want 2", len(entries))
+	}
+	if entries[0].Value != true || entries[1].Value != false {
+		t.Errorf("values = %v, %v, want true, false", entries[0].Value, entries[1].Value)
+	}
+	if entries[0].Timestamp != 1755800000000 {
+		t.Errorf("Timestamp = %d, want 1755800000000", entries[0].Timestamp)
+	}
+}

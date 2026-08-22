@@ -3,6 +3,7 @@ package rpc
 import (
 	"bytes"
 	"math"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -111,7 +112,24 @@ func Decode(data []byte, v any) error {
 	if rerr != nil {
 		return err // return original error
 	}
+
+	// the failed attempt above left whatever it managed to decode behind, and
+	// msgpack decodes into a non-nil `any` field through the value it already
+	// holds, which is unaddressable and panics
+	resetValue(v)
+
 	return msgpack.Unmarshal(reencoded, v)
+}
+
+func resetValue(v any) {
+	pointer := reflect.ValueOf(v)
+	if pointer.Kind() != reflect.Pointer || pointer.IsNil() {
+		return
+	}
+	target := pointer.Elem()
+	if target.CanSet() {
+		target.SetZero()
+	}
 }
 
 func isTypeMismatch(err error) bool {
