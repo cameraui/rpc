@@ -34,7 +34,7 @@
     "@nats-io/nats-core": "^3.4.0",
     "@nats-io/services": "^3.4.0",
     "@nats-io/transport-node": "^3.4.0",
-    "msgpackr": "^2.0.6",
+    "msgpackr": "^2.1.0",
     "reflect-metadata": "^0.2.2"
   },
   "devDependencies": {
