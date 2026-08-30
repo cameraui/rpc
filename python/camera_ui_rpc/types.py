@@ -222,8 +222,8 @@ class RPCClientOptions(TypedDict):
     connect_timeout: NotRequired[int]
     """Timeout for a single connection attempt in milliseconds"""
 
-    tls: NotRequired[dict[str, str]]
-    """TLS configuration with 'cert', 'key', and 'ca' keys"""
+    tls: NotRequired[dict[str, str] | ssl.SSLContext]
+    """TLS configuration with 'cert', 'key', and 'ca' keys, or a ready SSLContext"""
 
     max_payload_size: NotRequired[int]
     """Maximum payload size in bytes (default: auto-detect from NATS server)"""

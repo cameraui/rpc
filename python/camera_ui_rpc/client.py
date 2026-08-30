@@ -215,12 +215,15 @@ class RPCClient(RPCClientProtocol):
 
         # Add TLS if provided
         if tls := self.options.get("tls"):
-            context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-            if tls.get("ca"):
-                context.load_verify_locations(tls["ca"])
-            if tls.get("cert") and tls.get("key"):
-                context.load_cert_chain(tls["cert"], tls["key"])
-            connect_opts["tls"] = context
+            if isinstance(tls, ssl.SSLContext):
+                connect_opts["tls"] = tls
+            else:
+                context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+                if tls.get("ca"):
+                    context.load_verify_locations(tls["ca"])
+                if tls.get("cert") and tls.get("key"):
+                    context.load_cert_chain(tls["cert"], tls["key"])
+                connect_opts["tls"] = context
 
         self.nc = await connect(**connect_opts)
 
