@@ -29,7 +29,7 @@
     "test:integration": "npm run test:codec && npm run test:pull-callback && npm run test:rpc",
     "test": "npm run test:unit && npm run test:integration",
     "release": "bash scripts/release.sh",
-    "update": "updates --update ./ && updates --file go,node,python --update ./"
+    "update": "updates -M npm,pypi,go,cargo,docker,make --update ./ && updates --file go,node,python --update ./"
   },
   "homepage": "https://github.com/cameraui/rpc#readme",
   "bugs": {
@@ -53,6 +53,6 @@
     "tsx": "^4.23.13",
     "typescript": "5.9.3",
     "typescript-eslint": "^8.69.0",
-    "updates": "^18.0.7"
+    "updates": "^18.1.0"
   }
 }
