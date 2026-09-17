@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "typing_extensions>=4.16.0",
-    "nats-py>=2.15.0",
+    "nats-py>=2.16.0",
     "ormsgpack>=1.12.2"
 ]
 
