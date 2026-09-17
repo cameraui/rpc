@@ -64,3 +64,25 @@ func TestOnReconnectIsolatesPanics(t *testing.T) {
 	c.notifyReconnect()
 	<-ok
 }
+
+func TestReconnectIsOnByDefault(t *testing.T) {
+	disabled := false
+	enabled := true
+
+	cases := []struct {
+		name string
+		opts ClientOptions
+		want int
+	}{
+		{"unset", ClientOptions{}, -1},
+		{"enabled", ClientOptions{Reconnect: &enabled}, -1},
+		{"enabled with limit", ClientOptions{Reconnect: &enabled, MaxReconnectAttempts: 5}, 5},
+		{"disabled", ClientOptions{Reconnect: &disabled}, 0},
+	}
+
+	for _, tc := range cases {
+		if got := NewClient(tc.opts).maxReconnects(); got != tc.want {
+			t.Errorf("%s: max reconnects = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}

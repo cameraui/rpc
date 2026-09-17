@@ -187,12 +187,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		nats.Timeout(c.Options.ConnectTimeout),
 		nats.ReconnectWait(c.Options.ReconnectWait),
 		nats.ReconnectHandler(func(*nats.Conn) { c.notifyReconnect() }),
-	}
-
-	if c.Options.Reconnect {
-		natsOpts = append(natsOpts, nats.MaxReconnects(c.Options.MaxReconnectAttempts))
-	} else {
-		natsOpts = append(natsOpts, nats.MaxReconnects(0))
+		nats.MaxReconnects(c.maxReconnects()),
 	}
 
 	if c.Options.Auth != nil {
@@ -880,6 +875,13 @@ func (c *Client) notifyReconnect() {
 			fn()
 		}()
 	}
+}
+
+func (c *Client) maxReconnects() int {
+	if c.Options.Reconnect != nil && !*c.Options.Reconnect {
+		return 0
+	}
+	return c.Options.MaxReconnectAttempts
 }
 
 // OnRequest registers a handler for native NATS request/reply on the given

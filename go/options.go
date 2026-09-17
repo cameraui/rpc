@@ -43,8 +43,9 @@ type ClientOptions struct {
 	// Timeout is the default RPC call timeout (default: 30s).
 	Timeout time.Duration
 
-	// Reconnect enables automatic reconnection (default: true).
-	Reconnect bool
+	// Reconnect enables automatic reconnection. When nil or true, the client
+	// reconnects after the connection drops. Default: true.
+	Reconnect *bool
 
 	// MaxReconnectAttempts is the maximum number of reconnection attempts (-1 for infinite, default: -1).
 	MaxReconnectAttempts int
