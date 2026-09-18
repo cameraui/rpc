@@ -803,6 +803,8 @@ func (c *Client) requestOnce(ctx context.Context, subject string, data any, time
 	t := 5 * time.Second
 	if len(timeout) > 0 {
 		t = timeout[0]
+	} else if deadline, ok := ctx.Deadline(); ok {
+		t = time.Until(deadline)
 	}
 
 	// nc.Request copies the payload into the connection's flush buffer before
@@ -951,29 +953,43 @@ func (c *Client) Call(ctx context.Context, subject string, args ...any) (any, er
 	var result any
 	err := c.withNoResponderRetry(ctx, nil, func() error {
 		var callErr error
-		result, callErr = c.callOnce(ctx, subject, args...)
+		result, callErr = c.callOnce(ctx, subject, 0, args...)
 		return callErr
 	})
 	return result, err
 }
 
-// CallWithOptions is the same as Call but with per-call overrides for
-// no-responder retry. Pass nil to use client-wide defaults. (Timeout on
-// RequestOptions is currently honored only by RequestWithOptions; Call uses
-// the client-wide timeout.)
+// CallWithOptions is the same as Call but with per-call overrides for timeout
+// and no-responder retry. Pass nil to use client-wide defaults.
 func (c *Client) CallWithOptions(ctx context.Context, subject string, opts *RequestOptions, args ...any) (any, error) {
 	var override *NoResponderRetryOptions
+	var timeout time.Duration
 	if opts != nil {
 		override = opts.NoResponderRetry
+		timeout = opts.Timeout
 	}
 
 	var result any
 	err := c.withNoResponderRetry(ctx, override, func() error {
 		var callErr error
-		result, callErr = c.callOnce(ctx, subject, args...)
+		result, callErr = c.callOnce(ctx, subject, timeout, args...)
 		return callErr
 	})
 	return result, err
+}
+
+// callDeadline resolves how long a call may take: an explicit per-call
+// timeout, else what is left of the caller's deadline, else the client
+// default. A caller that grants more time than the default (a plugin waiting
+// for a slow model) must not be cut short by the transport.
+func (c *Client) callDeadline(ctx context.Context, timeout time.Duration) time.Duration {
+	if timeout > 0 {
+		return timeout
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		return time.Until(deadline)
+	}
+	return c.Options.Timeout
 }
 
 // callOnce performs a single RPC call attempt via the muxed reply inbox: the
@@ -981,7 +997,7 @@ func (c *Client) CallWithOptions(ctx context.Context, subject string, opts *Requ
 // wildcard subscription — no per-call subscriptions. Responses (plain or
 // chunked) and no-responder statuses all arrive on the mux, which settles the
 // pendingRequests entry; cleanup only has to drop the map entry.
-func (c *Client) callOnce(ctx context.Context, subject string, args ...any) (any, error) {
+func (c *Client) callOnce(ctx context.Context, subject string, timeout time.Duration, args ...any) (any, error) {
 	if !c.IsConnected() && !c.IsClosed() {
 		if err := c.Connect(ctx); err != nil {
 			return nil, err
@@ -998,7 +1014,7 @@ func (c *Client) callOnce(ctx context.Context, subject string, args ...any) (any
 	// Service calls (`<subject>.reply.<id>`) keep the legacy per-call
 	// subscription flow — separate refactor later.
 	if !strings.HasPrefix(subject, "rpc.") {
-		return c.callOnceService(ctx, nc, subject, args...)
+		return c.callOnceService(ctx, nc, subject, timeout, args...)
 	}
 
 	// Normally established by Connect(); covers clients whose connection was
@@ -1006,7 +1022,7 @@ func (c *Client) callOnce(ctx context.Context, subject string, args ...any) (any
 	c.ensureMuxSubscription(true)
 
 	id := c.generateID()
-	timeout := c.Options.Timeout
+	timeout = c.callDeadline(ctx, timeout)
 	// The reply subject is derived from the id by pure string concatenation —
 	// this is the wire contract with every responder implementation (Node,
 	// Go, Python): they publish the response to `rpc.reply.<msg.ID>` and
@@ -1049,9 +1065,9 @@ func (c *Client) callOnce(ctx context.Context, subject string, args ...any) (any
 // callOnceService is the legacy single-attempt call for service subjects
 // (reply pattern `<subject>.reply.<id>`): per-call reply subscription plus a
 // one-shot no-responder inbox. The rpc.* path is muxed — see callOnce.
-func (c *Client) callOnceService(ctx context.Context, nc *nats.Conn, subject string, args ...any) (any, error) {
+func (c *Client) callOnceService(ctx context.Context, nc *nats.Conn, subject string, timeout time.Duration, args ...any) (any, error) {
 	id := c.generateID()
-	timeout := c.Options.Timeout
+	timeout = c.callDeadline(ctx, timeout)
 	replySubject := subject + ".reply." + id
 
 	// Subscribe to reply
