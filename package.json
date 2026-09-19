@@ -44,7 +44,7 @@
   "devDependencies": {
     "@camera.ui/nats": "^2.15.0",
     "@stylistic/eslint-plugin": "^5.10.0",
-    "@types/node": "^26.6.1",
+    "@types/node": "^26.6.2",
     "@typescript-eslint/parser": "^8.70.0",
     "eslint": "9.39.2",
     "globals": "^17.12.0",
