@@ -505,7 +505,7 @@ type benchMeta struct {
 func BenchmarkEncodePooledSmallBaseline(b *testing.B) {
 	msg := RPCResponse{ID: "abc.123", Result: benchMeta{Camera: "front", Codec: "h264", Width: 1920, Height: 1080}}
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		data, release, err := encodePooled(msg)
 		if err != nil {
 			b.Fatal(err)
@@ -520,7 +520,7 @@ func BenchmarkEncodePooledSmallBaseline(b *testing.B) {
 func BenchmarkEncodeMessageSmallStructNoBinary(b *testing.B) {
 	msg := RPCResponse{ID: "abc.123", Result: benchMeta{Camera: "front", Codec: "h264", Width: 1920, Height: 1080}}
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		data, release, err := encodeMessagePooled(msg)
 		if err != nil {
 			b.Fatal(err)
@@ -534,7 +534,7 @@ func BenchmarkEncodeMessageSmallStructNoBinary(b *testing.B) {
 func BenchmarkEncodeMessageSmallMapNoBinary(b *testing.B) {
 	msg := RPCMessage{ID: "abc.123", Method: "call", Params: []any{"snapshot", map[string]any{"quality": 80, "camera": "front"}}}
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		data, release, err := encodeMessagePooled(msg)
 		if err != nil {
 			b.Fatal(err)
@@ -551,7 +551,7 @@ func BenchmarkEncodeMessageFrame100KB(b *testing.B) {
 	msg := CallbackInvocation{Method: "onFrame", Args: []any{frame}}
 	b.ReportAllocs()
 	b.SetBytes(100_000)
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		data, release, err := encodeMessagePooled(msg)
 		if err != nil {
 			b.Fatal(err)
@@ -569,7 +569,7 @@ func BenchmarkDecodeMessageFrame100KB(b *testing.B) {
 	}
 	b.ReportAllocs()
 	b.SetBytes(100_000)
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		var inv CallbackInvocation
 		if err := DecodeMessageInto(encoded, &inv); err != nil {
 			b.Fatal(err)
@@ -587,7 +587,7 @@ func BenchmarkDecodePlain100KB(b *testing.B) {
 	}
 	b.ReportAllocs()
 	b.SetBytes(100_000)
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		var inv CallbackInvocation
 		if err := Decode(encoded, &inv); err != nil {
 			b.Fatal(err)
