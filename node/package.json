@@ -38,8 +38,8 @@
     "reflect-metadata": "^0.2.2"
   },
   "devDependencies": {
-    "@types/node": "^26.6.2",
-    "vitest": "^5.0.1"
+    "@types/node": "^26.6.3",
+    "vitest": "^5.0.2"
   },
   "bugs": {
     "url": "https://github.com/cameraui/rpc/issues"
