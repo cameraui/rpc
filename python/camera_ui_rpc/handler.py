@@ -20,6 +20,10 @@ from .types import (
 )
 from .utils import is_async_function, is_async_generator, is_sync_generator
 
+STREAM_SUBJECT_PREFIX = "stream."
+CALLBACK_SUBJECT_PREFIX = "rpc.cb."
+PULL_CALLBACK_SUBJECT_PREFIX = "_rpc.cb."
+
 
 async def handle_stream_request(
     handler: Callable[..., Any],
@@ -30,6 +34,8 @@ async def handle_stream_request(
     io_pool: ThreadPoolExecutor,
 ) -> None:
     """Handle streaming request - common logic for client and service."""
+    _check_control_subject(stream_subject, STREAM_SUBJECT_PREFIX)
+
     generator: AsyncGenerator[Any, None]
 
     # Get generator
@@ -381,6 +387,8 @@ async def handle_pull_callback_request(
     The iterator response carries no value — it is purely a batch-boundary
     signal. See packages/rpc/PULL_CALLBACK_PROTOCOL.md.
     """
+    _check_control_subject(callback_subject, PULL_CALLBACK_SUBJECT_PREFIX)
+
     invoker = CallbackInvoker(callback_subject, client, set(oneway_methods))
 
     # Invoke handler with invoker appended as last positional argument.
@@ -541,6 +549,7 @@ async def handle_callback_request(
     on_finished: Callable[[], Any] | None = None,
 ) -> Callable[[], Coroutine[Any, Any, None]]:
     """Handle callback subscription request."""
+    _check_control_subject(callback_subject, CALLBACK_SUBJECT_PREFIX)
 
     # Create wrapper callback that publishes to callback_subject
     async def wrapper_callback(value: Any) -> None:
@@ -613,3 +622,9 @@ async def handle_callback_request(
         await run_handler_cleanup()
 
     return cleanup
+
+
+# the caller names this subject and the handler publishes there with its own credentials
+def _check_control_subject(subject: Any, prefix: str) -> None:
+    if not isinstance(subject, str) or len(subject) <= len(prefix) or not subject.startswith(prefix):
+        raise create_error(ErrorCode.INVALID_PARAMS, f"Control subject must start with '{prefix}'")

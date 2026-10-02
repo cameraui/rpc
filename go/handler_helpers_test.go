@@ -386,3 +386,40 @@ func TestToCamelCaseUnicode(t *testing.T) {
 		}
 	}
 }
+
+func TestForeignControlSubjectSkipsHandler(t *testing.T) {
+	called := false
+	fn := reflect.ValueOf(func(cb func(string)) { called = true })
+	target := "rpc.other.method"
+
+	handleStreamRequestGo(fn, nil, target, "id", nil)
+	if _, err := handleCallbackRequestGo(fn, nil, target, "id", nil, nil); err == nil {
+		t.Error("callback: foreign subject accepted")
+	}
+	if _, err := handlePullCallbackRequestGo(fn, nil, "id", target, nil, nil, nil); err == nil {
+		t.Error("pull-callback: foreign subject accepted")
+	}
+	if called {
+		t.Error("handler ran for a foreign control subject")
+	}
+}
+
+func TestIsControlSubject(t *testing.T) {
+	tests := []struct {
+		subject, prefix string
+		want            bool
+	}{
+		{"stream.rpc.ns.m.abc", streamSubjectPrefix, true},
+		{"stream.", streamSubjectPrefix, false},
+		{"rpc.ns.m", streamSubjectPrefix, false},
+		{"rpc.cb.abc", callbackSubjectPrefix, true},
+		{"_rpc.cb.abc", callbackSubjectPrefix, false},
+		{"_rpc.cb.abc", pullCallbackSubjectPrefix, true},
+		{"", pullCallbackSubjectPrefix, false},
+	}
+	for _, tt := range tests {
+		if got := isControlSubject(tt.subject, tt.prefix); got != tt.want {
+			t.Errorf("isControlSubject(%q, %q) = %v, want %v", tt.subject, tt.prefix, got, tt.want)
+		}
+	}
+}

@@ -12,6 +12,10 @@ import (
 // onFinished is invoked when the client cancels the subscription so the
 // caller can drop its cleanup-map entry for this session.
 func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requestID string, client *Client, onFinished func()) (func(), error) {
+	if !isControlSubject(callbackSubject, callbackSubjectPrefix) {
+		return nil, NewRPCException(ErrCodeInvalidParams, "callback subject must start with "+callbackSubjectPrefix)
+	}
+
 	fnType := fn.Type()
 
 	// Find the func(T) parameter position

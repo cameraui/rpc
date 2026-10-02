@@ -10,6 +10,12 @@ import (
 	"unicode"
 )
 
+const (
+	streamSubjectPrefix       = "stream."
+	callbackSubjectPrefix     = "rpc.cb."
+	pullCallbackSubjectPrefix = "_rpc.cb."
+)
+
 // CleanupFunc is returned by RegisterHandler to clean up subscriptions.
 type CleanupFunc func() error
 
@@ -805,4 +811,9 @@ func extractCallbackParams(params any) (subject string, args []any) {
 		return p.CallbackSubject, p.Args
 	}
 	return "", nil
+}
+
+// the caller names this subject and the handler publishes there with its own credentials
+func isControlSubject(subject, prefix string) bool {
+	return len(subject) > len(prefix) && strings.HasPrefix(subject, prefix)
 }

@@ -11,6 +11,10 @@ import (
 // It calls the handler, iterates over the returned channel, and publishes
 // data/end/error messages to the stream subject.
 func handleStreamRequestGo(fn reflect.Value, args []any, streamSubject, requestID string, client *Client) {
+	if !isControlSubject(streamSubject, streamSubjectPrefix) {
+		return
+	}
+
 	// Call the handler
 	result, err := callHandler(fn, args)
 	if err != nil {

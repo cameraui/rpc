@@ -59,6 +59,10 @@ func handlePullCallbackRequestGo(
 	client *Client,
 	onFinished func(),
 ) (func(), error) {
+	if !isControlSubject(callbackSubject, pullCallbackSubjectPrefix) {
+		return nil, NewRPCException(ErrCodeInvalidParams, "callback subject must start with "+pullCallbackSubjectPrefix)
+	}
+
 	onewaySet := make(map[string]struct{}, len(onewayMethods))
 	for _, m := range onewayMethods {
 		onewaySet[m] = struct{}{}

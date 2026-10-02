@@ -5,10 +5,16 @@ import { sleep } from './utils.js';
 import type { RPCClient } from './client.js';
 import type { CallbackInvocation, CallbackMessage, PullIteratorRequest, PullIteratorResponse, RPCError, StreamMessage } from './types.js';
 
+const STREAM_SUBJECT_PREFIX = 'stream.';
+const CALLBACK_SUBJECT_PREFIX = 'rpc.cb.';
+const PULL_CALLBACK_SUBJECT_PREFIX = '_rpc.cb.';
+
 /**
  * Handle streaming request - common logic for client and service
  */
 export async function handleStreamRequest(handler: Function, args: any[], streamSubject: string, requestId: string, client: RPCClient): Promise<void> {
+  assertControlSubject(streamSubject, STREAM_SUBJECT_PREFIX);
+
   let generator: AsyncGenerator<any, void, unknown>;
 
   // Check if handler is async or sync
@@ -284,6 +290,8 @@ export async function handlePullCallbackRequest(
   client: RPCClient,
   onFinished?: () => void,
 ): Promise<() => Promise<void>> {
+  assertControlSubject(callbackSubject, PULL_CALLBACK_SUBJECT_PREFIX);
+
   // Build callback proxy. Each method publishes a CallbackInvocation oneway.
   // Methods not in onewayMethods reject with NotImplemented (request-reply is v2).
   const onewaySet = new Set(onewayMethods);
@@ -427,6 +435,8 @@ export async function handleCallbackRequest(
   client: RPCClient,
   onFinished?: () => void,
 ): Promise<() => Promise<void>> {
+  assertControlSubject(callbackSubject, CALLBACK_SUBJECT_PREFIX);
+
   // Create wrapper callback that publishes to callbackSubject
   const wrapperCallback = async (value: any) => {
     if (!client.isConnected) return;
@@ -483,4 +493,11 @@ export async function handleCallbackRequest(
     cancelUnsub?.();
     await runHandlerCleanup();
   };
+}
+
+// the caller names this subject and the handler publishes there with its own credentials
+function assertControlSubject(subject: unknown, prefix: string): void {
+  if (typeof subject !== 'string' || subject.length <= prefix.length || !subject.startsWith(prefix)) {
+    throw createError(ERROR_CODES.INVALID_PARAMS, `Control subject must start with '${prefix}'`);
+  }
 }
