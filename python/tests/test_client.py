@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 from nats import errors
+from test_drain import until as until_timeout
 from test_mux import MockNC, MockSub, make_client, make_msg, mux_sub, no_responder_headers, until
 
 import camera_ui_rpc.client as rpc_client
@@ -883,7 +884,7 @@ def test_call_retries_a_local_no_responder_status() -> None:
         task = asyncio.create_task(client.call("rpc.ghost.method"))
 
         for attempt in range(4):
-            await until(lambda attempt=attempt: len(nc.published) == attempt + 1, tries=2000)
+            await until_timeout(lambda attempt=attempt: len(nc.published) == attempt + 1)
             req = decode(nc.published[-1]["data"])
             await mux_sub(client, nc).cb(make_msg(f"rpc.reply.{req['id']}", b"", no_responder_headers()))
 
@@ -1015,7 +1016,7 @@ def test_call_stream_retries_local_no_responders_before_the_first_item() -> None
         request_id, _ = stream_subject_of(nc, "rpc.gen.items")
         await mux_sub(client, nc).cb(make_msg(f"rpc.reply.{request_id}", b"", no_responder_headers()))
 
-        await until(lambda: len(requests_to(nc, "rpc.gen.items")) == 2, tries=2000)
+        await until_timeout(lambda: len(requests_to(nc, "rpc.gen.items")) == 2)
         request_id, stream_subject = stream_subject_of(nc, "rpc.gen.items")
         await push(nc, stream_subject, {"id": request_id, "type": "data", "data": "ok"})
         await until(lambda: items == ["ok"])
@@ -1154,7 +1155,7 @@ def test_proxy_without_options_keeps_the_client_retry() -> None:
         task = asyncio.create_task(proxy.echo(1))
         # four attempts and, after the first, one ask for the namespace's methods
         for sent in range(5):
-            await until(lambda sent=sent: len(nc.published) == sent + 1, tries=2000)
+            await until_timeout(lambda sent=sent: len(nc.published) == sent + 1)
             req = decode(nc.published[-1]["data"])
             await mux_sub(client, nc).cb(make_msg(f"rpc.reply.{req['id']}", b"", no_responder_headers()))
 
