@@ -17,12 +17,17 @@ export { RPCClass, RPCMethod, RPCNested, RPCProperty } from './decorators.js';
 // Pull-iterator-with-callbacks helper
 export { rpcCallbacks } from './utils.js';
 
+// Cancellation signal for stream and pull producers
+export { sessionSignal } from './handler.js';
+
 // Core types that users need
 export type {
   CallbackInvocation,
   CallbackMessage,
   CallbackParams,
   ErrorCode,
+  OrphanProbeOptions,
+  ProxyCallOptions,
   PullCallbackCallOptions,
   PullCallbackParams,
   RPCAuthOptions,

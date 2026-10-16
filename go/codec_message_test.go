@@ -6,6 +6,7 @@ package rpc
 import (
 	"bytes"
 	"encoding/binary"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -657,5 +658,52 @@ func TestDecodeMessageIntoTypedInlineBinary(t *testing.T) {
 	}
 	if !bytes.Equal(out.Blob, src.Blob) {
 		t.Fatalf("inline binary mangled")
+	}
+}
+
+func TestDecodeMessageIntoTypedTargetWithAnyMapBeforeBytes(t *testing.T) {
+	type event struct {
+		ID    string `msgpack:"id"`
+		Extra any    `msgpack:"extra"`
+		Thumb []byte `msgpack:"thumb"`
+	}
+	thumb := bytes.Repeat([]byte{7}, 20_000)
+	// a struct keeps the field order, extra must reach the target before thumb
+	data, err := EncodeMessage(struct {
+		ID    string         `msgpack:"id"`
+		Extra map[string]any `msgpack:"extra"`
+		Thumb any            `msgpack:"thumb"`
+	}{"e1", map[string]any{"k": "v"}, thumb})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got event
+	if err := DecodeMessageInto(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != "e1" || !bytes.Equal(got.Thumb, thumb) || got.Extra.(map[string]any)["k"] != "v" {
+		t.Errorf("decoded %+v", got)
+	}
+}
+
+func TestDecodeMessageIntoTypedTargetWithoutTheBinaryField(t *testing.T) {
+	type lean struct {
+		ID string `msgpack:"id"`
+	}
+	data, err := EncodeMessage(map[string]any{"id": "e2", "thumb": make([]byte, 20_000), "clip": make([]byte, 30_000)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got lean
+	if err := DecodeMessageInto(data, &got); err != nil || got.ID != "e2" {
+		t.Fatalf("decoded %+v, %v", got, err)
+	}
+
+	// a frame that does not add up still fails
+	if err := DecodeMessageInto(data[:len(data)-1], &got); err == nil {
+		t.Error("a frame one byte short decoded")
+	}
+	if err := DecodeMessageInto(append(slices.Clone(data), 0), &got); err == nil {
+		t.Error("a frame one byte long decoded")
 	}
 }

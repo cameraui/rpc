@@ -1,6 +1,8 @@
+import { DIRECT_SUBJECT_METADATA, directSubject, serviceSubject } from './service.js';
+
 import type { EndpointInfo, ServiceInfo } from '@nats-io/services';
 import type { RPCClient } from './client.js';
-import type { Promisify, ProxyTimingReporter } from './types.js';
+import type { Promisify, ProxyCallOptions, ProxyTimingReporter } from './types.js';
 
 /**
  * Symbol keys used to mark objects as rpc callback bundles.
@@ -44,6 +46,16 @@ export function getCallbacksOneway(v: any): string[] {
   return v?.[RPC_CALLBACKS_ONEWAY] ?? [];
 }
 
+/** What a proxy and its nested proxies have learned about the methods of their namespace. */
+export interface ProxyMethodCache {
+  /** Method names from the responder, null until a response brought them */
+  methods: Set<string> | null;
+  /** First path segments of `methods`, built on first use */
+  roots: Set<string> | null;
+  /** Calls made while `methods` is null: discovery starts with the second */
+  calls: number;
+}
+
 /**
  * Promise check. Used internally to detect async handlers
  * that need to be awaited so dispatch stays ordered.
@@ -62,7 +74,9 @@ export function isPromise(value: unknown): value is Promise<unknown> {
  * @param client - RPC client with call and callStream methods
  * @param namespace - RPC namespace
  * @param path - Current path in proxy hierarchy (internal use)
- * @param methodCache - Shared method cache for method discovery
+ * @param cache - Method cache shared with the nested proxies
+ * @param onTiming - Receives the cost of every call
+ * @param callOptions - Retry and timeout for every plain call, inherited by nested proxies
  * @returns Proxy that intercepts property access and method calls
  *
  * @example
@@ -86,23 +100,29 @@ export function createProxy<T extends object>(
   client: RPCClient,
   namespace: string,
   path: string[] = [],
-  methodCache: Set<string> | null = null,
+  cache: ProxyMethodCache = { methods: null, roots: null, calls: 0 },
   onTiming?: ProxyTimingReporter,
+  callOptions?: ProxyCallOptions,
 ): Promisify<T> {
-  // Shared cache reference that can be updated
-  let cache = methodCache;
-
   const updateCache = (methods: string[]) => {
-    cache ??= new Set(methods);
+    if (cache.methods !== null) return;
+    cache.methods = new Set(methods);
+    cache.roots = null;
   };
 
-  // Call via the meta side channel: the response's __methods travel next to
-  // the result instead of being spliced into it, so the result object is
-  // passed through untouched (no mutation, no spread copy). Discovery is
-  // requested only while the cache is empty — once the first response filled
-  // it, responses stay lean (no __methods payload).
-  const callAndCache = async (subject: string, args: any[], method?: string): Promise<any> => {
-    const { result, methods, timing } = await client.callWithMeta(subject, args, { discover: cache === null, timing: onTiming !== undefined });
+  // nested handlers are listed as `db.find`, so `db` passes the root check
+  const roots = (methods: Set<string>): Set<string> => (cache.roots ??= new Set([...methods].map((method) => method.split('.', 1)[0])));
+
+  // __methods travel beside the result, asked for from the second call while the cache is empty
+  const callAndCache = async (subject: string, args: any[], method: string): Promise<any> => {
+    const { result, methods, timing } = await client.callWithMeta(subject, args, {
+      ...callOptions,
+      discover: cache.methods === null && cache.calls++ >= 1,
+      timing: onTiming !== undefined,
+      probeNamespace: namespace,
+      probeMethod: method,
+      onMethods: updateCache,
+    });
     if (methods) {
       updateCache(methods);
     }
@@ -126,7 +146,7 @@ export function createProxy<T extends object>(
 
       // If we have cached methods and this method doesn't exist, return undefined
       // This enables: proxy.nonExistent?.() → undefined
-      if (cache && path.length === 0 && !cache.has(prop)) {
+      if (cache.methods && path.length === 0 && !roots(cache.methods).has(prop)) {
         return undefined;
       }
 
@@ -164,7 +184,7 @@ export function createProxy<T extends object>(
           const isGenerator = prop.toLowerCase().includes('generate');
 
           if (isGenerator) {
-            return client.callStream(subject, ...args);
+            return client.callStreamWithProbe(subject, args, { probeNamespace: namespace, probeMethod: method, onMethods: updateCache });
           } else if (isPullIterator) {
             return client.callPullIterator(subject, ...args);
           } else {
@@ -191,7 +211,7 @@ export function createProxy<T extends object>(
           }
 
           // Otherwise, return another proxy for nested access (share cache)
-          return createProxy<any>(client, namespace, fullPath, cache, onTiming)[nestedProp];
+          return createProxy<any>(client, namespace, fullPath, cache, onTiming, callOptions)[nestedProp];
         },
       });
     },
@@ -242,13 +262,16 @@ export function createServiceProxy<T extends object>(client: RPCClient, selected
       const fullPath = [...path, prop];
       const fullPathStr = fullPath.join('.');
 
-      // Check if this is an endpoint
-      const endpoint = selected.endpoints.find((e: EndpointInfo) => {
-        // Match exact path or last segment
-        if (e.subject === fullPathStr) return true;
-        const parts = e.subject.split('.');
-        return parts[parts.length - 1] === prop && parts.slice(0, -1).join('.') === path.join('.');
-      });
+      // the subject of this service only, then the exact path or last segment
+      const own = serviceSubject(selected.name, fullPathStr);
+      const endpoint =
+        selected.endpoints.find((e: EndpointInfo) => e.subject === own) ??
+        selected.endpoints.find((e: EndpointInfo) => {
+          if (e.subject === fullPathStr) return true;
+          const parts = e.subject.split('.');
+          return parts[parts.length - 1] === prop && parts.slice(0, -1).join('.') === path.join('.');
+        });
+      const direct = selected.metadata?.[DIRECT_SUBJECT_METADATA] === '1' ? directSubject(selected.id, fullPathStr) : undefined;
 
       if (endpoint) {
         // Return a callable proxy similar to createProxy
@@ -281,7 +304,7 @@ export function createServiceProxy<T extends object>(client: RPCClient, selected
             } else if (isPullIterator) {
               return client.callPullIterator(endpoint.subject, ...args);
             } else {
-              return client.call(endpoint.subject, ...args);
+              return client.callService(endpoint.subject, args, direct);
             }
           },
         });
@@ -337,8 +360,22 @@ export function generateReplyPrefix(): string {
   return value.toString(36).padStart(10, '0');
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+    function done(): void {
+      clearTimeout(timer);
+      signal!.removeEventListener('abort', done);
+      resolve();
+    }
+  });
 }
 
 /**
@@ -407,6 +444,112 @@ export function createSerialDispatcher(
   };
 
   const flush = (): Promise<void> => (busy === 0 ? Promise.resolve() : chain);
+
+  return { dispatch, flush };
+}
+
+/**
+ * Per-subscription dispatcher with up to `limit` handlers in flight.
+ *
+ * Messages start in arrival order. A message for which `isShared` returns
+ * false waits until nothing else runs and blocks later messages until it is
+ * done, so it keeps the serial semantics of createSerialDispatcher.
+ *
+ * flush() resolves once the dispatcher is idle: nothing running, nothing queued.
+ */
+export function createBoundedDispatcher(
+  handler: (data: any) => void | Promise<void>,
+  limit: number,
+  isShared: (data: any) => boolean,
+  onError: (error: unknown) => void,
+): { dispatch: (data: any) => void; flush: () => Promise<void> } {
+  const queue: ({ data: any; exclusive: boolean } | undefined)[] = [];
+  let head = 0;
+  let active = 0;
+  let exclusiveActive = false;
+  let pumping = false;
+  let idle: { promise: Promise<void>; resolve: () => void } | undefined;
+
+  const canStart = (exclusive: boolean): boolean => (exclusive ? active === 0 : active < limit && !exclusiveActive);
+
+  const finish = (exclusive: boolean): void => {
+    active--;
+    if (exclusive) exclusiveActive = false;
+    pump();
+  };
+
+  const start = (data: any, exclusive: boolean): void => {
+    active++;
+    if (exclusive) exclusiveActive = true;
+    let result: void | Promise<void>;
+    try {
+      result = handler(data);
+    } catch (error) {
+      onError(error);
+      finish(exclusive);
+      return;
+    }
+    if (isPromise(result)) {
+      result.then(
+        () => finish(exclusive),
+        (error) => {
+          onError(error);
+          finish(exclusive);
+        },
+      );
+    } else {
+      finish(exclusive);
+    }
+  };
+
+  // a handler that completes synchronously re-enters through finish(); the
+  // flag keeps that from recursing, the loop below picks up the freed slot
+  function pump(): void {
+    if (pumping) return;
+    pumping = true;
+    try {
+      while (head < queue.length) {
+        const next = queue[head]!;
+        if (!canStart(next.exclusive)) break;
+        queue[head++] = undefined;
+        start(next.data, next.exclusive);
+      }
+    } finally {
+      pumping = false;
+    }
+    if (head === queue.length) {
+      queue.length = 0;
+      head = 0;
+    } else if (head > 1024 && head * 2 > queue.length) {
+      queue.splice(0, head);
+      head = 0;
+    }
+    if (idle && active === 0 && queue.length === 0) {
+      idle.resolve();
+      idle = undefined;
+    }
+  }
+
+  const dispatch = (data: any): void => {
+    const exclusive = !isShared(data);
+    if (head === queue.length && !pumping && canStart(exclusive)) {
+      start(data, exclusive);
+      return;
+    }
+    queue.push({ data, exclusive });
+  };
+
+  const flush = (): Promise<void> => {
+    if (active === 0 && head === queue.length) return Promise.resolve();
+    if (!idle) {
+      let resolve!: () => void;
+      const promise = new Promise<void>((r) => {
+        resolve = r;
+      });
+      idle = { promise, resolve };
+    }
+    return idle.promise;
+  };
 
   return { dispatch, flush };
 }

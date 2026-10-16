@@ -25,6 +25,8 @@ type Channel struct {
 	onError   func(err error)
 
 	isolatedClient *Client
+	// drops isolatedClient from its parent once it is disconnected
+	release func()
 }
 
 // NewChannel creates a new broadcast channel. Call Init() before use.
@@ -189,7 +191,11 @@ func (ch *Channel) cleanup() error {
 	}
 
 	if ch.isolatedClient != nil {
-		return ch.isolatedClient.Disconnect()
+		err := ch.isolatedClient.Disconnect()
+		if ch.release != nil {
+			ch.release()
+		}
+		return err
 	}
 	return nil
 }
@@ -213,6 +219,8 @@ type PrivateChannel struct {
 	onError   func(err error)
 
 	isolatedClient *Client
+	// drops isolatedClient from its parent once it is disconnected
+	release func()
 }
 
 // NewPrivateChannel creates a new private 1:1 channel. Call Init() before use.
@@ -452,7 +460,11 @@ func (ch *PrivateChannel) cleanup() error {
 	}
 
 	if ch.isolatedClient != nil {
-		return ch.isolatedClient.Disconnect()
+		err := ch.isolatedClient.Disconnect()
+		if ch.release != nil {
+			ch.release()
+		}
+		return err
 	}
 	return nil
 }
@@ -472,6 +484,7 @@ func (c *Client) Channel(channelID string, isolated ...bool) (*Channel, error) {
 		c.isolatedClients = append(c.isolatedClients, client)
 		c.isolatedClientsMu.Unlock()
 		if err := client.Connect(context.Background()); err != nil {
+			_ = c.releaseIsolated(client)
 			return nil, err
 		}
 		isolatedClient = client
@@ -481,10 +494,12 @@ func (c *Client) Channel(channelID string, isolated ...bool) (*Channel, error) {
 	ch.isolatedClient = isolatedClient
 	if err := ch.Init(); err != nil {
 		if isolatedClient != nil {
-			_ = isolatedClient.Disconnect()
-			c.removeIsolatedClient(isolatedClient)
+			_ = c.releaseIsolated(isolatedClient)
 		}
 		return nil, err
+	}
+	if isolatedClient != nil {
+		ch.release = func() { c.removeIsolatedClient(isolatedClient) }
 	}
 	return ch, nil
 }
@@ -500,6 +515,7 @@ func (c *Client) PrivateChannelConnect(channelID, targetClientID string, isolate
 		c.isolatedClients = append(c.isolatedClients, client)
 		c.isolatedClientsMu.Unlock()
 		if err := client.Connect(context.Background()); err != nil {
+			_ = c.releaseIsolated(client)
 			return nil, err
 		}
 		isolatedClient = client
@@ -509,10 +525,12 @@ func (c *Client) PrivateChannelConnect(channelID, targetClientID string, isolate
 	ch.isolatedClient = isolatedClient
 	if err := ch.Init(); err != nil {
 		if isolatedClient != nil {
-			_ = isolatedClient.Disconnect()
-			c.removeIsolatedClient(isolatedClient)
+			_ = c.releaseIsolated(isolatedClient)
 		}
 		return nil, err
+	}
+	if isolatedClient != nil {
+		ch.release = func() { c.removeIsolatedClient(isolatedClient) }
 	}
 	return ch, nil
 }

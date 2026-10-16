@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
 
       - name: Install dependencies
         run: |
@@ -45,6 +45,21 @@ jobs:
 
       - name: Unit tests
         run: npm --prefix node test
+
+  nats-fork:
+    if: ${{ inputs.node }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Fork tests
+        working-directory: node/externals/nats.js
+        run: deno task test-fork
 
   python:
     if: ${{ inputs.python }}
@@ -136,7 +151,7 @@ jobs:
           restore-keys: swift-release-${{ runner.os }}-
       - uses: actions/setup-node@v7
         with:
-          node-version: "22"
+          node-version: "24"
       - uses: actions/setup-go@v7
         with:
           go-version: "stable"

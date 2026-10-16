@@ -1,13 +1,17 @@
 import Foundation
 
 extension RPCClientOptions {
+  /// Options for the bus of a camera.ui server. The 15 s ping interval
+  /// notices a link that died silently within 45 s.
   public static func cameraUI(
     serverURL: URL,
     token: String,
     connId: String = UUID().uuidString,
     pinnedCertificate: URL? = nil,
     skipHostnameVerification: Bool = false,
-    skipCertificateVerification: Bool = false
+    skipCertificateVerification: Bool = false,
+    additionalTrustRoots: [Data] = [],
+    pingInterval: TimeInterval = 15
   ) -> RPCClientOptions {
     var components = URLComponents(url: serverURL, resolvingAgainstBaseURL: false)!
     let insecure = components.scheme == "http" || components.scheme == "ws"
@@ -28,7 +32,9 @@ extension RPCClientOptions {
       password: "secret",
       pinnedCertificate: pinnedCertificate,
       skipHostnameVerification: skipHostnameVerification,
-      skipCertificateVerification: skipCertificateVerification
+      skipCertificateVerification: skipCertificateVerification,
+      additionalTrustRoots: additionalTrustRoots,
+      pingInterval: pingInterval
     )
   }
 
@@ -39,7 +45,9 @@ extension RPCClientOptions {
     connId: String = UUID().uuidString,
     pinnedCertificate: URL? = nil,
     skipHostnameVerification: Bool = false,
-    skipCertificateVerification: Bool = false
+    skipCertificateVerification: Bool = false,
+    additionalTrustRoots: [Data] = [],
+    pingInterval: TimeInterval = 15
   ) -> RPCClientOptions {
     cameraUI(
       serverURL: URL(string: "https://\(host):\(port)")!,
@@ -47,7 +55,9 @@ extension RPCClientOptions {
       connId: connId,
       pinnedCertificate: pinnedCertificate,
       skipHostnameVerification: skipHostnameVerification,
-      skipCertificateVerification: skipCertificateVerification
+      skipCertificateVerification: skipCertificateVerification,
+      additionalTrustRoots: additionalTrustRoots,
+      pingInterval: pingInterval
     )
   }
 }

@@ -78,6 +78,9 @@ _PLACEHOLDER_KEY = "__cui_bin__"
 
 _ENV_LEN_STRUCT = struct.Struct("<I")
 
+_SCALARS = frozenset((str, int, float, bool, type(None)))
+_ENVELOPE_KEYS = ("params", "result", "data", "args", "value")
+
 
 def _as_extractable_segment(value: Any) -> bytes | bytearray | memoryview | None:
     """Return the segment buffer for extractable binaries, None otherwise."""
@@ -97,6 +100,14 @@ def _extract_binaries(value: Any, segments: list[bytes | bytearray | memoryview]
     binary-free messages). Only dicts, lists and tuples are traversed —
     other class instances are left to msgpack.
     """
+    cls = value.__class__
+    if cls is dict:
+        return _extract_from_dict(value, segments)
+    if cls is list or cls is tuple:
+        return _extract_from_sequence(value, segments)
+    if cls in _SCALARS:
+        return value
+
     segment = _as_extractable_segment(value)
     if segment is not None:
         index = len(segments)
@@ -107,34 +118,85 @@ def _extract_binaries(value: Any, segments: list[bytes | bytearray | memoryview]
         }
 
     if isinstance(value, dict):
-        dict_copy: dict[Any, Any] | None = None
-        for key, item in value.items():  # pyright: ignore[reportUnknownVariableType]
-            # Fast skip for common scalar leaves (exact types only —
-            # subclasses take the full path below).
-            cls = item.__class__
-            if cls is str or cls is int or cls is float or cls is bool or item is None:
-                continue
-            transformed = _extract_binaries(item, segments)
-            if transformed is not item:
-                if dict_copy is None:
-                    dict_copy = dict(value)  # pyright: ignore[reportUnknownArgumentType]
-                dict_copy[key] = transformed
-        return dict_copy if dict_copy is not None else value
-
+        return _extract_from_dict(value, segments)  # pyright: ignore[reportUnknownArgumentType]
     if isinstance(value, (list, tuple)):
-        list_copy: list[Any] | None = None
-        for i, item in enumerate(value):  # pyright: ignore[reportUnknownVariableType,reportUnknownArgumentType]
-            cls = item.__class__
-            if cls is str or cls is int or cls is float or cls is bool or item is None:
-                continue
-            transformed = _extract_binaries(item, segments)
-            if transformed is not item:
-                if list_copy is None:
-                    list_copy = list(value)  # pyright: ignore[reportUnknownArgumentType]
-                list_copy[i] = transformed
-        return list_copy if list_copy is not None else value
-
+        return _extract_from_sequence(value, segments)  # pyright: ignore[reportUnknownArgumentType]
     return value
+
+
+def _extract_from_dict(value: dict[Any, Any], segments: list[bytes | bytearray | memoryview]) -> Any:
+    dict_copy: dict[Any, Any] | None = None
+    for key, item in value.items():
+        if item.__class__ in _SCALARS:
+            continue
+        transformed = _extract_binaries(item, segments)
+        if transformed is not item:
+            if dict_copy is None:
+                dict_copy = dict(value)
+            dict_copy[key] = transformed
+    return dict_copy if dict_copy is not None else value
+
+
+def _extract_from_sequence(
+    value: list[Any] | tuple[Any, ...], segments: list[bytes | bytearray | memoryview]
+) -> Any:
+    # the scalar check runs in C, long number lists skip the per-item loop
+    if len(value) > 8 and _SCALARS.issuperset(map(type, value)):
+        return value
+    list_copy: list[Any] | None = None
+    for i, item in enumerate(value):
+        if item.__class__ in _SCALARS:
+            continue
+        transformed = _extract_binaries(item, segments)
+        if transformed is not item:
+            if list_copy is None:
+                list_copy = list(value)
+            list_copy[i] = transformed
+    return list_copy if list_copy is not None else value
+
+
+def _is_large_binary(value: Any) -> bool:
+    cls = value.__class__
+    if cls is bytes or cls is bytearray:
+        return len(value) >= BINARY_EXTRACT_THRESHOLD
+    if cls is memoryview:
+        return bool(value.nbytes >= BINARY_EXTRACT_THRESHOLD)
+    return False
+
+
+def _dict_has_large_binary(value: dict[Any, Any]) -> bool:
+    return any(map(_is_large_binary, value.values()))
+
+
+def _has_large_binary_near(value: Any) -> bool:
+    cls = value.__class__
+    if cls is dict:
+        return _dict_has_large_binary(value)
+    if (cls is list or cls is tuple) and value:
+        first = value[0]
+        first_cls = first.__class__
+        if first_cls is dict:
+            return _dict_has_large_binary(first)
+        if (first_cls is list or first_cls is tuple) and first and first[0].__class__ is dict:
+            return _dict_has_large_binary(first[0])
+        return _is_large_binary(first)
+    return _is_large_binary(value)
+
+
+def _hint_large_binary(data: Any) -> bool:
+    """Look for an extractable binary where the library's envelopes carry one.
+
+    Covers call params, results, stream and pull-iterator items and callback
+    args without walking the message. A miss only costs encode_message one
+    extra pack before it walks.
+    """
+    if data.__class__ is not dict:
+        return _has_large_binary_near(data)
+    for key in _ENVELOPE_KEYS:
+        value = data.get(key)
+        if value is not None and _has_large_binary_near(value):
+            return True
+    return False
 
 
 def _is_binary_placeholder(value: Any) -> bool:
@@ -272,11 +334,22 @@ def encode_message(data: Any) -> bytes:
     Returns:
         Wire-encoded binary data
     """
+    packed: bytes | None = None
+    if not _hint_large_binary(data):
+        try:
+            packed = encode(data)
+        except TypeError:
+            # e.g. a non-contiguous memoryview or a bytes subclass, only the walk below handles those
+            packed = None
+        # an extractable binary would add at least BINARY_EXTRACT_THRESHOLD bytes of bin payload
+        if packed is not None and len(packed) < BINARY_EXTRACT_THRESHOLD:
+            return packed
+
     segments: list[bytes | bytearray | memoryview] = []
     transformed = _extract_binaries(data, segments)
 
     if not segments:
-        return encode(data)
+        return packed if packed is not None else encode(data)
 
     envelope = encode(transformed)
     # One join copy assembles the full frame — acceptable even for large

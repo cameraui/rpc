@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ssl
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Collection, Coroutine, Mapping
 from enum import StrEnum
 from typing import (
     TYPE_CHECKING,
@@ -61,7 +61,9 @@ class RPCClient(Protocol):
         servers: list[str] | None = None,
         auth: RPCAuthOptions | None = None,
     ) -> None: ...
-    async def publish(self, subject: str, data: Any) -> None: ...
+    async def publish(
+        self, subject: str, data: Any, headers: dict[str, str] | None = None, reply: str | None = None
+    ) -> None: ...
     async def subscribe(
         self,
         pattern: str,
@@ -86,6 +88,11 @@ class RPCClient(Protocol):
         isolated_connection: bool = False,
         without_decorators: bool = False,
         queue: str = "",
+        *,
+        concurrency: Mapping[str, int] | None = None,
+        orphan_probe: OrphanProbeOptions | Literal[False] | None = None,
+        namespace_subscription: bool = False,
+        drop_expired: bool | Collection[str] = False,
     ) -> Callable[[], Coroutine[Any, Any, None]]: ...
     async def call_with_callback(
         self,
@@ -106,22 +113,52 @@ class RPCClient(Protocol):
     ) -> PrivateChannel: ...
     @overload
     def create_proxy(
-        self, namespace: str, type_class: type[T], isolated_connection: Literal[False] | None = None
+        self,
+        namespace: str,
+        type_class: type[T],
+        isolated_connection: Literal[False] | None = None,
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> T: ...
     @overload
     def create_proxy(
-        self, namespace: str, type_class: type[T], isolated_connection: Literal[True]
+        self,
+        namespace: str,
+        type_class: type[T],
+        isolated_connection: Literal[True],
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> ProxyWithClose[T]: ...
     @overload
     def create_proxy(
-        self, namespace: str, type_class: None = None, isolated_connection: Literal[False] | None = None
+        self,
+        namespace: str,
+        type_class: None = None,
+        isolated_connection: Literal[False] | None = None,
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> Any: ...
     @overload
     def create_proxy(
-        self, namespace: str, type_class: None = None, isolated_connection: Literal[True] = True
+        self,
+        namespace: str,
+        type_class: None = None,
+        isolated_connection: Literal[True] = True,
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> ProxyWithClose[Any]: ...
     def create_proxy(
-        self, namespace: str, type_class: type[T] | None = None, isolated_connection: bool | None = False
+        self,
+        namespace: str,
+        type_class: type[T] | None = None,
+        isolated_connection: bool | None = False,
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> T | Any | ProxyWithClose[T] | ProxyWithClose[Any]: ...
     @overload
     async def create_service_proxy(
@@ -170,13 +207,35 @@ class RPCClient(Protocol):
 
 
 class NoResponderRetryOptions(TypedDict):
-    """Retry configuration for 503/no-responder errors."""
+    """Retry configuration for 503/no-responder errors.
+
+    With neither field set, a call retries after 0.025, 0.05, 0.1, 0.325, 1
+    and 2 seconds, about 3.5 s in all. With only max_retries set the delays
+    are [0.5, 1.0, 2.0], with only delays set a call retries 3 times.
+    """
 
     max_retries: NotRequired[int]
-    """Maximum number of retry attempts (default: 3)."""
+    """Maximum number of retry attempts."""
 
     delays: NotRequired[list[float]]
-    """Delay in seconds before each retry attempt (default: [0.5, 1.0, 2.0])."""
+    """Delay in seconds before each retry attempt, the last one repeats."""
+
+
+class OrphanProbeOptions(TypedDict):
+    """How a producer notices that the consumer of a session it serves vanished without a cancel.
+
+    Covers callback, push stream and pull sessions. At most once per
+    ``interval_ms`` a publish of the session carries a reply subject, an idle
+    session sends a ping instead. The server answers a message nobody
+    receives with a no-responder status; when that lasts for ``grace_ms``,
+    the session ends as if the consumer had cancelled it.
+    """
+
+    interval_ms: NotRequired[int]
+    """Least time between two probes of one session (default and 0: 30000)."""
+
+    grace_ms: NotRequired[int]
+    """How long the consumer must stay missing before the session ends (default and 0: 300000)."""
 
 
 class RPCAuthOptions(TypedDict):
@@ -214,10 +273,13 @@ class RPCClientOptions(TypedDict):
     """Enable automatic reconnection"""
 
     max_reconnect_attempts: NotRequired[int]
-    """Maximum reconnection attempts (-1 for infinite)"""
+    """Maximum reconnection attempts (-1 for infinite).
+
+    Defaults to -1, or to 1 without reconnect, so the first connect gives up.
+    """
 
     reconnect_time_wait: NotRequired[int]
-    """Delay between reconnection attempts in milliseconds"""
+    """Delay between reconnection attempts in milliseconds (default: 2000, at least 100)"""
 
     connect_timeout: NotRequired[int]
     """Timeout for a single connection attempt in milliseconds"""
@@ -226,7 +288,22 @@ class RPCClientOptions(TypedDict):
     """TLS configuration with 'cert', 'key', and 'ca' keys, or a ready SSLContext"""
 
     max_payload_size: NotRequired[int]
-    """Maximum payload size in bytes (default: auto-detect from NATS server)"""
+    """Largest message this client sends in one piece, in bytes; larger ones go
+    out chunked. Only lowers the server's max_payload, for links with a lower
+    limit than the local server (leaf nodes). Default: the server's limit.
+
+    8192 bytes of it are kept for the envelope, so a chunk carries at most
+    the value minus 8192. The client refuses a value that is not an int or
+    is below 16384 with ValueError; 0 means the server's limit. With a server
+    limit below 16384, messages that fit it go out unchanged and a larger one
+    fails with PAYLOAD_TOO_LARGE.
+    """
+
+    max_transfer_size: NotRequired[int]
+    """Largest incoming chunked transfer in bytes; bigger ones are dropped before
+    anything is allocated (default and 0: 1 GiB). It also caps the bytes that all
+    transfers still being reassembled by this client hold together; a transfer
+    that would go over it is dropped with its first chunk."""
 
     wait_on_first_connect: NotRequired[bool]
     """Block connect() until the first connection succeeds (default: True).
@@ -237,8 +314,21 @@ class RPCClientOptions(TypedDict):
     """Maximum time in ms to wait for the NATS connection to fully close
     during disconnect(). Default: 2000"""
 
+    drain_timeout_ms: NotRequired[int]
+    """How long disconnect(), suspend() and the cleanup of register_handler()
+    let calls their handlers already received finish, in milliseconds
+    (default: 250). The handler subscriptions go first, so new calls find
+    another instance or a no-responder. A call still unanswered at the end
+    gets a CONNECTION_CLOSED error. 0 tears down at once and cancels running
+    handlers."""
+
     no_responder_retry: NotRequired[NoResponderRetryOptions]
     """Retry configuration for 503/no-responder errors."""
+
+    orphan_probe: NotRequired[OrphanProbeOptions | Literal[False]]
+    """Default for the sessions this client serves, see OrphanProbeOptions
+    (default: on with its defaults). False turns it off. register_handler()
+    can set it per registration."""
 
     error_cb: NotRequired[ErrorCallback]
     """Async callback for NATS transport errors. When omitted, transport errors are
@@ -275,6 +365,11 @@ class RPCMessage(TypedDict):
     """Timing request (internal metadata). When True, the responder stamps its
     clock around the handler and returns both stamps in ``__timing``. Old
     responders ignore it and the caller just sees no timing back."""
+
+    __ttl: NotRequired[int]
+    """The caller's timeout for this request in milliseconds (internal
+    metadata). A method registered with drop_expired skips a request that
+    waited longer for its handler. Old responders ignore it."""
 
 
 class RPCResponse(TypedDict):
@@ -327,8 +422,8 @@ class StreamMessage(TypedDict):
     id: str
     """Stream ID (same as request ID)"""
 
-    type: Literal["data", "end", "error"]
-    """Message type"""
+    type: Literal["data", "end", "error", "ping"]
+    """Message type; consumers ignore 'ping', a producer's probe for whether they still listen"""
 
     data: NotRequired[Any | None]
     """Data payload (for 'data' type)"""
@@ -374,6 +469,7 @@ class ErrorCode(StrEnum):
     STREAM_ERROR = "STREAM_ERROR"
     PAYLOAD_TOO_LARGE = "PAYLOAD_TOO_LARGE"
     NOT_FOUND = "NOT_FOUND"
+    FORBIDDEN = "FORBIDDEN"
 
 
 class ChunkedTransferHeader(TypedDict):
@@ -405,8 +501,8 @@ class ConnectionOptions(TypedDict):
     pedantic: NotRequired[bool]
     verbose: NotRequired[bool]
     allow_reconnect: NotRequired[bool]
-    connect_timeout: NotRequired[int]
-    reconnect_time_wait: NotRequired[int]
+    connect_timeout: NotRequired[float]
+    reconnect_time_wait: NotRequired[float]
     max_reconnect_attempts: NotRequired[int]
     ping_interval: NotRequired[int]
     max_outstanding_pings: NotRequired[int]
@@ -442,7 +538,7 @@ class CallbackMessage(TypedDict):
     """Message format for callback data pushed to subscribers."""
 
     id: str
-    type: Literal["data", "error"]
+    type: Literal["data", "error", "ping"]
     data: NotRequired[Any | None]
     error: NotRequired[RPCError | None]
 

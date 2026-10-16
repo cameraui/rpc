@@ -380,3 +380,130 @@ class TestFrameValidation:
         encoded = encode_message({"params": [_bytes(T)]})
         with pytest.raises(ValueError, match="expected payload size"):
             decode_message(encoded + b"\x00\x00\x00\x00")
+
+
+def _reference_extract(value: Any, segments: list[Any]) -> Any:
+    # the walk encode_message used before the pack-first path, kept as the byte-identity oracle
+    if isinstance(value, (bytes, bytearray)) and len(value) >= BINARY_EXTRACT_THRESHOLD:
+        segments.append(value)
+        return {"__cui_bin__": len(segments) - 1, "l": len(value)}
+    if isinstance(value, memoryview) and value.nbytes >= BINARY_EXTRACT_THRESHOLD:
+        segment = value if value.c_contiguous else memoryview(value.tobytes())
+        segments.append(segment)
+        return {"__cui_bin__": len(segments) - 1, "l": segment.nbytes}
+    if isinstance(value, dict):
+        out = {key: _reference_extract(item, segments) for key, item in value.items()}
+        return out if any(out[k] is not value[k] for k in value) else value
+    if isinstance(value, (list, tuple)):
+        items = [_reference_extract(item, segments) for item in value]
+        return items if any(a is not b for a, b in zip(items, value, strict=True)) else value
+    return value
+
+
+def reference_encode_message(data: Any) -> bytes:
+    segments: list[Any] = []
+    transformed = _reference_extract(data, segments)
+    if not segments:
+        return encode(data)
+    envelope = encode(transformed)
+    return b"".join((b"CUIB", struct.pack("<I", len(envelope)), envelope, *segments))
+
+
+class Label(StrEnum):
+    PERSON = "person"
+
+
+class BigBytes(bytes):
+    pass
+
+
+def _detections(n: int) -> list[dict[str, Any]]:
+    return [{"label": Label.PERSON, "score": 0.5 + i / 100, "box": [i, i + 1, 20, 30]} for i in range(n)]
+
+
+GOLDEN_MESSAGES: list[Any] = [
+    None,
+    1,
+    "x" * 20000,
+    {"id": "a.b", "result": _detections(0)},
+    {"id": "a.b", "result": _detections(3)},
+    {"id": "a.b", "result": {"detections": _detections(12), "embedding": [0.25] * 512}},
+    {"id": "a.b", "method": "call", "params": ({"data": _bytes(307200), "width": 320},)},
+    {"id": "a.b", "method": "call", "params": ([{"data": _bytes(58000)}, {"data": _bytes(58000)}],)},
+    {"id": "a.b", "method": "call", "params": [[[{"deep": _bytes(BINARY_EXTRACT_THRESHOLD)}]]]},
+    {"id": "a.b", "result": _bytes(BINARY_EXTRACT_THRESHOLD - 1)},
+    {"id": "a.b", "result": _bytes(BINARY_EXTRACT_THRESHOLD)},
+    {"id": "a.b", "result": bytearray(_bytes(BINARY_EXTRACT_THRESHOLD + 5))},
+    {"id": "a.b", "result": memoryview(_bytes(20000))},
+    {"id": "a.b", "result": memoryview(_bytes(40000))[::2]},
+    {"id": "a.b", "result": memoryview(_bytes(2000))[::2]},
+    {"id": "a.b", "result": BigBytes(_bytes(20000))},
+    {"id": "a.b", "result": [{"k": i, "v": "s" * 30} for i in range(1000)]},
+    {"id": "a.b", "result": ("tuple", [1, 2, (3, _bytes(16400))])},
+    {"k": [1] * 20 + [_bytes(17000)]},
+    {f"key{i}": i for i in range(40)} | {"late": _bytes(18000)},
+]
+
+
+@pytest.mark.parametrize("message", GOLDEN_MESSAGES)
+def test_encode_message_bytes_match_the_full_walk(message: Any) -> None:
+    try:
+        expected = reference_encode_message(message)
+    except TypeError:
+        with pytest.raises(TypeError):
+            encode_message(message)
+        return
+    assert encode_message(message) == expected
+
+
+def test_encode_message_bytes_match_the_full_walk_on_random_structures() -> None:
+    import random
+
+    rng = random.Random(1234)
+    sizes = [0, 10, BINARY_EXTRACT_THRESHOLD - 1, BINARY_EXTRACT_THRESHOLD, 30000]
+
+    def build(depth: int) -> Any:
+        pick = rng.random()
+        if depth > 4 or pick < 0.35:
+            return rng.choice([None, True, 3, 2.5, "s", _bytes(rng.choice(sizes), rng.randrange(256))])
+        if pick < 0.7:
+            return {f"k{i}": build(depth + 1) for i in range(rng.randrange(0, 20))}
+        seq = [build(depth + 1) for _ in range(rng.randrange(0, 12))]
+        return tuple(seq) if rng.random() < 0.3 else seq
+
+    for _ in range(150):
+        message = {"id": "x", "result": build(0)}
+        assert encode_message(message) == reference_encode_message(message)
+
+
+def test_small_message_is_packed_without_the_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    import camera_ui_rpc.codec as codec
+
+    def no_walk(*_args: Any) -> Any:
+        raise AssertionError("walked a message under the extract threshold")
+
+    monkeypatch.setattr(codec, "_extract_binaries", no_walk)
+    message = {"id": "a.b", "result": {"detections": _detections(12)}}
+    assert codec.encode_message(message) == encode(message)
+
+
+def test_frame_message_is_packed_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import camera_ui_rpc.codec as codec
+
+    packs: list[int] = []
+    real_encode = codec.encode
+
+    def counting_encode(data: Any) -> bytes:
+        packs.append(1)
+        return real_encode(data)
+
+    monkeypatch.setattr(codec, "encode", counting_encode)
+    codec.encode_message({"id": "a.b", "method": "call", "params": ({"data": _bytes(307200)},)})
+    assert packs == [1]
+
+
+@pytest.mark.parametrize("kind", [bytes, bytearray, memoryview])
+def test_msgpack_packs_binaries_at_full_length(kind: Any) -> None:
+    # encode_message returns small packs without the walk because of this
+    value = kind(_bytes(BINARY_EXTRACT_THRESHOLD))
+    assert len(encode({"v": value})) >= BINARY_EXTRACT_THRESHOLD

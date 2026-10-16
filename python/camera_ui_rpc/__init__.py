@@ -15,7 +15,7 @@ from .client import create_rpc_client
 from .decorators import RPCClass, RPCMethod, RPCNested, RPCProperty
 
 # Error handling
-from .errors import RPCException
+from .errors import RPCException, RPCTimeoutError
 
 # Service support
 from .service import RPCService, Service
@@ -26,6 +26,7 @@ from .types import (
     CloseHandler,
     ErrorCode,
     NoResponderRetryOptions,
+    OrphanProbeOptions,
     ProxyWithClose,  # For isolated connections
     PullCallbackParams,
     RPCClient,
@@ -44,6 +45,7 @@ __all__ = [
     "PrivateChannel",
     # Errors
     "RPCException",
+    "RPCTimeoutError",
     "ErrorCode",
     # Service
     "RPCService",
@@ -60,6 +62,7 @@ __all__ = [
     "RPCClient",
     "RPCClientOptions",
     "NoResponderRetryOptions",
+    "OrphanProbeOptions",
     "RPCError",
     "ProxyWithClose",
     "CloseHandler",

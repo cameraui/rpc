@@ -1,3 +1,5 @@
+import { generateId } from './utils.js';
+
 import type { RPCClient } from './client.js';
 
 export interface ChannelMessage {
@@ -25,7 +27,9 @@ export class Channel {
   private handlers = new Map<string, Set<(data: any) => void>>();
   private closeHandlers = new Set<() => void>();
   private errorHandlers = new Set<(error: Error) => void>();
-  private subscriptions: Promise<() => void>[] = [];
+  protected subscriptions: Promise<() => void>[] = [];
+  // marks the requests of this end, its onRequest leaves them to the other end
+  protected readonly sender = generateId();
 
   /**
    * Check if channel is closed
@@ -98,14 +102,14 @@ export class Channel {
       throw new Error('Channel is closed');
     }
 
-    return this.client.request<TRequest, TResponse>(this.requestSubject, data, { timeout });
+    return this.client.request<TRequest, TResponse>(this.requestSubject, data, { timeout, sender: this.sender });
   }
 
   /**
    * Setup a request handler for this channel
    */
   public async onRequest<TRequest = any, TResponse = any>(handler: (data: TRequest) => Promise<TResponse> | TResponse): Promise<() => void> {
-    const unsubscribe = this.client.onRequest(this.requestSubject, handler);
+    const unsubscribe = this.client.onRequest(this.requestSubject, handler, { ignoreSender: this.sender });
     this.subscriptions.push(unsubscribe);
     return unsubscribe;
   }
@@ -231,6 +235,7 @@ export class Channel {
       } catch {
         // Ignore disconnect errors
       }
+      (this as any)._releaseIsolated?.();
     }
   }
 }
@@ -357,14 +362,16 @@ export class PrivateChannel extends Channel {
       throw new Error('Channel is closed');
     }
 
-    return this.client.request(this.privateRequestSubject, data, { timeout });
+    return this.client.request(this.privateRequestSubject, data, { timeout, sender: this.sender });
   }
 
   /**
    * Setup a request handler for this private channel
    */
   public async onRequest<TRequest = any, TResponse = any>(handler: (data: TRequest) => Promise<TResponse> | TResponse): Promise<() => void> {
-    return this.client.onRequest(this.privateRequestSubject, handler);
+    const unsubscribe = this.client.onRequest(this.privateRequestSubject, handler, { ignoreSender: this.sender });
+    this.subscriptions.push(unsubscribe);
+    return unsubscribe;
   }
 
   /**

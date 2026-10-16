@@ -116,7 +116,7 @@ func (h *helperHandler) Echo(s string) string {
 
 func TestCallHandlerVariadic(t *testing.T) {
 	methods := ExtractMethods(&helperHandler{})
-	got, err := callHandler(methods["sum"], []any{int64(1), int64(2), int64(3), int64(4)})
+	got, err := callHandler(t.Context(), methods["sum"], []any{int64(1), int64(2), int64(3), int64(4)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestCallHandlerVariadic(t *testing.T) {
 
 func TestCallHandlerMultiReturn(t *testing.T) {
 	methods := ExtractMethods(&helperHandler{})
-	got, err := callHandler(methods["multi"], nil)
+	got, err := callHandler(t.Context(), methods["multi"], nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestCallHandlerMultiReturn(t *testing.T) {
 
 func TestCallHandlerNoReturn(t *testing.T) {
 	methods := ExtractMethods(&helperHandler{})
-	got, err := callHandler(methods["noReturn"], []any{"name"})
+	got, err := callHandler(t.Context(), methods["noReturn"], []any{"name"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestCallHandlerNoReturn(t *testing.T) {
 
 func TestCallHandlerErrorReturn(t *testing.T) {
 	methods := ExtractMethods(&helperHandler{})
-	_, err := callHandler(methods["fail"], nil)
+	_, err := callHandler(t.Context(), methods["fail"], nil)
 	if err == nil || err.Error() != "boom" {
 		t.Errorf("err = %v, want boom", err)
 	}
@@ -162,7 +162,7 @@ func TestCallHandlerErrorReturn(t *testing.T) {
 func TestCallHandlerScalarParam(t *testing.T) {
 	methods := ExtractMethods(&helperHandler{})
 	// Scalar (non-slice) params are wrapped into a single-arg call.
-	got, err := callHandler(methods["echo"], "direct")
+	got, err := callHandler(t.Context(), methods["echo"], "direct")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +173,7 @@ func TestCallHandlerScalarParam(t *testing.T) {
 
 func TestCallHandlerMissingArgsZeroFilled(t *testing.T) {
 	methods := ExtractMethods(&helperHandler{})
-	got, err := callHandler(methods["echo"], []any{})
+	got, err := callHandler(t.Context(), methods["echo"], []any{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +197,7 @@ func TestExtractMethodsRPCProp(t *testing.T) {
 		t.Error("missing setter setCount")
 	}
 
-	got, err := callHandler(methods["count"], nil)
+	got, err := callHandler(t.Context(), methods["count"], nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestExtractMethodsRPCProp(t *testing.T) {
 		t.Errorf("getter = %v, want 5", got)
 	}
 
-	if _, err := callHandler(methods["setCount"], []any{int64(9)}); err != nil {
+	if _, err := callHandler(t.Context(), methods["setCount"], []any{int64(9)}); err != nil {
 		t.Fatal(err)
 	}
 	if h.Count != 9 {
@@ -225,7 +225,7 @@ func TestExtractMethodsMapNonFuncValue(t *testing.T) {
 		t.Error("underscore-prefixed key should be skipped")
 	}
 
-	got, err := callHandler(methods["version"], nil)
+	got, err := callHandler(t.Context(), methods["version"], nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,11 +392,11 @@ func TestForeignControlSubjectSkipsHandler(t *testing.T) {
 	fn := reflect.ValueOf(func(cb func(string)) { called = true })
 	target := "rpc.other.method"
 
-	handleStreamRequestGo(fn, nil, target, "id", nil)
-	if _, err := handleCallbackRequestGo(fn, nil, target, "id", nil, nil); err == nil {
+	handleStreamRequestGo(nil, fn, nil, target, "id", nil, nil, false)
+	if _, err := handleCallbackRequestGo(t.Context(), fn, nil, target, "id", nil, nil, nil); err == nil {
 		t.Error("callback: foreign subject accepted")
 	}
-	if _, err := handlePullCallbackRequestGo(fn, nil, "id", target, nil, nil, nil); err == nil {
+	if _, err := handlePullCallbackRequestGo(t.Context(), fn, nil, "id", target, nil, nil, nil, nil); err == nil {
 		t.Error("pull-callback: foreign subject accepted")
 	}
 	if called {

@@ -26,6 +26,7 @@ __pycache__
 .tmp
 
 tests/nats
+tests/harness
 tests/go-codec/go-codec
 tests/go-codec-cross/go-codec-cross
 .build*

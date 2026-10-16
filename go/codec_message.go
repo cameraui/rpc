@@ -10,6 +10,7 @@ import (
 	"maps"
 	"math"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
@@ -71,15 +72,92 @@ func encodeMessagePooled(v any) (encoded []byte, release func(), err error) {
 	return buf.Bytes(), release, nil
 }
 
+// a message ready for the wire except for the segments, which stay where the
+// caller keeps them until the publish joins or chunks them; head is a plain
+// msgpack message, or the CUIB header and envelope the segments follow
+type wireFrame struct {
+	head     *bytes.Buffer
+	segments [][]byte
+	size     int
+}
+
+// encodeFramePooled is encodeMessagePooled without copying the segments; call
+// release once no publish uses the frame anymore (see encodeBufPool)
+func encodeFramePooled(v any) (wireFrame, error) {
+	transformed, segments := extractBinaries(v)
+	if len(segments) == 0 {
+		buf, err := encodeToPooledBuf(v)
+		if err != nil {
+			return wireFrame{}, err
+		}
+		return wireFrame{head: buf, size: buf.Len()}, nil
+	}
+
+	buf := encodeBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if err := encodeFrameHead(buf, transformed); err != nil {
+		releaseEncodeBuf(buf)
+		return wireFrame{}, err
+	}
+	size := buf.Len()
+	for _, seg := range segments {
+		size += len(seg)
+	}
+	return wireFrame{head: buf, segments: segments, size: size}, nil
+}
+
+// the whole message in one slice, the segments appended to head
+func (f *wireFrame) joined() []byte {
+	if len(f.segments) == 0 {
+		return f.head.Bytes()
+	}
+	switch {
+	case f.head.Available() >= f.size-f.head.Len():
+	case f.size > maxPooledEncodeBuf:
+		// never pooled, so exactly the message instead of the doubling of Grow
+		exact := bytes.NewBuffer(make([]byte, f.head.Len(), f.size))
+		copy(exact.Bytes(), f.head.Bytes())
+		releaseEncodeBuf(f.head)
+		f.head = exact
+	default:
+		f.head.Grow(f.size - f.head.Len())
+	}
+	for _, seg := range f.segments {
+		f.head.Write(seg)
+	}
+	f.segments = nil
+	return f.head.Bytes()
+}
+
+func (f *wireFrame) release() {
+	releaseEncodeBuf(f.head)
+}
+
 // encodeFrame assembles a CUIB frame into buf: 8-byte header, msgpack
 // envelope, then the segments back-to-back in index order.
 func encodeFrame(buf *bytes.Buffer, transformed any, segments [][]byte) error {
+	if err := encodeFrameHead(buf, transformed); err != nil {
+		return err
+	}
+	total := buf.Len()
+	for _, seg := range segments {
+		total += len(seg)
+	}
+	buf.Grow(total - buf.Len())
+	for _, seg := range segments {
+		buf.Write(seg)
+	}
+	return nil
+}
+
+// the 8-byte CUIB header and the msgpack envelope
+func encodeFrameHead(buf *bytes.Buffer, transformed any) error {
 	var header [cuibHeaderSize]byte
 	buf.Write(header[:])
 
 	enc := msgpack.GetEncoder()
 	enc.Reset(buf)
-	err := enc.Encode(transformed)
+	err := encodeFast(enc, transformed)
 	msgpack.PutEncoder(enc)
 	if err != nil {
 		return err
@@ -92,15 +170,6 @@ func encodeFrame(buf *bytes.Buffer, transformed any, segments [][]byte) error {
 	b := buf.Bytes()
 	copy(b[:4], cuibMagic[:])
 	binary.LittleEndian.PutUint32(b[4:cuibHeaderSize], uint32(envLen))
-
-	total := buf.Len()
-	for _, seg := range segments {
-		total += len(seg)
-	}
-	buf.Grow(total - buf.Len())
-	for _, seg := range segments {
-		buf.Write(seg)
-	}
 	return nil
 }
 
@@ -108,6 +177,9 @@ func encodeFrame(buf *bytes.Buffer, transformed any, segments [][]byte) error {
 // transformed value and the extracted segments (nil when there are none, in
 // which case the original v must be encoded as-is).
 func extractBinaries(v any) (transformed any, segments [][]byte) {
+	if !containsBinary(v) {
+		return v, nil
+	}
 	result, changed := extractValue(v, &segments)
 	if !changed {
 		return v, nil
@@ -320,6 +392,121 @@ func extractSequence(rv reflect.Value, segs *[][]byte) (any, bool) {
 		return cow, true
 	}
 	return rv.Interface(), false
+}
+
+// extractValue's paths without Interface(), which would copy each struct behind a pointer or in a slice
+func containsBinary(v any) bool {
+	switch t := v.(type) {
+	case nil, bool, string,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64:
+		return false
+	case []byte:
+		return len(t) >= binaryExtractThreshold
+	case map[string]any:
+		for _, val := range t {
+			if containsBinary(val) {
+				return true
+			}
+		}
+		return false
+	case []any:
+		return slices.ContainsFunc(t, containsBinary)
+	default:
+		return valueContainsBinary(reflect.ValueOf(v))
+	}
+}
+
+func valueContainsBinary(rv reflect.Value) bool {
+	switch rv.Kind() {
+	case reflect.Interface:
+		if rv.IsNil() {
+			return false
+		}
+		// the value an interface holds is not addressable, so this does not copy
+		if rv.CanInterface() {
+			return containsBinary(rv.Elem().Interface())
+		}
+		return valueContainsBinary(rv.Elem())
+
+	case reflect.Pointer:
+		if rv.IsNil() {
+			return false
+		}
+		return valueContainsBinary(rv.Elem())
+
+	case reflect.Slice:
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return rv.Len() >= binaryExtractThreshold
+		}
+		return sequenceContainsBinary(rv)
+
+	case reflect.Array:
+		if rv.Type().Elem().Kind() == reflect.Uint8 {
+			return false
+		}
+		return sequenceContainsBinary(rv)
+
+	case reflect.Map:
+		if !typeCanContainBinary(rv.Type().Elem()) {
+			return false
+		}
+		// a map is a pointer in an interface, Interface() does not copy it
+		if rv.Type() == mapStringAnyType && rv.CanInterface() {
+			return containsBinary(rv.Interface())
+		}
+		var iter reflect.MapIter
+		iter.Reset(rv)
+		// SetIterValue refuses a map reached through an unexported field
+		if !rv.CanInterface() {
+			for iter.Next() {
+				if valueContainsBinary(iter.Value()) {
+					return true
+				}
+			}
+			return false
+		}
+		elem := reflect.New(rv.Type().Elem()).Elem()
+		for iter.Next() {
+			elem.SetIterValue(&iter)
+			if valueContainsBinary(elem) {
+				return true
+			}
+		}
+		return false
+
+	case reflect.Struct:
+		meta := structMetaFor(rv.Type())
+		if meta.opaque || !meta.candidate {
+			return false
+		}
+		for i := range meta.fields {
+			f := &meta.fields[i]
+			if !f.candidate {
+				continue
+			}
+			if fv, ok := fieldByIndexRO(rv, f.index); ok && valueContainsBinary(fv) {
+				return true
+			}
+		}
+		return false
+
+	default:
+		return false
+	}
+}
+
+func sequenceContainsBinary(rv reflect.Value) bool {
+	if !typeCanContainBinary(rv.Type().Elem()) {
+		return false
+	}
+	for i := range rv.Len() {
+		if valueContainsBinary(rv.Index(i)) {
+			return true
+		}
+	}
+	return false
 }
 
 type structFieldMeta struct {
@@ -671,11 +858,10 @@ func DecodeMessageInto(data []byte, v any) error {
 	if err := restoreBinaries(&generic, data, segmentBase); err != nil {
 		return err
 	}
-	inlined, err := Encode(generic)
-	if err != nil {
-		return err
-	}
-	return Decode(inlined, v)
+	// the failed typed decode left values in v, and msgpack decodes into a
+	// non-nil `any` through the value it holds, which panics when unaddressable
+	resetValue(v)
+	return convertPooled(generic, v)
 }
 
 // placeholderRef records one placeholder found in the decoded envelope: its
@@ -697,42 +883,23 @@ func restoreBinaries(target any, data []byte, segmentBase int) error {
 		return err
 	}
 
-	if len(refs) == 0 {
-		if segmentBase != len(data) {
-			return fmt.Errorf("invalid CUIB frame: expected payload size %d, got %d", segmentBase, len(data))
+	offsets, lengths, err := segmentLayout(refs, data, segmentBase)
+	if err != nil {
+		// a typed target may leave out a field that carries a segment, the
+		// envelope still names them all; a frame that does not add up fails here too
+		var all []placeholderRef
+		var generic any
+		if Decode(data[cuibHeaderSize:segmentBase], &generic) != nil || collectAny(generic, func([]byte) {}, &all) != nil {
+			return err
 		}
-		return nil
-	}
-
-	maxIndex := 0
-	for i := range refs {
-		if refs[i].index > maxIndex {
-			maxIndex = refs[i].index
+		if offsets, lengths, err = segmentLayout(all, data, segmentBase); err != nil {
+			return err
 		}
-	}
-
-	lengths := make([]int, maxIndex+1)
-	for i := range lengths {
-		lengths[i] = -1
-	}
-	for i := range refs {
-		lengths[refs[i].index] = refs[i].length
-	}
-
-	offsets := make([]int, maxIndex+1)
-	offset := segmentBase
-	for i, l := range lengths {
-		if l < 0 {
-			return fmt.Errorf("invalid CUIB frame: missing placeholder for segment %d", i)
+		for i := range refs {
+			if refs[i].index >= len(lengths) || refs[i].length != lengths[refs[i].index] {
+				return fmt.Errorf("invalid CUIB frame: segment %d of the target does not match the envelope", refs[i].index)
+			}
 		}
-		if l > len(data)-offset {
-			return fmt.Errorf("invalid CUIB frame: segment %d exceeds payload size %d", i, len(data))
-		}
-		offsets[i] = offset
-		offset += l
-	}
-	if offset != len(data) {
-		return fmt.Errorf("invalid CUIB frame: expected payload size %d, got %d", offset, len(data))
 	}
 
 	for i := range refs {
@@ -741,6 +908,40 @@ func restoreBinaries(target any, data []byte, segmentBase int) error {
 		refs[i].set(data[start:end:end])
 	}
 	return nil
+}
+
+// the segments lie back-to-back in index order after the envelope and fill
+// the payload exactly
+func segmentLayout(refs []placeholderRef, data []byte, segmentBase int) (offsets, lengths []int, err error) {
+	maxIndex := -1
+	for i := range refs {
+		maxIndex = max(maxIndex, refs[i].index)
+	}
+
+	lengths = make([]int, maxIndex+1)
+	for i := range lengths {
+		lengths[i] = -1
+	}
+	for i := range refs {
+		lengths[refs[i].index] = refs[i].length
+	}
+
+	offsets = make([]int, maxIndex+1)
+	offset := segmentBase
+	for i, l := range lengths {
+		if l < 0 {
+			return nil, nil, fmt.Errorf("invalid CUIB frame: missing placeholder for segment %d", i)
+		}
+		if l > len(data)-offset {
+			return nil, nil, fmt.Errorf("invalid CUIB frame: segment %d exceeds payload size %d", i, len(data))
+		}
+		offsets[i] = offset
+		offset += l
+	}
+	if offset != len(data) {
+		return nil, nil, fmt.Errorf("invalid CUIB frame: expected payload size %d, got %d", offset, len(data))
+	}
+	return offsets, lengths, nil
 }
 
 // placeholderInfo is the strict placeholder check: a map is a placeholder

@@ -3,11 +3,21 @@ package rpc
 import (
 	"context"
 	"fmt"
-	"strconv"
+	"maps"
 	"strings"
 	"sync"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/micro"
+)
+
+const (
+	// a service announces in its metadata that each instance takes chunked
+	// requests on $CUI.SVC.<instance id>.<method path>
+	chunkDirectKey      = "cui.chunk.direct"
+	directSubjectPrefix = "$CUI.SVC."
+	// every method is also served on svc.<service name>.<method path>
+	svcSubjectPrefix = "svc."
 )
 
 // ServiceConfig configures a NATS micro service.
@@ -33,18 +43,35 @@ func NewRPCService(client *Client) *RPCService {
 	}
 }
 
-// RegisterHandler registers an RPC handler as a NATS micro service.
-func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated ...bool) (*Service, error) {
+// RegisterHandler registers an RPC handler as a NATS micro service. Methods
+// take an optional context.Context first parameter as with
+// Client.RegisterHandler; it also ends when the service stops.
+//
+// Every method is served on its bare endpoint subject and on
+// svc.<service name>.<path>, which no other service shares. Each instance also
+// takes chunked requests on $CUI.SVC.<instance id>.<path> and announces that
+// in its metadata under cui.chunk.direct, next to config.Metadata. A request is
+// answered on <its subject>.reply.<id>.
+func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated ...bool) (_ *Service, err error) {
 	client := s.client
 
 	if len(isolated) > 0 && isolated[0] {
+		// a service is bound to its connection, a parent's Suspend and Connect
+		// could not move it, so the isolated client is the service's alone
 		client = s.client.createIsolatedClient("service-" + config.Name)
+		defer func() {
+			if err != nil {
+				_ = client.Disconnect()
+			}
+		}()
 		if err := client.Connect(context.Background()); err != nil {
 			return nil, fmt.Errorf("connect isolated: %w", err)
 		}
 	}
 
+	client.mu.RLock()
 	nc := client.nc
+	client.mu.RUnlock()
 	if nc == nil {
 		return nil, fmt.Errorf("not connected")
 	}
@@ -59,27 +86,40 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 	if config.Queue != "" {
 		microCfg.QueueGroup = config.Queue
 	}
-	if config.Metadata != nil {
-		microCfg.Metadata = config.Metadata
-	}
+	microCfg.Metadata = make(map[string]string, len(config.Metadata)+1)
+	maps.Copy(microCfg.Metadata, config.Metadata)
+	microCfg.Metadata[chunkDirectKey] = "1"
 
 	svc, err := micro.AddService(nc, microCfg)
 	if err != nil {
 		return nil, fmt.Errorf("add service: %w", err)
 	}
+	directPrefix := directSubjectPrefix + svc.Info().ID + "."
 
-	// Track pull iterator cleanups for this service only — scoped so that
-	// stopping one service never tears down another service's live sessions.
-	var pullCleanupsMu sync.Mutex
-	pullIteratorCleanups := make(map[string]func())
+	// stopping one service never ends another service's sessions
+	owner := newSessionOwner()
+	orphan := client.orphanConfig(nil)
 
 	// Create groups for nested paths
 	groups := make(map[string]micro.Group)
+	endpointChunks := make([]*ChunkingManager, 0, len(methods))
+	directSubs := make([]*nats.Subscription, 0, len(methods))
+	release := func() {
+		owner.stop()
+		for _, sub := range directSubs {
+			_ = sub.Unsubscribe()
+		}
+		for _, cm := range endpointChunks {
+			client.removeEndpointChunks(cm)
+			cm.Close()
+		}
+	}
 
 	for path, fn := range methods {
 		parts := strings.Split(path, ".")
 		methodName := parts[len(parts)-1]
 		fnCopy := fn
+		takesCtx := takesContext(fn.Type())
 
 		var target interface {
 			AddEndpoint(string, micro.Handler, ...micro.EndpointOpt) error
@@ -110,48 +150,70 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 			// Handle stream request
 			if isStreamRequest(msg.Params) {
 				streamSubject, args := extractStreamParams(msg.Params)
-				go handleStreamRequestGo(fnCopy, args, streamSubject, msg.ID, client)
+				go handleStreamRequestGo(owner, fnCopy, args, streamSubject, msg.ID, client, orphan, false)
 				return
+			}
+
+			replySubject := fmt.Sprintf("%s.reply.%s", subject, msg.ID)
+			reply := func(result any, err error) {
+				if err != nil {
+					response.Error = FormatErrorObject(err)
+				} else {
+					response.Result = result
+				}
+				if pubErr := client.Publish(replySubject, response); pubErr != nil && client.IsConnected() {
+					_ = client.Publish(replySubject, RPCResponse{ID: msg.ID, Error: FormatErrorObject(pubErr)})
+				}
 			}
 
 			// Handle pull iterator
 			if isPullIteratorRequest(msg.Params) {
 				iteratorID, args := extractPullIteratorParams(msg.Params, msg.ID)
-				cleanup, err := handlePullIteratorRequestGo(fnCopy, args, iteratorID, client, func() {
-					pullCleanupsMu.Lock()
-					delete(pullIteratorCleanups, iteratorID)
-					pullCleanupsMu.Unlock()
+				cleanup, err := handlePullIteratorRequestGo(owner.ctx, fnCopy, args, iteratorID, client, orphan, func() {
+					owner.untrack(&client.pullIteratorCleanups, iteratorID)
 				})
-				if err != nil {
-					response.Error = FormatErrorObject(err)
-					replySubject := fmt.Sprintf("%s.reply.%s", subject, msg.ID)
-					_ = client.Publish(replySubject, response)
-					return
+				if err == nil && cleanup != nil {
+					err = owner.keep(&client.pullIteratorCleanups, iteratorID, cleanup)
 				}
-				pullCleanupsMu.Lock()
-				pullIteratorCleanups[iteratorID] = cleanup
-				pullCleanupsMu.Unlock()
-				response.Result = map[string]any{"iteratorId": iteratorID}
-				replySubject := fmt.Sprintf("%s.reply.%s", subject, msg.ID)
-				_ = client.Publish(replySubject, response)
+				reply(map[string]any{"iteratorId": iteratorID}, err)
+				return
+			}
+
+			if isPullCallbackRequest(msg.Params) {
+				iteratorID, callbackSubject, oneway, args := extractPullCallbackParams(msg.Params, msg.ID)
+				cleanup, err := handlePullCallbackRequestGo(owner.ctx, fnCopy, args, iteratorID, callbackSubject, oneway, client, orphan, func() {
+					owner.untrack(&client.pullIteratorCleanups, iteratorID)
+				})
+				if err == nil && cleanup != nil {
+					err = owner.keep(&client.pullIteratorCleanups, iteratorID, cleanup)
+				}
+				reply(map[string]any{"iteratorId": iteratorID}, err)
+				return
+			}
+
+			if isCallbackRequest(msg.Params) {
+				callbackSubject, args := extractCallbackParams(msg.Params)
+				requestID := msg.ID
+				cleanup, err := handleCallbackRequestGo(owner.ctx, fnCopy, args, callbackSubject, requestID, client, orphan, func() {
+					owner.untrack(&client.callbackCleanups, requestID)
+				})
+				if err == nil {
+					err = owner.keep(&client.callbackCleanups, requestID, cleanup)
+				}
+				reply(map[string]any{"ok": true}, err)
 				return
 			}
 
 			// Normal RPC
-			result, err := callHandler(fnCopy, msg.Params)
-			if err != nil {
-				response.Error = FormatErrorObject(err)
-			} else {
-				response.Result = result
-			}
-
-			replySubject := fmt.Sprintf("%s.reply.%s", subject, msg.ID)
-			_ = client.Publish(replySubject, response)
+			ctx, cancel := callContext(owner.ctx, takesCtx)
+			defer cancel()
+			reply(callHandler(ctx, fnCopy, msg.Params))
 		}
 
-		err := target.AddEndpoint(methodName, micro.HandlerFunc(func(req micro.Request) {
-			headers := req.Headers()
-
+		chunks := newChunkingManager(client.Options.MaxTransferSize, client.chunkBudget)
+		client.addEndpointChunks(chunks)
+		endpointChunks = append(endpointChunks, chunks)
+		handle := func(headers nats.Header, data []byte, subject string) {
 			// Handle chunked transfer
 			chunkType := ""
 			if headers != nil {
@@ -160,19 +222,11 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 
 			switch chunkType {
 			case "header":
-				var hdr ChunkedTransferHeader
-				if err := Decode(req.Data(), &hdr); err != nil {
+				hdr, ok := decodeChunkHeader(headers, data)
+				if !ok {
 					return
 				}
-				chunkID := ""
-				if headers != nil {
-					chunkID = headers.Get("x-chunk-id")
-				}
-				if chunkID == "" || hdr.TransferID != chunkID {
-					return
-				}
-				subject := req.Subject()
-				client.chunkingManager.StartReceiving(
+				chunks.StartReceiving(
 					hdr.TransferID, hdr.TotalChunks,
 					func(data []byte) { processMessage(data, subject) },
 					func(err error) {},
@@ -181,47 +235,47 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 				return
 
 			case "chunk":
-				chunkID := ""
-				chunkIndex := 0
-				if headers != nil {
-					chunkID = headers.Get("x-chunk-id")
-					chunkIndex, _ = strconv.Atoi(headers.Get("x-chunk-index"))
-				}
-				if chunkID == "" {
+				chunk, err := decodeChunk(headers, data)
+				if err != nil {
+					chunks.fail(chunk.ID, err)
 					return
 				}
-				client.chunkingManager.ProcessChunk(ChunkData{
-					ID:         chunkID,
-					ChunkIndex: chunkIndex,
-					Data:       req.Data(),
-				})
+				chunks.ProcessChunk(chunk)
 				return
 			}
 
 			// Non-chunked: process directly
-			processMessage(req.Data(), req.Subject())
-		}))
+			processMessage(data, subject)
+		}
+		endpoint := micro.HandlerFunc(func(req micro.Request) {
+			handle(nats.Header(req.Headers()), req.Data(), req.Subject())
+		})
+
+		// unbounded like the reply mux: a slow consumer error would stop the whole service
+		unbounded := micro.WithEndpointPendingLimits(-1, -1)
+		err := target.AddEndpoint(methodName, endpoint, unbounded)
+		if err == nil {
+			// services sharing a method name each keep their own subject
+			err = svc.AddEndpoint(methodName, endpoint, unbounded, micro.WithEndpointSubject(svcSubjectPrefix+config.Name+"."+path))
+		}
+		if err == nil {
+			var sub *nats.Subscription
+			sub, err = nc.Subscribe(directPrefix+path, func(msg *nats.Msg) { handle(msg.Header, msg.Data, msg.Subject) })
+			if err == nil {
+				_ = sub.SetPendingLimits(-1, -1)
+				directSubs = append(directSubs, sub)
+			}
+		}
 		if err != nil {
 			_ = svc.Stop()
+			release()
 			return nil, fmt.Errorf("add endpoint %s: %w", methodName, err)
 		}
 	}
 
 	wrapped := &Service{
-		svc: svc,
-		// Stop() runs the pull-iterator cleanups this service accumulated.
-		stopCleanups: func() {
-			pullCleanupsMu.Lock()
-			fns := make([]func(), 0, len(pullIteratorCleanups))
-			for _, fn := range pullIteratorCleanups {
-				fns = append(fns, fn)
-			}
-			pullIteratorCleanups = make(map[string]func())
-			pullCleanupsMu.Unlock()
-			for _, fn := range fns {
-				fn()
-			}
-		},
+		svc:          svc,
+		stopCleanups: release,
 	}
 	if len(isolated) > 0 && isolated[0] {
 		wrapped.isolatedClient = client
@@ -310,7 +364,8 @@ func (s *Service) Stats() micro.Stats {
 	return s.svc.Stats()
 }
 
-// Stop stops the service and cleans up its pull-iterator sessions.
+// Stop stops the service and ends its stream and pull-iterator sessions, their
+// clients get a CONNECTION_CLOSED error.
 func (s *Service) Stop() error {
 	if s.stopCleanups != nil {
 		s.stopCleanups()

@@ -1,5 +1,7 @@
 import 'reflect-metadata';
 
+import type { MethodHandler } from './handler.js';
+
 // Metadata keys
 const RPC_METHODS_KEY = Symbol('rpc:methods');
 const RPC_NESTED_KEY = Symbol('rpc:nested');
@@ -59,9 +61,9 @@ export function RPCProperty(target: any, propertyKey: string) {
 export function extractNestedMethodsWithoutDecorators(
   obj: any,
   path: string[] = [],
-  handlers: Record<string, Function> = {},
+  handlers: Record<string, MethodHandler> = {},
   visited = new WeakSet(),
-): Record<string, Function> {
+): Record<string, MethodHandler> {
   if (!obj || typeof obj !== 'object') return handlers;
   if (visited.has(obj)) return handlers;
   visited.add(obj);
@@ -134,9 +136,9 @@ export function extractNestedMethodsWithoutDecorators(
 export function extractNestedMethodsWithDecorators(
   obj: any,
   path: string[] = [],
-  handlers: Record<string, Function> = {},
+  handlers: Record<string, MethodHandler> = {},
   visited = new WeakSet(),
-): Record<string, Function> {
+): Record<string, MethodHandler> {
   if (visited.has(obj)) return handlers;
   visited.add(obj);
 

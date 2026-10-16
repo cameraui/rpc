@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 // StreamValue is a single value received from a push-based stream.
@@ -24,7 +27,7 @@ type PullValue struct {
 // Cancel via the context to stop early.
 func (c *Client) CallStream(ctx context.Context, subject string, args ...any) (<-chan StreamValue, error) {
 	var ch <-chan StreamValue
-	err := c.withNoResponderRetry(ctx, nil, func() error {
+	err := c.withNoResponderRetry(ctx, nil, methodProbe{}, func() error {
 		var callErr error
 		ch, callErr = c.callStreamOnce(ctx, subject, args...)
 		return callErr
@@ -35,13 +38,17 @@ func (c *Client) CallStream(ctx context.Context, subject string, args ...any) (<
 // CallStreamWithOptions is the same as CallStream but with per-call no-responder
 // retry overrides. Pass nil to use client-wide defaults.
 func (c *Client) CallStreamWithOptions(ctx context.Context, subject string, opts *RequestOptions, args ...any) (<-chan StreamValue, error) {
+	return c.callStreamWithOptions(ctx, subject, opts, methodProbe{}, args...)
+}
+
+func (c *Client) callStreamWithOptions(ctx context.Context, subject string, opts *RequestOptions, probe methodProbe, args ...any) (<-chan StreamValue, error) {
 	var override *NoResponderRetryOptions
 	if opts != nil {
 		override = opts.NoResponderRetry
 	}
 
 	var ch <-chan StreamValue
-	err := c.withNoResponderRetry(ctx, override, func() error {
+	err := c.withNoResponderRetry(ctx, override, probe, func() error {
 		var callErr error
 		ch, callErr = c.callStreamOnce(ctx, subject, args...)
 		return callErr
@@ -51,7 +58,7 @@ func (c *Client) CallStreamWithOptions(ctx context.Context, subject string, opts
 
 // callStreamOnce performs a single streaming RPC call attempt.
 func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any) (<-chan StreamValue, error) {
-	if !c.IsConnected() && !c.IsClosed() {
+	if c.needsConnect() {
 		if err := c.Connect(ctx); err != nil {
 			return nil, err
 		}
@@ -78,33 +85,58 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 	var statusOnce sync.Once
 	closeStatus := func() { statusOnce.Do(func() { close(statusDone) }) }
 
-	// ended is shared between the NATS subscription goroutine (push/end/error),
-	// the ctx-cancellation goroutine below, and Disconnect()/Suspend() (which
-	// call sh.end() via streamHandlers). CompareAndSwap makes close(ch)
-	// happen exactly once regardless of which side settles first.
-	var ended atomic.Bool
+	// mu serializes every send on ch with close(ch): the subscription
+	// goroutine pushes while ctx cancel, Disconnect or Suspend may end the
+	// stream. end closes done first, so a push parked on a full buffer lets go
+	var mu sync.Mutex
+	ended := false
+	done := make(chan struct{})
+	var doneOnce sync.Once
+	send := func(v StreamValue) {
+		select {
+		case ch <- v:
+		default:
+			select {
+			case ch <- v:
+			case <-done:
+			}
+		}
+	}
 
 	sh := &streamHandler{
+		subject: subject,
 		push: func(v any) {
-			if !ended.Load() {
-				ch <- StreamValue{Data: v}
+			mu.Lock()
+			if !ended {
+				send(StreamValue{Data: v})
 			}
+			mu.Unlock()
 		},
 		end: func() {
-			if ended.CompareAndSwap(false, true) {
+			doneOnce.Do(func() { close(done) })
+			mu.Lock()
+			if !ended {
+				ended = true
 				close(ch)
 			}
+			mu.Unlock()
+			closeStatus()
 		},
 		error: func(err error) {
-			if ended.CompareAndSwap(false, true) {
-				ch <- StreamValue{Error: err}
+			mu.Lock()
+			if !ended {
+				ended = true
+				send(StreamValue{Error: err})
 				close(ch)
 			}
+			mu.Unlock()
+			closeStatus()
 		},
 	}
 	c.streamHandlers.Store(id, sh)
 
-	// Subscribe to stream messages
+	// a slow consumer backs up into nats.go instead of losing items, as the
+	// reply mux does; the end message must not be dropped either
 	unsub, err := c.Subscribe(streamSubject, func(data []byte) {
 		var msg StreamMessage
 		if err := DecodeMessageInto(data, &msg); err != nil {
@@ -127,7 +159,6 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 			handler.end()
 			c.streamHandlers.Delete(msg.ID)
 			c.statusHandlers.Delete(msg.ID)
-			closeStatus()
 		case "error":
 			if msg.Error != nil {
 				handler.error(RPCExceptionFromError(msg.Error))
@@ -136,26 +167,26 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 			}
 			c.streamHandlers.Delete(msg.ID)
 			c.statusHandlers.Delete(msg.ID)
-			closeStatus()
 		}
-	})
+	}, func(sub *nats.Subscription) { _ = sub.SetPendingLimits(-1, -1) })
 	if err != nil {
 		c.streamHandlers.Delete(id)
-		close(ch)
+		sh.end()
 		return nil, err
 	}
 
-	// Handle context cancellation
+	// ends with ctx or with the stream itself (end, error, late 503,
+	// Disconnect, Suspend), so a finished stream does not keep its subscription
 	go func() {
-		<-ctx.Done()
-		if _, ok := c.streamHandlers.LoadAndDelete(id); ok {
-			_ = c.Publish(streamSubject+".cancel", map[string]any{"id": id})
-			if ended.CompareAndSwap(false, true) {
-				close(ch)
-			}
+		select {
+		case <-ctx.Done():
+		case <-statusDone:
 		}
+		if _, ok := c.streamHandlers.LoadAndDelete(id); ok && ctx.Err() != nil {
+			_ = c.Publish(streamSubject+".cancel", map[string]any{"id": id})
+		}
+		sh.end()
 		c.statusHandlers.Delete(id)
-		closeStatus()
 		unsub()
 	}()
 
@@ -165,10 +196,10 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 	// removes the handler when it fires. The buffered channel lets us detect
 	// the common synchronous case (no responders at publish time) below and
 	// return an error the retry wrapper can act on.
-	noRespCh := make(chan error, 1)
+	noRespCh := make(chan *RPCException, 1)
 	c.statusHandlers.Store(id, func(error) {
 		select {
-		case noRespCh <- NewRPCException(ErrCodeNotFound, "No responders for "+subject):
+		case noRespCh <- noRespondersException(subject, "No responders for "+subject):
 		default:
 		}
 	})
@@ -187,9 +218,8 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 	if err := c.publishInternal(subject, message, "rpc.reply."+id); err != nil {
 		c.streamHandlers.Delete(id)
 		c.statusHandlers.Delete(id)
-		closeStatus()
+		sh.end()
 		unsub()
-		close(ch)
 		return nil, err
 	}
 
@@ -201,10 +231,9 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 	case noRespErr := <-noRespCh:
 		c.streamHandlers.Delete(id)
 		c.statusHandlers.Delete(id)
-		closeStatus()
+		sh.end()
 		unsub()
-		close(ch)
-		return nil, noRespErr
+		return nil, &localNoResponders{err: noRespErr}
 	default:
 	}
 
@@ -227,9 +256,15 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 
 // CallPullIterator makes a pull-based iterator RPC call.
 // Returns a channel that yields PullValue items on demand.
-// Cancel via the context to stop early.
+// Cancel via the context to stop early. When ctx ends while the call is still
+// being set up, the call returns at once and the session the responder sets
+// up anyway is cancelled when its answer arrives.
 func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...any) (<-chan PullValue, error) {
-	if !c.IsConnected() && !c.IsClosed() {
+	return c.callPullIterator(ctx, subject, nil, args...)
+}
+
+func (c *Client) callPullIterator(ctx context.Context, subject string, opts *RequestOptions, args ...any) (<-chan PullValue, error) {
+	if c.needsConnect() {
 		if err := c.Connect(ctx); err != nil {
 			return nil, err
 		}
@@ -252,18 +287,8 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 		IteratorID:   iteratorID,
 		Args:         args,
 	}
-	initResult, err := c.Call(ctx, subject, initParams)
-	if err != nil {
-		return nil, fmt.Errorf("init pull iterator: %w", err)
-	}
-
-	// Validate response contains iteratorId
-	if m, ok := initResult.(map[string]any); ok {
-		if retID, ok := m["iteratorId"].(string); !ok || retID != iteratorID {
-			return nil, fmt.Errorf("failed to initialize pull iterator")
-		}
-	} else {
-		return nil, fmt.Errorf("failed to initialize pull iterator: unexpected response type")
+	if err := c.initPullSession(ctx, subject, "pull iterator", iteratorID, opts, initParams); err != nil {
+		return nil, err
 	}
 
 	ch := make(chan PullValue, 1)
@@ -305,13 +330,10 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 		// inbox (one-shot; replaces the previous lack of any detection /
 		// Node's per-iterator max:1 status inbox). The handler feeds an
 		// error response into the regular response path.
+		noResponders := &RPCError{Code: "503", Message: "No responders for " + subject}
 		c.statusHandlers.Store(iteratorID, func(error) {
 			if !ended.Load() {
-				respCh <- PullIteratorResponse{
-					ID:    iteratorID,
-					Type:  "error",
-					Error: &RPCError{Code: "503", Message: "No responders for " + subject},
-				}
+				respCh <- PullIteratorResponse{ID: iteratorID, Type: "error", Error: noResponders}
 			}
 		})
 		defer c.statusHandlers.Delete(iteratorID)
@@ -375,7 +397,7 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 				case "error":
 					var pv PullValue
 					if resp.Error != nil {
-						pv = PullValue{Error: RPCExceptionFromError(resp.Error)}
+						pv = PullValue{Error: pullError(resp.Error, noResponders, subject)}
 					} else {
 						pv = PullValue{Error: NewRPCException(ErrCodeStreamError, "Iterator error")}
 					}
@@ -394,4 +416,70 @@ func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...a
 	}()
 
 	return ch, nil
+}
+
+// a cancel that overtakes the init call reaches no session yet, so the call
+// runs on to its own timeout, past ctx's deadline too; one cancel follows
+// every init that went out and did not hand its session over
+func (c *Client) initPullSession(ctx context.Context, subject, kind, iteratorID string, opts *RequestOptions, params any) error {
+	cancelled := func(err error) error {
+		return fmt.Errorf("init %s: %w", kind, NewRPCException(ErrCodeTimeout, fmt.Sprintf("RPC call to %q context cancelled: %v", subject, err)))
+	}
+	if err := ctx.Err(); err != nil {
+		return cancelled(err)
+	}
+	sendCancel := func() {
+		_ = c.Publish("_rpc.iterator."+iteratorID+".request", PullIteratorRequest{ID: iteratorID, Type: "cancel"})
+	}
+	call := func(ctx context.Context) error {
+		result, err := c.CallWithOptions(ctx, subject, opts, params)
+		if err != nil {
+			err = fmt.Errorf("init %s: %w", kind, err)
+		} else if m, ok := result.(map[string]any); !ok {
+			err = fmt.Errorf("failed to initialize %s: unexpected response type", kind)
+		} else if id, ok := m["iteratorId"].(string); !ok || id != iteratorID {
+			err = fmt.Errorf("failed to initialize %s", kind)
+		}
+		if err != nil {
+			sendCancel()
+		}
+		return err
+	}
+	if ctx.Done() == nil {
+		return call(ctx)
+	}
+
+	detached, stop := context.WithoutCancel(ctx), context.CancelFunc(func() {})
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout := c.Options.Timeout
+		if opts != nil && opts.Timeout > 0 {
+			timeout = opts.Timeout
+		}
+		detached, stop = context.WithTimeout(detached, max(timeout, time.Until(deadline)))
+	}
+	done := make(chan error, 1)
+	go func() {
+		defer stop()
+		done <- call(detached)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		go func() {
+			if <-done == nil {
+				sendCancel()
+			}
+		}()
+		return cancelled(ctx.Err())
+	}
+}
+
+// the 503 of a next request is a no-responder this client saw itself
+func pullError(e, local *RPCError, subject string) *RPCException {
+	ex := RPCExceptionFromError(e)
+	if e == local {
+		ex.upstream = subject
+	}
+	return ex
 }

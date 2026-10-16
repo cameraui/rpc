@@ -213,7 +213,8 @@ describe('message codec (CUIB wire format)', () => {
     });
 
     it('round-trips multiple binaries and keeps their contents distinct', () => {
-      const a = bytes(T, 1);      const b = bytes(T + 2048, 2);
+      const a = bytes(T, 1);
+      const b = bytes(T + 2048, 2);
       const c = bytes(T + 1, 3);
       const message = { params: [a, { b }, [c]] };
       const result = messageRoundtrip(message);
@@ -279,7 +280,7 @@ describe('message codec (CUIB wire format)', () => {
     });
 
     it('does not replace a user map with a non-integer "l"', () => {
-      const message = { params: [{ __cui_bin__: 0, l: "nope" }, bytes(T)] };
+      const message = { params: [{ __cui_bin__: 0, l: 'nope' }, bytes(T)] };
       const result = messageRoundtrip<any>(message);
       expect(result.params[0]).toEqual({ __cui_bin__: 0, l: 'nope' });
     });
@@ -320,6 +321,52 @@ describe('message codec (CUIB wire format)', () => {
     });
   });
 
+  describe('binary walk', () => {
+    it('reads each property once during extraction', () => {
+      let reads = 0;
+      const message = {
+        get value() {
+          reads++;
+          return 7;
+        },
+      };
+      encodeMessage(message);
+      // one read by the walk, one by msgpack
+      expect(reads).toBe(2);
+    });
+
+    it('ignores enumerable keys inherited from a polluted prototype', () => {
+      const proto = Object.prototype as Record<string, unknown>;
+      proto.polluted = bytes(T);
+      try {
+        const message = { id: 'a', params: [{ x: 1 }] };
+        expect(Buffer.from(encodeMessage(message))).toEqual(Buffer.from(encode(message)));
+      } finally {
+        delete proto.polluted;
+      }
+    });
+
+    it('assigns placeholder indices in Object.keys order, integer-like keys first', () => {
+      const message = { b: bytes(T, 1), 1: bytes(T, 2), a: { deep: [0, bytes(T, 3)] } };
+      const encoded = encodeMessage(message);
+      const envLen = new DataView(encoded.buffer, encoded.byteOffset).getUint32(4, true);
+      const envelope = decode<any>(encoded.subarray(8, 8 + envLen));
+      expect(envelope[1].__cui_bin__).toBe(0);
+      expect(envelope.b.__cui_bin__).toBe(1);
+      expect(envelope.a.deep[1].__cui_bin__).toBe(2);
+      const result = decodeMessage<any>(encoded);
+      expect([result[1][0], result.b[0], result.a.deep[1][0]]).toEqual([2, 1, 3]);
+    });
+
+    it('walks null-prototype objects and skips primitive roots', () => {
+      const message = Object.assign(Object.create(null), { data: bytes(T, 9) });
+      expect(decodeMessage<any>(encodeMessage(message)).data[0]).toBe(9);
+      for (const value of [1, 'x', null, true]) {
+        expect(Buffer.from(encodeMessage(value))).toEqual(Buffer.from(encode(value)));
+      }
+    });
+  });
+
   describe('frame validation', () => {
     it('rejects a frame whose envelope length exceeds the payload', () => {
       const encoded = encodeMessage({ params: [bytes(T)] });
@@ -338,5 +385,77 @@ describe('message codec (CUIB wire format)', () => {
       padded.set(encoded, 0);
       expect(() => decodeMessage(padded)).toThrow(/expected payload size/);
     });
+  });
+});
+
+describe('typed arrays other than Uint8Array', () => {
+  // the bytes a value holds, little-endian on every platform this runs on
+  function bytesOf(value: ArrayBufferView): Buffer {
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  }
+
+  function views(byteLength: number): [string, ArrayBufferView][] {
+    const source = new Uint8Array(byteLength + 16);
+    for (let i = 0; i < source.length; i++) source[i] = (i * 37 + 11) & 0xff;
+    // offset 8 keeps every element type aligned and shows that only the view's own bytes go out
+    const buffer = source.buffer;
+    return [
+      ['Float32Array', new Float32Array(buffer, 8, byteLength / 4)],
+      ['Float64Array', new Float64Array(buffer, 8, byteLength / 8)],
+      ['Int16Array', new Int16Array(buffer, 8, byteLength / 2)],
+      ['Uint8ClampedArray', new Uint8ClampedArray(buffer, 8, byteLength)],
+      ['DataView', new DataView(buffer, 8, byteLength)],
+    ];
+  }
+
+  for (const size of [8, 1024, 16376, 16384, 32768]) {
+    it(`arrives as its exact bytes at ${size} bytes`, () => {
+      for (const [name, view] of views(size)) {
+        // a message before may leave other bytes in msgpackr's shared buffer
+        encodeMessage({ secret: 'MARKER'.repeat(4000) });
+        const wire = encodeMessage({ name, view, nested: [{ view }] });
+        const decoded = decodeMessage(wire);
+
+        expect(decoded.view, name).toBeInstanceOf(Uint8Array);
+        expect(bytesOf(decoded.view).equals(bytesOf(view)), name).toBe(true);
+        expect(bytesOf(decoded.nested[0].view).equals(bytesOf(view)), name).toBe(true);
+        expect(Buffer.from(wire).includes('MARKER'), name).toBe(false);
+      }
+    });
+  }
+
+  it('encodes a typed array on its own as its bytes', () => {
+    const value = new Int16Array([1, -2, 3]);
+    expect(bytesOf(decodeMessage(encodeMessage(value))).equals(bytesOf(value))).toBe(true);
+  });
+
+  it('keeps messages without such views byte-identical to encode()', () => {
+    const message = { id: 'a', params: [1, 'x', { deep: [true, null] }], blob: new Uint8Array([1, 2, 3]) };
+    expect(Buffer.from(encodeMessage(message)).equals(Buffer.from(encode(message)))).toBe(true);
+  });
+});
+
+describe('binaries after decodeMessage', () => {
+  it('are Buffer views whether the payload came as a Buffer or a plain Uint8Array', () => {
+    const small = { blob: Buffer.from([1, 2, 3]), nested: [{ blob: new Uint8Array([4, 5]) }] };
+    const framed = { frame: new Uint8Array(BINARY_EXTRACT_THRESHOLD).fill(7) };
+
+    for (const message of [small, framed]) {
+      const wire = encodeMessage(message);
+      const plain = new Uint8Array(wire.byteLength + 4).subarray(2, 2 + wire.byteLength);
+      plain.set(wire);
+      for (const data of [wire, plain]) {
+        const decoded = decodeMessage(data);
+        const binaries = 'frame' in decoded ? [decoded.frame] : [decoded.blob, decoded.nested[0].blob];
+        for (const binary of binaries) expect(Buffer.isBuffer(binary)).toBe(true);
+      }
+    }
+  });
+
+  it('views the payload instead of copying it', () => {
+    const wire = encodeMessage({ frame: new Uint8Array(BINARY_EXTRACT_THRESHOLD).fill(1) });
+    const plain = new Uint8Array(wire);
+    const decoded = decodeMessage(plain);
+    expect(decoded.frame.buffer).toBe(plain.buffer);
   });
 });

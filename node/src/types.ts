@@ -28,7 +28,15 @@ export interface RPCClient {
   registerHandler(
     namespace: string,
     handlers: object,
-    options?: { isolatedConnection?: boolean; withoutDecorators?: boolean; queue?: string },
+    options?: {
+      isolatedConnection?: boolean;
+      withoutDecorators?: boolean;
+      queue?: string;
+      concurrency?: Record<string, number>;
+      orphanProbe?: OrphanProbeOptions | false;
+      namespaceSubscription?: boolean;
+      dropExpired?: boolean | string[];
+    },
   ): Promise<() => Promise<void>>;
   callWithCallback<TResponse = any>(subject: string, args: any[], callback: (value: TResponse) => void | Promise<void>): Promise<() => void>;
   callPullIteratorWithCallback(
@@ -40,10 +48,10 @@ export interface RPCClient {
   channel(channelId: string, options?: { isolatedConnection?: boolean }): Promise<Channel>;
   privateChannel(channelId: string, targetClientId: string, options?: { isolatedConnection?: boolean }): Promise<PrivateChannel>;
   createProxy<T extends object>(namespace: string): Promisify<T>;
-  createProxy<T extends object>(namespace: string, options: { isolatedConnection?: false; onTiming?: ProxyTimingReporter }): Promisify<T>;
+  createProxy<T extends object>(namespace: string, options: { isolatedConnection?: false; onTiming?: ProxyTimingReporter } & ProxyCallOptions): Promisify<T>;
   createProxy<T extends object>(
     namespace: string,
-    options: { isolatedConnection: true },
+    options: { isolatedConnection: true } & ProxyCallOptions,
   ): {
     proxy: Promisify<T>;
     close: () => Promise<void>;
@@ -138,8 +146,43 @@ export interface RPCClientOptions {
     ca: string;
   };
 
-  /** Maximum payload size in bytes (default: auto-detect from NATS server) */
+  /** Cap on the message size in bytes (default and 0: the server's max_payload).
+   *  The client uses the smaller of this and the server's limit, less 8 KiB,
+   *  and sends bigger messages in chunks. Set it below the server's limit
+   *  when messages cross a leaf link to a server with a smaller max_payload.
+   *  Any other value below 16384 or not an integer throws. With a server
+   *  limit below 16384 nothing is chunked: a message up to that limit goes
+   *  out whole, a bigger one fails with PAYLOAD_TOO_LARGE. */
   maxPayloadSize?: number;
+
+  /** Largest chunked message this client accepts, in bytes (default and 0: 1 GiB),
+   *  and the most all chunked messages it is receiving may hold together. A
+   *  chunk header announcing more is dropped before anything is allocated. */
+  maxTransferSize?: number;
+
+  /** Write large binary arguments of call() and proxy calls to the socket
+   *  without copying them (default: false). A binary argument must not be
+   *  changed or released until its call settles; disconnect() and suspend()
+   *  settle pending calls only once the socket is closed. A call that timed
+   *  out can still have its request in the socket queue: do not reuse or
+   *  release that buffer, leave it to the garbage collector.
+   *  publish(), streams, callbacks and replies always copy. Node only. */
+  zeroCopyBinaries?: boolean;
+
+  /** How long requests that a handler registration has already received may
+   *  take to finish on disconnect(), suspend() and the cleanup returned by
+   *  registerHandler(), in ms (default: 250, 0: stop at once without
+   *  answering them). The registration stops taking requests first, so a
+   *  caller sees no responder and its retry can reach another instance.
+   *  Requests still unanswered at the deadline get CONNECTION_CLOSED.
+   *  Stream, pull and callback sessions end at once. */
+  drainTimeoutMs?: number;
+
+  /** How a handler notices that the consumer of a stream, callback,
+   *  pull-iterator or pull-callback session went away without cancelling
+   *  (default: on, see OrphanProbeOptions). false turns it off.
+   *  registerHandler() takes the same option for one registration. */
+  orphanProbe?: OrphanProbeOptions | false;
 
   /** Block connect() until the first connection succeeds (default: true).
    *  Set to false for browser clients where disconnect() must be able to
@@ -152,13 +195,35 @@ export interface RPCClientOptions {
    *  Default: 2000 */
   disconnectTimeout?: number;
 
-  /** Retry configuration for 503 / no-responder errors. */
+  /** Retry configuration for 503 / no-responder errors. Without both fields
+   *  a call retries after 25, 50, 100, 325, 1000 and 2000 ms, about 3.5 s in
+   *  all. With only delays it retries 3 times, with only maxRetries it waits
+   *  500, 1000 and then 2000 ms. */
   noResponderRetry?: {
-    /** Maximum number of retries (default: 3) */
+    /** Maximum number of retries (default: 6 without delays, 3 with delays) */
     maxRetries?: number;
-    /** Delay in ms before each retry attempt (default: [500, 1000, 2000]) */
+    /** Delay in ms before each retry attempt, the last one repeats (default: [25, 50, 100, 325, 1000, 2000], or [500, 1000, 2000] when only maxRetries is set) */
     delays?: number[];
   };
+}
+
+/**
+ * Liveness probe of the stream, callback, pull-iterator and pull-callback
+ * sessions a handler serves. At most once per intervalMs a publish of the
+ * session asks the server to report it when nobody listens. A session without
+ * a publish in that time sends a probe instead: a stream or callback session
+ * a message of type 'ping' on its subject, a pull session `{ type: 'ping' }`
+ * to rpc.reply.<iterator id>, the consumer's reply inbox. Consumers drop
+ * them. When the probes keep finding no responders for graceMs, the session
+ * ends as if the consumer had cancelled. A consumer gone for longer than
+ * graceMs, also one that reconnects later, finds its session ended.
+ */
+export interface OrphanProbeOptions {
+  /** Least time between two probes of a session, in ms (default: 30000, also for 0) */
+  intervalMs?: number;
+
+  /** How long probes must find no responders before the session ends, in ms (default: 300000, also for 0) */
+  graceMs?: number;
 }
 
 /**
@@ -194,6 +259,14 @@ export interface RPCMessage<T = any> {
    * old responders ignore it and the caller simply sees no timing back.
    */
   __timing?: boolean;
+
+  /**
+   * How long the caller still waits for the answer when it sends the request,
+   * in ms (internal metadata). A responder that opted in with dropExpired
+   * skips a request that waited longer than this in its queue. Old
+   * responders ignore it.
+   */
+  __ttl?: number;
 }
 
 /**
@@ -231,6 +304,23 @@ export interface RPCTiming {
 
 /** Receives what every call of a timed proxy cost. */
 export type ProxyTimingReporter = (method: string, timing: RPCCallTiming) => void;
+
+/**
+ * Per-proxy settings for the plain calls of a proxy and its nested proxies.
+ * Streams, pull iterators and callback subscriptions keep the client options.
+ */
+export interface ProxyCallOptions {
+  /** Retry for no-responder errors, overrides the client option. `maxRetries: 0` turns it off. */
+  noResponderRetry?: {
+    /** Maximum number of retries */
+    maxRetries?: number;
+    /** Delay in ms before each retry attempt */
+    delays?: number[];
+  };
+
+  /** Timeout in ms for each attempt, overrides the client's `timeout` */
+  timeout?: number;
+}
 
 /** What a timed call cost, split into the responder's share and the rest. */
 export interface RPCCallTiming {
@@ -298,8 +388,8 @@ export interface StreamMessage<T = any> {
   /** Stream ID (same as request ID) */
   id: string;
 
-  /** Message type */
-  type: 'data' | 'end' | 'error';
+  /** Message type, 'ping' is the liveness probe of an idle stream, consumers drop it */
+  type: 'data' | 'end' | 'error' | 'ping';
 
   /** Data payload (for 'data' type) */
   data?: T;
@@ -350,7 +440,8 @@ export interface CallbackParams {
  */
 export interface CallbackMessage<T = any> {
   id: string;
-  type: 'data' | 'error';
+  /** 'ping' is the liveness probe of an idle session, consumers drop it */
+  type: 'data' | 'error' | 'ping';
   data?: T;
   error?: RPCError;
 }
@@ -405,6 +496,8 @@ export const ERROR_CODES = {
   STREAM_ERROR: 'STREAM_ERROR',
   PAYLOAD_TOO_LARGE: 'PAYLOAD_TOO_LARGE',
   NOT_FOUND: 'NOT_FOUND',
+  /** The server does not let this connection publish to the request's subject. */
+  FORBIDDEN: 'FORBIDDEN',
 } as const;
 
 /**

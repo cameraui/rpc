@@ -1,5 +1,12 @@
 package rpc
 
+import (
+	"math"
+
+	"github.com/vmihailenco/msgpack/v5"
+	"github.com/vmihailenco/msgpack/v5/msgpcode"
+)
+
 // RPCMessage is the wire-format for an RPC request.
 //
 // Discover is the method-discovery request marker (internal metadata for
@@ -15,7 +22,16 @@ type RPCMessage struct {
 	// Timing asks the responder to stamp its clock around the handler and
 	// return both stamps in the response. Old responders ignore it.
 	Timing bool `msgpack:"__timing,omitempty"`
+	// TTL is how many milliseconds the caller waits for the reply. A method
+	// registered with WithDropExpired skips a call that waited longer than
+	// that before it could start. Old responders ignore it.
+	TTL Milliseconds `msgpack:"__ttl,omitempty"`
 }
+
+// Milliseconds is a count of milliseconds on the wire. It decodes from any
+// msgpack number, a fraction rounded up, and reads any other value as 0, so a
+// peer that sends a float or a stray value never fails the whole message.
+type Milliseconds int64
 
 // RPCResponse is the wire-format for an RPC response.
 type RPCResponse struct {
@@ -140,4 +156,32 @@ type PullCallbackParams struct {
 type CallbackInvocation struct {
 	Method string `msgpack:"method"`
 	Args   []any  `msgpack:"args"`
+}
+
+// DecodeMsgpack implements msgpack.CustomDecoder.
+func (m *Milliseconds) DecodeMsgpack(dec *msgpack.Decoder) error {
+	code, err := dec.PeekCode()
+	if err != nil {
+		return err
+	}
+	*m = 0
+	switch {
+	case code == msgpcode.Float || code == msgpcode.Double:
+		f, err := dec.DecodeFloat64()
+		if err != nil {
+			return err
+		}
+		if f > 0 && f < math.MaxInt64 {
+			*m = Milliseconds(math.Ceil(f))
+		}
+		return nil
+	case msgpcode.IsFixedNum(code) || (code >= msgpcode.Uint8 && code <= msgpcode.Int64):
+		n, err := dec.DecodeInt64()
+		if err != nil {
+			return err
+		}
+		*m = Milliseconds(n)
+		return nil
+	}
+	return dec.Skip()
 }

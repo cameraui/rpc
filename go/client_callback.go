@@ -9,10 +9,14 @@ import (
 // The callback is invoked for each value pushed by the handler.
 // Returns an unsubscribe function.
 func CallWithCallback[T any](client *Client, subject string, args []any, callback func(T)) (func(), error) {
+	return callWithCallback(client, subject, nil, args, callback)
+}
+
+func callWithCallback[T any](client *Client, subject string, opts *RequestOptions, args []any, callback func(T)) (func(), error) {
 	id := client.generateID()
 	callbackSubject := fmt.Sprintf("rpc.cb.%s", id)
 
-	if !client.IsConnected() && !client.IsClosed() {
+	if client.needsConnect() {
 		if err := client.Connect(context.Background()); err != nil {
 			return nil, err
 		}
@@ -28,13 +32,9 @@ func CallWithCallback[T any](client *Client, subject string, args []any, callbac
 			if val, ok := msg.Data.(T); ok {
 				callback(val)
 			} else {
-				// Try coercion via re-encode/decode
-				encoded, err := Encode(msg.Data)
-				if err == nil {
-					var typed T
-					if err := Decode(encoded, &typed); err == nil {
-						callback(typed)
-					}
+				var typed T
+				if err := convertPooled(msg.Data, &typed); err == nil {
+					callback(typed)
 				}
 			}
 		}
@@ -51,7 +51,7 @@ func CallWithCallback[T any](client *Client, subject string, args []any, callbac
 	}
 
 	// Use standard call to get initial response
-	resp, err := client.Call(context.Background(), subject, callbackParams)
+	resp, err := client.CallWithOptions(context.Background(), subject, opts, callbackParams)
 	if err != nil {
 		unsub()
 		return nil, err

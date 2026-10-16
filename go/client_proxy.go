@@ -3,8 +3,19 @@ package rpc
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 )
+
+// the first retry delays are shorter than a remote namespace takes to answer
+// __methods, the probe gets at least this long
+const methodProbeWindow = 500 * time.Millisecond
+
+type methodProbe struct {
+	proxy  *Proxy
+	method string
+}
 
 // Proxy provides a convenient way to make RPC calls to a specific namespace.
 // Since Go doesn't have JS-style dynamic proxies, this uses explicit method calls.
@@ -12,6 +23,7 @@ type Proxy struct {
 	client    *Client
 	namespace string
 	path      []string
+	opts      *RequestOptions
 }
 
 // CreateProxy creates a new RPC proxy for the given namespace.
@@ -40,7 +52,7 @@ func (c *Client) CreateIsolatedProxy(namespace string) (*Proxy, func() error, er
 	}
 
 	closeFunc := func() error {
-		return isolated.Disconnect()
+		return c.releaseIsolated(isolated)
 	}
 
 	return proxy, closeFunc, nil
@@ -54,25 +66,38 @@ func (p *Proxy) Sub(name string) *Proxy {
 		client:    p.client,
 		namespace: p.namespace,
 		path:      append(append([]string{}, p.path...), name),
+		opts:      p.opts,
 	}
 }
 
-// Invoke makes a normal RPC call through the proxy.
-func (p *Proxy) Invoke(ctx context.Context, method string, args ...any) (any, error) {
-	subject := p.buildSubject(method)
-	return p.client.Call(ctx, subject, args...)
+// WithOptions returns a copy of the proxy whose calls use opts for the
+// per-call timeout and no-responder retry, as CallWithOptions does. Sub proxies
+// of the copy inherit the options. Streams use only the retry part.
+func (p *Proxy) WithOptions(opts RequestOptions) *Proxy {
+	cp := *p
+	cp.opts = &opts
+	return &cp
 }
 
-// InvokeStream makes a push-based streaming RPC call through the proxy.
+// Invoke makes a normal RPC call through the proxy. When nobody serves the
+// method but the namespace is up, the call fails at once with the no-responder
+// error instead of retrying.
+func (p *Proxy) Invoke(ctx context.Context, method string, args ...any) (any, error) {
+	subject := p.buildSubject(method)
+	return p.client.callWithOptions(ctx, subject, p.opts, methodProbe{p, method}, args...)
+}
+
+// InvokeStream makes a push-based streaming RPC call through the proxy. A
+// method the namespace does not serve fails at once, as in Invoke.
 func (p *Proxy) InvokeStream(ctx context.Context, method string, args ...any) (<-chan StreamValue, error) {
 	subject := p.buildSubject(method)
-	return p.client.CallStream(ctx, subject, args...)
+	return p.client.callStreamWithOptions(ctx, subject, p.opts, methodProbe{p, method}, args...)
 }
 
 // InvokePullIterator makes a pull-based iterator RPC call through the proxy.
 func (p *Proxy) InvokePullIterator(ctx context.Context, method string, args ...any) (<-chan PullValue, error) {
 	subject := p.buildSubject(method)
-	return p.client.CallPullIterator(ctx, subject, args...)
+	return p.client.callPullIterator(ctx, subject, p.opts, args...)
 }
 
 // InvokeCallback makes a callback subscription RPC call through the proxy.
@@ -80,7 +105,7 @@ func (p *Proxy) InvokePullIterator(ctx context.Context, method string, args ...a
 // Returns an unsubscribe function.
 func (p *Proxy) InvokeCallback(method string, args []any, callback func(any)) (func(), error) {
 	subject := p.buildSubject(method)
-	return CallWithCallback(p.client, subject, args, callback)
+	return callWithCallback(p.client, subject, p.opts, args, callback)
 }
 
 // InvokePullIteratorWithCallback makes a pull-iterator-with-callbacks call.
@@ -93,7 +118,7 @@ func (p *Proxy) InvokePullIteratorWithCallback(
 	args ...any,
 ) (<-chan PullValue, error) {
 	subject := p.buildSubject(method)
-	return p.client.CallPullIteratorWithCallback(ctx, subject, callbacks, oneway, args...)
+	return p.client.callPullIteratorWithCallback(ctx, subject, p.opts, callbacks, oneway, args...)
 }
 
 func (p *Proxy) buildSubject(method string) string {
@@ -110,6 +135,32 @@ func (p *Proxy) String() string {
 		return fmt.Sprintf("[RPCProxy %s.%s]", p.namespace, strings.Join(p.path, "."))
 	}
 	return fmt.Sprintf("[RPCProxy %s]", p.namespace)
+}
+
+// gone closes once the namespace answers without the method, every later retry
+// wait sees it; an old responder, a dead namespace or no answer leave it open
+func (m methodProbe) start(ctx context.Context, delay time.Duration) (gone <-chan struct{}, stop context.CancelFunc) {
+	probeCtx, cancel := context.WithTimeout(ctx, max(delay, methodProbeWindow))
+	missing := make(chan struct{})
+	go func() {
+		if m.missing(probeCtx) {
+			close(missing)
+		}
+	}()
+	return missing, cancel
+}
+
+func (m methodProbe) missing(ctx context.Context) bool {
+	name := m.method
+	if len(m.proxy.path) > 0 {
+		name = strings.Join(m.proxy.path, ".") + "." + m.method
+	}
+	result, err := m.proxy.client.callOnce(ctx, "rpc."+m.proxy.namespace+"."+methodsSubject, 0)
+	if err != nil {
+		return false
+	}
+	names, ok := result.([]any)
+	return ok && !slices.Contains(names, any(name))
 }
 
 // ServiceProxy provides RPC calls to a discovered NATS micro service.
@@ -134,18 +185,26 @@ func (c *Client) CreateServiceProxy(ctx context.Context, serviceName string, opt
 		c.isolatedClientsMu.Lock()
 		c.isolatedClients = append(c.isolatedClients, client)
 		c.isolatedClientsMu.Unlock()
+	}
+	fail := func(err error) (*ServiceProxy, error) {
+		if cfg.isolated {
+			_ = c.releaseIsolated(client)
+		}
+		return nil, err
+	}
+	if cfg.isolated {
 		if err := client.Connect(ctx); err != nil {
-			return nil, err
+			return fail(err)
 		}
 	}
 
 	monitor := NewServiceMonitor(client)
 	services, err := monitor.Info(ctx, serviceName)
 	if err != nil {
-		return nil, fmt.Errorf("discover service: %w", err)
+		return fail(fmt.Errorf("discover service: %w", err))
 	}
 	if len(services) == 0 {
-		return nil, fmt.Errorf("no services found with name: %s", serviceName)
+		return fail(fmt.Errorf("no services found with name: %s", serviceName))
 	}
 
 	selected := services[0]
@@ -172,22 +231,31 @@ func (c *Client) CreateServiceProxy(ctx context.Context, serviceName string, opt
 // Close disconnects the isolated connection if one was created.
 func (sp *ServiceProxy) Close() error {
 	if sp.isolatedClient != nil {
-		err := sp.isolatedClient.Disconnect()
 		if sp.parentClient != nil {
-			sp.parentClient.removeIsolatedClient(sp.isolatedClient)
+			return sp.parentClient.releaseIsolated(sp.isolatedClient)
 		}
-		return err
+		return sp.isolatedClient.Disconnect()
 	}
 	return nil
 }
 
-// Invoke calls a method on the service.
+// Invoke calls a method on the service. A request too large for one message
+// goes to the instance the proxy found, when that instance takes chunked
+// requests on its own subject; with several instances behind one queue its
+// chunks would otherwise be spread over them.
 func (sp *ServiceProxy) Invoke(ctx context.Context, method string, args ...any) (any, error) {
 	subject := sp.findEndpointSubject(method)
 	if subject == "" {
 		return nil, NewRPCException(ErrCodeMethodNotFound, fmt.Sprintf("endpoint %s not found", method))
 	}
-	return sp.client.Call(ctx, subject, args...)
+	direct := sp.directSubject(method)
+	var result any
+	err := sp.client.withNoResponderRetry(ctx, nil, methodProbe{}, func() error {
+		var callErr error
+		result, callErr = sp.client.callOnceTo(ctx, subject, direct, 0, args...)
+		return callErr
+	})
+	return result, err
 }
 
 // InvokeStream calls a streaming method on the service.
@@ -244,10 +312,22 @@ func (sp *ServiceProxy) Sub(name string) *ServiceProxy {
 	}
 }
 
-func (sp *ServiceProxy) findEndpointSubject(method string) string {
-	fullPath := method
+func (sp *ServiceProxy) fullPath(method string) string {
 	if len(sp.path) > 0 {
-		fullPath = strings.Join(sp.path, ".") + "." + method
+		return strings.Join(sp.path, ".") + "." + method
+	}
+	return method
+}
+
+// the subject of this service alone first, the bare one of an older responder
+// may also reach another service with a method of the same name
+func (sp *ServiceProxy) findEndpointSubject(method string) string {
+	fullPath := sp.fullPath(method)
+	own := svcSubjectPrefix + sp.info.Name + "." + fullPath
+	for _, ep := range sp.info.Endpoints {
+		if ep.Subject == own {
+			return own
+		}
 	}
 
 	for _, ep := range sp.info.Endpoints {
@@ -264,6 +344,13 @@ func (sp *ServiceProxy) findEndpointSubject(method string) string {
 		}
 	}
 	return ""
+}
+
+func (sp *ServiceProxy) directSubject(method string) string {
+	if sp.info.ID == "" || sp.info.Metadata[chunkDirectKey] != "1" {
+		return ""
+	}
+	return directSubjectPrefix + sp.info.ID + "." + sp.fullPath(method)
 }
 
 // ServiceProxyOption configures service proxy creation.

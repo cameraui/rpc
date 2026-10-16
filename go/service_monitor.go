@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
-
-	"github.com/nats-io/nats.go"
 )
 
 // ServiceMonitor provides service discovery via NATS micro $SRV subjects.
@@ -111,20 +109,19 @@ func (m *ServiceMonitor) Stats(ctx context.Context, name string, timeout ...time
 	return collectResponses[ServiceStatsResponse](m.client, ctx, subject, t)
 }
 
-// collectResponses sends a broadcast request and collects responses.
-// Uses a short per-message timeout (10ms): once no new response arrives
-// within that window, collection stops and results are returned immediately.
-// The overall timeout acts as a hard upper bound.
+// collectResponses sends a broadcast request and collects responses. It waits
+// up to timeout for the first reply, then for more as long as each follows the
+// previous within 10ms. A no-responder status ends it at once.
 func collectResponses[T any](client *Client, ctx context.Context, subject string, timeout time.Duration) ([]T, error) {
+	client.mu.RLock()
 	nc := client.nc
+	client.mu.RUnlock()
 	if nc == nil {
 		return nil, fmt.Errorf("not connected")
 	}
 
 	inbox := nc.NewInbox()
-	msgCh := make(chan *nats.Msg, 16)
-
-	sub, err := nc.ChanSubscribe(inbox, msgCh)
+	sub, err := nc.SubscribeSync(inbox)
 	if err != nil {
 		return nil, err
 	}
@@ -133,40 +130,30 @@ func collectResponses[T any](client *Client, ctx context.Context, subject string
 	if err := nc.PublishRequest(subject, inbox, nil); err != nil {
 		return nil, err
 	}
-	_ = nc.Flush()
 
+	const stall = 10 * time.Millisecond
 	results := make([]T, 0)
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-
-	// Short per-message timeout
-	const perMsgTimeout = 10 * time.Millisecond
-	msgTimer := time.NewTimer(perMsgTimeout)
-	defer msgTimer.Stop()
-
+	deadline := time.Now().Add(timeout)
+	wait := timeout
 	for {
-		select {
-		case msg := <-msgCh:
-			var v T
-			if err := json.Unmarshal(msg.Data, &v); err == nil {
-				results = append(results, v)
-			}
-			// Reset short timer for next potential message
-			if !msgTimer.Stop() {
-				select {
-				case <-msgTimer.C:
-				default:
-				}
-			}
-			msgTimer.Reset(perMsgTimeout)
-		case <-msgTimer.C:
-			// No message for 10ms — all responders have replied
+		left := time.Until(deadline)
+		if left <= 0 {
 			return results, nil
-		case <-deadline.C:
-			// Hard timeout reached
-			return results, nil
-		case <-ctx.Done():
+		}
+		waitCtx, cancel := context.WithTimeout(ctx, min(wait, left))
+		msg, err := sub.NextMsgWithContext(waitCtx)
+		cancel()
+		if ctx.Err() != nil {
 			return results, ctx.Err()
 		}
+		// the wait ran out, or nats.ErrNoResponders: nobody serves the name
+		if err != nil {
+			return results, nil
+		}
+		var v T
+		if err := json.Unmarshal(msg.Data, &v); err == nil {
+			results = append(results, v)
+		}
+		wait = stall
 	}
 }

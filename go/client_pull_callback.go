@@ -24,7 +24,8 @@ type PullCallbackMap map[string]any
 //
 // The returned channel yields one PullValue per batch boundary the server
 // produces. The Value field is always nil — meaningful data is dispatched
-// through the callbacks map. Cancel via the context to stop early.
+// through the callbacks map. Cancel via the context to stop early, also while
+// the call is being set up, as with CallPullIterator.
 func (c *Client) CallPullIteratorWithCallback(
 	ctx context.Context,
 	subject string,
@@ -32,7 +33,18 @@ func (c *Client) CallPullIteratorWithCallback(
 	oneway []string,
 	args ...any,
 ) (<-chan PullValue, error) {
-	if !c.IsConnected() && !c.IsClosed() {
+	return c.callPullIteratorWithCallback(ctx, subject, nil, callbacks, oneway, args...)
+}
+
+func (c *Client) callPullIteratorWithCallback(
+	ctx context.Context,
+	subject string,
+	opts *RequestOptions,
+	callbacks PullCallbackMap,
+	oneway []string,
+	args ...any,
+) (<-chan PullValue, error) {
+	if c.needsConnect() {
 		if err := c.Connect(ctx); err != nil {
 			return nil, err
 		}
@@ -100,20 +112,9 @@ func (c *Client) CallPullIteratorWithCallback(
 		OnewayMethods:   oneway,
 		Args:            args,
 	}
-	initResult, err := c.Call(ctx, subject, initParams)
-	if err != nil {
+	if err := c.initPullSession(ctx, subject, "pull-callback iterator", iteratorID, opts, initParams); err != nil {
 		cbUnsub()
-		return nil, fmt.Errorf("init pull-callback iterator: %w", err)
-	}
-
-	if m, ok := initResult.(map[string]any); ok {
-		if retID, ok := m["iteratorId"].(string); !ok || retID != iteratorID {
-			cbUnsub()
-			return nil, fmt.Errorf("failed to initialize pull-callback iterator")
-		}
-	} else {
-		cbUnsub()
-		return nil, fmt.Errorf("failed to initialize pull-callback iterator: unexpected response type")
+		return nil, err
 	}
 
 	// Unbuffered: the send blocks until the consumer reads, which prevents
@@ -157,13 +158,10 @@ func (c *Client) CallPullIteratorWithCallback(
 
 		// No-responder detection for `next` requests via the muxed reply
 		// inbox (one-shot) — see CallPullIterator.
+		noResponders := &RPCError{Code: "503", Message: "No responders for " + subject}
 		c.statusHandlers.Store(iteratorID, func(error) {
 			if !ended.Load() {
-				respCh <- PullIteratorResponse{
-					ID:    iteratorID,
-					Type:  "error",
-					Error: &RPCError{Code: "503", Message: "No responders for " + subject},
-				}
+				respCh <- PullIteratorResponse{ID: iteratorID, Type: "error", Error: noResponders}
 			}
 		})
 		defer c.statusHandlers.Delete(iteratorID)
@@ -257,7 +255,7 @@ func (c *Client) CallPullIteratorWithCallback(
 				case "error":
 					var pv PullValue
 					if resp.Error != nil {
-						pv = PullValue{Error: RPCExceptionFromError(resp.Error)}
+						pv = PullValue{Error: pullError(resp.Error, noResponders, subject)}
 					} else {
 						pv = PullValue{Error: NewRPCException(ErrCodeStreamError, "Iterator error")}
 					}

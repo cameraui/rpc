@@ -36,6 +36,12 @@ public final class PullIterator: AsyncSequence, Sendable {
 }
 
 actor PullIteratorSession {
+  // a response with the count of callback messages that had arrived by then
+  private struct Boundary {
+    let response: [String: Any?]
+    let callbacks: UInt64
+  }
+
   private let client: RPCClient
   private let iteratorId: String
   private let requestSubject: String
@@ -43,9 +49,14 @@ actor PullIteratorSession {
   private let callbacks: [String: PullCallback]
   private let prefetch: Bool
   private let callbackSub: NatsSubscription?
+  private let callbackChunks: ChunkReceiver
   private var responseTask: Task<Void, Never>?
-  private var queue: [[String: Any?]] = []
-  private var waiter: CheckedContinuation<[String: Any?], Never>?
+  private var callbackTask: Task<Void, Never>?
+  private var queue: [Boundary] = []
+  private var waiter: CheckedContinuation<Boundary, Never>?
+  private var handled: UInt64 = 0
+  private var pumpEnded = false
+  private var callbackWaiters: [(through: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
   private var ended = false
   private var endedError: Error?
   private var prefetched = false
@@ -58,7 +69,8 @@ actor PullIteratorSession {
     statusInbox: String,
     callbacks: [String: PullCallback],
     prefetch: Bool,
-    callbackSub: NatsSubscription?
+    callbackSub: NatsSubscription?,
+    callbackChunks: ChunkReceiver
   ) {
     self.client = client
     self.iteratorId = iteratorId
@@ -67,9 +79,11 @@ actor PullIteratorSession {
     self.callbacks = callbacks
     self.prefetch = prefetch
     self.callbackSub = callbackSub
+    self.callbackChunks = callbackChunks
   }
 
   func start(responses: AsyncThrowingStream<Any?, Error>) {
+    startCallbackPump()
     responseTask = Task { [weak self] in
       do {
         for try await message in responses {
@@ -95,6 +109,10 @@ actor PullIteratorSession {
       }
       return nil
     }
+    if Task.isCancelled {
+      await cancel()
+      return nil
+    }
 
     if prefetched {
       prefetched = false
@@ -107,11 +125,12 @@ actor PullIteratorSession {
       }
     }
 
-    let response = await withTaskCancellationHandler {
+    let boundary = await withTaskCancellationHandler {
       await awaitResponse()
     } onCancel: {
       Task { await self.cancel() }
     }
+    let response = boundary.response
 
     switch response["type"] as? String {
     case "value":
@@ -125,10 +144,10 @@ actor PullIteratorSession {
           prefetched = false
         }
       }
-      await drainCallbacks()
+      await callbacksHandled(through: boundary.callbacks)
       return .some(response["value"] ?? nil)
     case "done":
-      await drainCallbacks()
+      await callbacksHandled(through: boundary.callbacks)
       await cleanup(sendCancel: false)
       return nil
     case "cancelled":
@@ -147,7 +166,7 @@ actor PullIteratorSession {
     if cleanedUp { return }
     if let waiter {
       self.waiter = nil
-      waiter.resume(returning: ["type": "cancelled"])
+      waiter.resume(returning: Boundary(response: ["type": "cancelled"], callbacks: 0))
     }
     await cleanup(sendCancel: true)
   }
@@ -166,7 +185,7 @@ actor PullIteratorSession {
     }
     if let waiter {
       self.waiter = nil
-      waiter.resume(returning: ["type": "disconnected"])
+      waiter.resume(returning: Boundary(response: ["type": "disconnected"], callbacks: 0))
     }
   }
 
@@ -180,40 +199,73 @@ actor PullIteratorSession {
     default:
       break
     }
+    let boundary = Boundary(response: map, callbacks: callbackSub?.received ?? 0)
     if let waiter {
       self.waiter = nil
-      waiter.resume(returning: map)
+      waiter.resume(returning: boundary)
     } else {
-      queue.append(map)
+      queue.append(boundary)
     }
   }
 
   private func sendNextRequest() async throws {
     let request: [String: Any?] = ["id": iteratorId, "type": "next"]
-    try await client.publish(requestSubject, request, reply: statusInbox)
+    try await client.publishLinked(requestSubject, request, reply: statusInbox)
   }
 
-  private func awaitResponse() async -> [String: Any?] {
+  private func awaitResponse() async -> Boundary {
     if !queue.isEmpty { return queue.removeFirst() }
-    if ended { return ["type": endedError == nil ? "done" : "error"] }
+    if ended { return Boundary(response: ["type": endedError == nil ? "done" : "error"], callbacks: 0) }
     return await withCheckedContinuation { waiter = $0 }
   }
 
-  // callback messages of a batch arrive before the boundary response (same
-  // connection, publish order), so they are already buffered here: a
-  // non-blocking drain sees the whole batch. Handlers run serially — a slow
-  // handler stalls the next request, which parks the server at its yield.
-  private func drainCallbacks() async {
+  // handlers run as the frames arrive; a boundary waits only for the callbacks
+  // that came before it, so a slow handler still holds the next request
+  private func startCallbackPump() {
     guard let callbackSub else { return }
-    while true {
-      guard let message = (try? callbackSub.tryNextMessage()) ?? nil else { break }
-      guard
-        let payload = message.payload,
-        let invocation = (try? RPCCodec.decodeMessage(payload)) as? [String: Any?],
-        let method = invocation["method"] as? String,
-        let handler = callbacks[method]
-      else { continue }
-      await handler(invocation["args"] as? [Any?] ?? [])
+    let callbacks = self.callbacks
+    let chunks = callbackChunks
+    callbackTask = Task { [weak self] in
+      do {
+        for try await message in callbackSub {
+          if let payload = chunks.receive(message),
+            let invocation = (try? RPCCodec.decodeMessage(payload)) as? [String: Any?],
+            let method = invocation["method"] as? String,
+            let handler = callbacks[method]
+          {
+            // cancel() can run during a handler, before the subscription closes
+            guard !Task.isCancelled else { break }
+            await handler(invocation["args"] as? [Any?] ?? [])
+          }
+          await self?.markHandled()
+        }
+      } catch {}
+      await self?.endPump()
+    }
+  }
+
+  private func callbacksHandled(through mark: UInt64) async {
+    guard !pumpEnded, !cleanedUp, handled < mark else { return }
+    await withCheckedContinuation { callbackWaiters.append((mark, $0)) }
+  }
+
+  private func markHandled() {
+    handled += 1
+    releaseCallbackWaiters()
+  }
+
+  // a closed subscription drops what it still buffered
+  private func endPump() {
+    pumpEnded = true
+    releaseCallbackWaiters()
+  }
+
+  private func releaseCallbackWaiters() {
+    let open = pumpEnded || cleanedUp
+    let ready = callbackWaiters.filter { open || $0.through <= handled }
+    callbackWaiters.removeAll { open || $0.through <= handled }
+    for waiter in ready {
+      waiter.continuation.resume()
     }
   }
 
@@ -222,13 +274,18 @@ actor PullIteratorSession {
     cleanedUp = true
     responseTask?.cancel()
     responseTask = nil
+    callbackTask?.cancel()
+    callbackTask = nil
+    releaseCallbackWaiters()
+    callbackChunks.dispose()
     await client.removeStatusHandler(iteratorId)
     await client.removeIteratorSettle(iteratorId)
     try? await callbackSub?.unsubscribe()
     if sendCancel && !ended {
       ended = true
-      let request: [String: Any?] = ["id": iteratorId, "type": "cancel"]
-      try? await client.publish(requestSubject, request)
+      await client.cancelSession(iteratorId)
+    } else {
+      await client.endSession(iteratorId)
     }
     ended = true
   }

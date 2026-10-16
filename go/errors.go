@@ -1,6 +1,12 @@
 package rpc
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
+const upstreamUnavailable = "upstream unavailable"
 
 // Error codes
 const (
@@ -12,6 +18,7 @@ const (
 	ErrCodeStreamError      = "STREAM_ERROR"
 	ErrCodePayloadTooLarge  = "PAYLOAD_TOO_LARGE"
 	ErrCodeNotFound         = "NOT_FOUND"
+	ErrCodeForbidden        = "FORBIDDEN"
 )
 
 // RPCException is a structured RPC error.
@@ -19,6 +26,9 @@ type RPCException struct {
 	Code    string
 	Msg     string
 	Details any
+
+	// the subject nobody served, set only on a no-responder error this client saw itself
+	upstream string
 }
 
 func (e *RPCException) Error() string {
@@ -55,8 +65,23 @@ func RPCExceptionFromError(e *RPCError) *RPCException {
 	}
 }
 
-// FormatErrorObject converts any error into an RPCError for the wire.
+// FormatErrorObject converts any error into an RPCError for the wire. A
+// no-responder error this client saw itself, also wrapped with %w, goes out as
+// INTERNAL_ERROR "upstream unavailable" with the subject in Data, so the caller
+// does not take it for a no-responder of its own call and retry it.
 func FormatErrorObject(err error) *RPCError {
+	var local *RPCException
+	if errors.As(err, &local) && local.upstream != "" {
+		message := upstreamUnavailable
+		if err != error(local) {
+			message = strings.Replace(err.Error(), local.Error(), upstreamUnavailable, 1)
+		}
+		return &RPCError{
+			Code:    ErrCodeInternalError,
+			Message: message,
+			Data:    map[string]any{"subject": local.upstream},
+		}
+	}
 	if rpcErr, ok := err.(*RPCException); ok {
 		return rpcErr.ToRPCError()
 	}
@@ -64,4 +89,26 @@ func FormatErrorObject(err error) *RPCError {
 		Code:    ErrCodeInternalError,
 		Message: err.Error(),
 	}
+}
+
+// a no-responder failure this client saw itself (503 status or
+// nats.ErrNoResponders); only these are retried, a remote NOT_FOUND is not
+type localNoResponders struct {
+	err *RPCException
+}
+
+func newLocalNoResponders(subject, message string) error {
+	return &localNoResponders{err: noRespondersException(subject, message)}
+}
+
+func noRespondersException(subject, message string) *RPCException {
+	return &RPCException{Code: ErrCodeNotFound, Msg: message, upstream: subject}
+}
+
+func (e *localNoResponders) Error() string {
+	return e.err.Error()
+}
+
+func (e *localNoResponders) Unwrap() error {
+	return e.err
 }

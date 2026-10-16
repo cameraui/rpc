@@ -215,9 +215,33 @@ def test_attaches_methods_metadata_to_dict_results() -> None:
         )
 
         result = await task
-        # Python semantics: __methods rides inside dict results (the proxy
-        # strips it) — scalar results stay untouched.
+        # plain call() keeps splicing __methods into dict results, proxies read it beside the result
         assert result == {"value": 7, "__methods": ["meta", "other"]}
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("result", [5, None, b"raw", [1], {"value": 7}])
+def test_call_with_meta_returns_the_methods_beside_any_result(result: Any) -> None:
+    async def run() -> None:
+        client, nc = make_client()
+
+        task = asyncio.create_task(
+            client._call_with_meta("rpc.test.meta", (1,), discover=True)  # pyright: ignore[reportPrivateUsage]
+        )
+        await until(lambda: len(nc.published) == 1)
+        req = decode(nc.published[0]["data"])
+        assert req["__discover"] is True
+        assert req["params"] == [1]
+
+        await mux_sub(client, nc).cb(
+            make_msg(
+                f"rpc.reply.{req['id']}",
+                encode({"id": req["id"], "result": result, "__methods": ["meta", "other"]}),
+            )
+        )
+
+        assert await task == (result, ["meta", "other"])
 
     asyncio.run(run())
 

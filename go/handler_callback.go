@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"sync"
@@ -11,16 +12,17 @@ import (
 // calls the handler with it, and manages the subscription lifecycle.
 // onFinished is invoked when the client cancels the subscription so the
 // caller can drop its cleanup-map entry for this session.
-func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requestID string, client *Client, onFinished func()) (func(), error) {
+func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []any, callbackSubject, requestID string, client *Client, orphan *orphanConfig, onFinished func()) (func(), error) {
 	if !isControlSubject(callbackSubject, callbackSubjectPrefix) {
 		return nil, NewRPCException(ErrCodeInvalidParams, "callback subject must start with "+callbackSubjectPrefix)
 	}
 
 	fnType := fn.Type()
+	first := contextParams(fnType)
 
 	// Find the func(T) parameter position
 	callbackParamIdx := -1
-	for i := 0; i < fnType.NumIn(); i++ {
+	for i := first; i < fnType.NumIn(); i++ {
 		if fnType.In(i).Kind() == reflect.Func {
 			callbackParamIdx = i
 			break
@@ -38,6 +40,11 @@ func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requ
 			fmt.Sprintf("callback parameter must be func(T) or func(T) error, got %s", callbackType))
 	}
 
+	// every consumer skips a callback message of an unknown type
+	probe := client.newOrphanProbe(orphan, func(reply string) error {
+		return client.publishInternal(callbackSubject, CallbackMessage{ID: requestID, Type: "ping"}, reply)
+	})
+
 	// Create wrapper function that publishes to callbackSubject
 	wrapperFunc := reflect.MakeFunc(callbackType, func(wrapperArgs []reflect.Value) []reflect.Value {
 		if !client.IsConnected() {
@@ -51,7 +58,7 @@ func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requ
 			Type: "data",
 			Data: wrapperArgs[0].Interface(),
 		}
-		err := client.Publish(callbackSubject, msg)
+		err := client.publishInternal(callbackSubject, msg, probe.replyFor())
 		if hasErrorReturn {
 			if err != nil {
 				return []reflect.Value{reflect.ValueOf(err)}
@@ -61,14 +68,26 @@ func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requ
 		return nil
 	})
 
-	// Build call arguments: insert wrapper at the callback position
+	ctx, cancel := context.WithCancel(parent)
+	// a panicking handler ends the context too
+	started := false
+	defer func() {
+		if !started {
+			cancel()
+		}
+	}()
+
+	// Build call arguments: [ctx], then the wrapper at the callback position
 	numIn := fnType.NumIn()
 	callArgs := make([]reflect.Value, numIn)
 	argIdx := 0
 	for i := range numIn {
-		if i == callbackParamIdx {
+		switch {
+		case i < first:
+			callArgs[i] = reflect.ValueOf(ctx)
+		case i == callbackParamIdx:
 			callArgs[i] = wrapperFunc
-		} else {
+		default:
 			if argIdx < len(args) {
 				callArgs[i] = coerceValue(args[argIdx], fnType.In(i))
 			} else {
@@ -98,17 +117,20 @@ func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requ
 	var cleanupOnce sync.Once
 	runHandlerCleanup := func() {
 		cleanupOnce.Do(func() {
+			probe.stop()
+			cancel()
 			if handlerCleanup != nil {
 				handlerCleanup()
 			}
 		})
 	}
+	started = true
 
 	// Subscribe to cancel subject for cleanup. cancelUnsub is assigned after
 	// Subscribe returns but read from the NATS callback goroutine — guard it.
 	var cancelUnsubMu sync.Mutex
 	var cancelUnsub func()
-	unsub, err := client.Subscribe(callbackSubject+".cancel", func(data []byte) {
+	finish := func() {
 		cancelUnsubMu.Lock()
 		u := cancelUnsub
 		cancelUnsubMu.Unlock()
@@ -119,7 +141,8 @@ func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requ
 			onFinished()
 		}
 		runHandlerCleanup()
-	})
+	}
+	unsub, err := client.Subscribe(callbackSubject+".cancel", func([]byte) { finish() })
 	if err != nil {
 		runHandlerCleanup()
 		return nil, fmt.Errorf("failed to setup cancel listener: %w", err)
@@ -127,6 +150,7 @@ func handleCallbackRequestGo(fn reflect.Value, args []any, callbackSubject, requ
 	cancelUnsubMu.Lock()
 	cancelUnsub = unsub
 	cancelUnsubMu.Unlock()
+	probe.start(finish)
 
 	// Return combined cleanup
 	cleanup := func() {

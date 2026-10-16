@@ -63,7 +63,7 @@ class TestService:
 @RPCClass
 class SmallPayloadService:
     async def get_small_data(self) -> str:
-        return "Small response that fits in 1KB"
+        return "Small response that fits in one message"
 
     async def get_medium_data(self) -> bytes:
         return bytes(10 * 1024)
@@ -174,14 +174,17 @@ async def main():
 
     await asyncio.gather(*concurrent_tasks)
 
-    print("\nExtreme Chunking (1KB max payload)")
+    print("\nExtreme Chunking (16KB max payload)")
+
+    # the client keeps 8 KiB of the cap for the envelope, so each chunk carries 8 KiB
+    chunk_size = 16 * 1024 - 8192
 
     small_payload_server = create_rpc_client(
         {
             "servers": ["nats://localhost:4222"],
             "auth": {"user": "server", "password": "server_password"},
             "name": "small-payload-server",
-            "max_payload_size": 1024,
+            "max_payload_size": 16 * 1024,
         }
     )
 
@@ -194,7 +197,7 @@ async def main():
             "servers": ["nats://localhost:4222"],
             "auth": {"user": "server", "password": "server_password"},
             "name": "small-payload-client",
-            "max_payload_size": 1024,
+            "max_payload_size": 16 * 1024,
         }
     )
 
@@ -202,22 +205,22 @@ async def main():
     small_payload_service = small_payload_client.create_proxy("test-small-payload", SmallPayloadService)
 
     small_result = await small_payload_service.get_small_data()
-    print(f'Small data with 1KB limit: "{small_result}"')
+    print(f'Small data with 16KB limit: "{small_result}"')
 
     start = time.perf_counter()
     medium_buffer = await small_payload_service.get_medium_data()
     elapsed = time.perf_counter() - start
-    expected_chunks = (10 * 1024 + 1023) // 1024
+    expected_chunks = -(-10 * 1024 // chunk_size)
     print(
-        f"10KB data with 1KB limit: received {len(medium_buffer)} bytes in {elapsed * 1000:.0f}ms (~{expected_chunks} chunks)"
+        f"10KB data with 16KB limit: received {len(medium_buffer)} bytes in {elapsed * 1000:.0f}ms (~{expected_chunks} chunks)"
     )
 
     large_start_new = time.perf_counter()
     large_buffer = await small_payload_service.get_large_data()
     large_elapsed = time.perf_counter() - large_start_new
-    expected_chunks = (5 * 1024 * 1024 + 1023) // 1024
+    expected_chunks = -(-5 * 1024 * 1024 // chunk_size)
     print(
-        f"5MB data with 1KB limit: received {len(large_buffer)} bytes in {large_elapsed * 1000:.0f}ms (~{expected_chunks} chunks)"
+        f"5MB data with 16KB limit: received {len(large_buffer)} bytes in {large_elapsed * 1000:.0f}ms (~{expected_chunks} chunks)"
     )
 
     print("\nCleaning up...")

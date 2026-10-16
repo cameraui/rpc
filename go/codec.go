@@ -32,7 +32,11 @@ func (u *msgpackrUndefined) UnmarshalMsgpack(b []byte) error {
 // Encode serializes data to MessagePack binary format.
 // Compatible with msgpackr (useRecords=false, bundleStrings=false).
 func Encode(v any) ([]byte, error) {
-	return msgpack.Marshal(v)
+	data, err := encodeToBytes(func(enc *msgpack.Encoder) error { return encodeFast(enc, v) })
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 // encodeBufPool recycles encode buffers for the hot publish path so that
@@ -60,6 +64,14 @@ const maxPooledEncodeBuf = 4 << 20 // 4MB
 // The returned release func must be called exactly once, and only when the
 // returned bytes are no longer referenced (see encodeBufPool invariant).
 func encodePooled(v any) (encoded []byte, release func(), err error) {
+	buf, err := encodeToPooledBuf(v)
+	if err != nil {
+		return nil, nil, err
+	}
+	return buf.Bytes(), func() { releaseEncodeBuf(buf) }, nil
+}
+
+func encodeToPooledBuf(v any) (*bytes.Buffer, error) {
 	buf := encodeBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 
@@ -67,19 +79,31 @@ func encodePooled(v any) (encoded []byte, release func(), err error) {
 	// pooled encoder behaves identically to msgpack.Marshal.
 	enc := msgpack.GetEncoder()
 	enc.Reset(buf)
-	err = enc.Encode(v)
+	err := encodeFast(enc, v)
 	msgpack.PutEncoder(enc)
 
-	release = func() {
-		if buf.Cap() <= maxPooledEncodeBuf {
-			encodeBufPool.Put(buf)
-		}
-	}
 	if err != nil {
-		release()
-		return nil, nil, err
+		releaseEncodeBuf(buf)
+		return nil, err
 	}
-	return buf.Bytes(), release, nil
+	return buf, nil
+}
+
+func releaseEncodeBuf(buf *bytes.Buffer) {
+	if buf.Cap() <= maxPooledEncodeBuf {
+		encodeBufPool.Put(buf)
+	}
+}
+
+func convertPooled(src, dst any) error {
+	buf, err := encodeToPooledBuf(src)
+	if err != nil {
+		return err
+	}
+	err = Decode(buf.Bytes(), dst)
+	// msgpack decoding copies bytes and strings out of its input, nothing keeps a view of buf
+	releaseEncodeBuf(buf)
+	return err
 }
 
 func Decode(data []byte, v any) error {
@@ -108,7 +132,7 @@ func Decode(data []byte, v any) error {
 	}
 
 	coerced := coerceValues(raw)
-	reencoded, rerr := msgpack.Marshal(coerced)
+	buf, rerr := encodeToPooledBuf(coerced)
 	if rerr != nil {
 		return err // return original error
 	}
@@ -118,7 +142,9 @@ func Decode(data []byte, v any) error {
 	// holds, which is unaddressable and panics
 	resetValue(v)
 
-	return msgpack.Unmarshal(reencoded, v)
+	err = msgpack.Unmarshal(buf.Bytes(), v)
+	releaseEncodeBuf(buf)
+	return err
 }
 
 func resetValue(v any) {
@@ -150,13 +176,14 @@ func coerceValues(v any) any {
 			val >= math.MinInt64 && val <= math.MaxInt64 {
 			return int64(val)
 		}
-		return val
+		// v, not val: boxing val again allocates for every float in the tree
+		return v
 	case float32:
 		f := float64(val)
 		if f == math.Trunc(f) && !math.IsInf(f, 0) && !math.IsNaN(f) {
 			return int64(f)
 		}
-		return val
+		return v
 	case *msgpackrUndefined:
 		return nil
 	case msgpackrUndefined:

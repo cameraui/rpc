@@ -1,12 +1,17 @@
 """Tests for RPC exception types and helpers."""
 
 import pytest
+from nats import errors as nats_errors
 
 from camera_ui_rpc.errors import (
+    LocalNoRespondersError,
     RPCException,
     create_error,
     create_error_from_dict,
+    is_local_no_responders,
+    reported_error,
 )
+from camera_ui_rpc.handler import format_error_dict
 from camera_ui_rpc.types import ErrorCode
 
 
@@ -119,3 +124,34 @@ def test_error_code_value_equals_name(member: ErrorCode) -> None:
 def test_error_code_is_str_enum() -> None:
     assert isinstance(ErrorCode.TIMEOUT, str)
     assert ErrorCode.TIMEOUT == "TIMEOUT"
+
+
+UPSTREAM = {"code": "INTERNAL_ERROR", "message": "upstream unavailable", "data": {"subject": "rpc.up.find"}}
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        nats_errors.NoRespondersError("rpc.up.find"),
+        LocalNoRespondersError("NOT_FOUND", "No responders available", subject="rpc.up.find"),
+        LocalNoRespondersError("503", "nats: no responders available for request", subject="rpc.up.find"),
+    ],
+)
+def test_a_no_responder_the_responder_saw_itself_is_reported_as_upstream_unavailable(
+    error: Exception,
+) -> None:
+    assert is_local_no_responders(error)
+    assert format_error_dict(error) == UPSTREAM
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RPCException("NOT_FOUND", "no responders available"),
+        RPCException("INTERNAL_ERROR", "nats: no responders available for request"),
+        RuntimeError("no responders"),
+    ],
+)
+def test_errors_from_a_reply_or_the_handler_keep_their_code_and_text(error: Exception) -> None:
+    assert not is_local_no_responders(error)
+    assert reported_error(error) is error

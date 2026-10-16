@@ -1,11 +1,87 @@
 """Optimized chunking system for large message handling."""
 
+import asyncio
 import time
 from collections.abc import Callable, Generator
-from typing import Any
+from typing import Any, cast
 
 from .codec import decode_message
 from .types import ChunkData
+
+DEFAULT_MAX_TRANSFER_SIZE = 1024 * 1024 * 1024
+"""Default upper bound for the total size of one incoming chunked transfer."""
+
+MAX_CHUNK_SIZE = 64 * 1024 * 1024
+"""Largest chunk size a transfer header may announce (the NATS max_payload ceiling)."""
+
+MAX_CONCURRENT_TRANSFERS = 32
+"""Incoming transfers a ChunkingManager tracks at once; further headers are rejected."""
+
+CHUNK_RESERVE = 8192
+"""Bytes of the payload limit kept free in every message for headers and the envelope."""
+
+MIN_PAYLOAD_LIMIT = 16384
+"""Smallest payload limit that leaves room for a chunk next to CHUNK_RESERVE."""
+
+_MAX_INDEX_DIGITS = 15
+
+
+def parse_chunk_index(value: str | None) -> int | None:
+    """Parse an ``x-chunk-index`` header value, None unless it is 1 to 15 plain ASCII digits."""
+    if not value or len(value) > _MAX_INDEX_DIGITS or not value.isascii() or not value.isdigit():
+        return None
+    return int(value)
+
+
+def _as_int(value: Any) -> int | None:
+    # msgpackr encodes large numbers as float64, an integral float is still a valid size
+    if type(value) is int:
+        return value
+    if type(value) is float and value.is_integer():
+        return int(value)
+    return None
+
+
+def _header_problem(
+    total_chunks: Any, total_size: Any, chunk_size: Any, max_transfer_size: int
+) -> str | None:
+    chunks = _as_int(total_chunks)
+    size = _as_int(total_size)
+    step = _as_int(chunk_size)
+    if step is None or not 0 < step <= MAX_CHUNK_SIZE:
+        return f"invalid chunkSize {chunk_size!r}"
+    if size is None or not 0 < size <= max_transfer_size:
+        return f"invalid totalSize {total_size!r} (limit {max_transfer_size})"
+    if chunks is None or chunks != -(-size // step):
+        return f"totalChunks {total_chunks!r} does not match totalSize {size} and chunkSize {step}"
+    return None
+
+
+class TransferBudget:
+    """Bytes the buffers of all incoming transfers in progress may hold together.
+
+    A client shares one budget between all its ChunkingManagers, so a manager
+    per subscription does not multiply what a sender can make it allocate.
+    """
+
+    def __init__(self, limit: int | None = None) -> None:
+        """
+        Args:
+            limit: Bytes in use at most. None or 0 means DEFAULT_MAX_TRANSFER_SIZE.
+        """
+        self.limit: int = limit or DEFAULT_MAX_TRANSFER_SIZE
+        self.used: int = 0
+
+    def reserve(self, size: int) -> bool:
+        """Take size bytes, False when that would exceed the limit."""
+        if self.used + size > self.limit:
+            return False
+        self.used += size
+        return True
+
+    def release(self, size: int) -> None:
+        """Return size bytes taken with reserve()."""
+        self.used = max(0, self.used - size)
 
 
 def create_chunks(encoded: bytes, chunk_id: str, max_chunk_size: int) -> Generator[ChunkData, None, None]:
@@ -59,12 +135,17 @@ class ChunkAssembler:
         self.temp_chunks: dict[int, bytes] = {}
         # Dynamically determined chunk size from first chunk
         self.chunk_size: int | None = None
+        # set by ChunkingManager, the buffer is only allocated within it
+        self.budget: TransferBudget | None = None
+        self.reserved: int = 0
+        self._preallocate = False
 
     def set_expected_chunks(
         self, count: int, total_size: int | None = None, chunk_size: int | None = None
     ) -> None:
         """
-        Set the expected number of chunks and pre-allocate the buffer if total_size is known.
+        Set the expected number of chunks. With a known total_size the buffer is
+        pre-allocated when the first chunk arrives.
 
         Args:
             count: The total number of chunks expected.
@@ -72,22 +153,16 @@ class ChunkAssembler:
             chunk_size: The size of each chunk (except possibly the last one).
         """
         self.total_chunks = count
-        if chunk_size is not None:
-            self.chunk_size = chunk_size
+        self.chunk_size = chunk_size
         if total_size is not None and total_size > 0:
             self.total_size = total_size
-            try:
-                # Pre-allocate the entire buffer to write chunks into directly.
-                # This is the core of the zero-copy assembly strategy.
-                self.buffer = bytearray(total_size)
-            except MemoryError:
-                print(f"MemoryError: Failed to allocate {total_size} bytes for chunk assembly.")
-                self.buffer = None  # Fallback to temp_chunks
+            self._preallocate = True
 
     def add_chunk(self, chunk: dict[str, Any]) -> bool:
         """
         Add a chunk to the assembler. Writes directly into the pre-allocated
-        buffer if available, otherwise stores it temporarily.
+        buffer if available, otherwise stores it temporarily. A repeated index
+        with the right length is ignored, the first copy wins.
 
         Args:
             chunk: A dictionary containing chunk metadata and data.
@@ -96,6 +171,10 @@ class ChunkAssembler:
 
         Returns:
             True if the transfer is complete, False otherwise.
+
+        Raises:
+            ValueError: The chunk does not fit the transfer (index out of
+                range, wrong length also for a repeated index, other transfer id).
         """
         if chunk["transferId"] != self.id:
             raise ValueError(f"Chunk ID mismatch: expected {self.id}, got {chunk['transferId']}")
@@ -103,6 +182,22 @@ class ChunkAssembler:
         chunk_index = chunk["index"]
         chunk_data = chunk["data"]
         chunk_size = len(chunk_data)
+
+        if (
+            type(chunk_index) is not int
+            or chunk_index < 0
+            or (self.total_chunks is not None and chunk_index >= self.total_chunks)
+        ):
+            raise ValueError(f"Invalid chunk index {chunk_index!r} for {self.total_chunks} chunks")
+
+        if self.chunk_size is not None and self.total_chunks is not None and self.total_size > 0:
+            last = self.total_chunks - 1
+            expected = self.chunk_size if chunk_index < last else self.total_size - last * self.chunk_size
+            if chunk_size != expected:
+                raise ValueError(f"Chunk {chunk_index} has {chunk_size} bytes, expected {expected}")
+
+        if chunk_index in self.chunks_received:
+            return False
 
         # Determine chunk size from first non-last chunk (chunk 0)
         # This handles dynamic chunk sizes from different clients
@@ -112,6 +207,18 @@ class ChunkAssembler:
 
         # Use dynamically determined chunk size, or fall back to received chunk size for single chunks
         effective_chunk_size = self.chunk_size if self.chunk_size else chunk_size
+
+        if self.buffer is None and self._preallocate:
+            # not on the header: bytearray zero-fills, a bare header would commit totalSize
+            if self.budget is not None:
+                if not self.budget.reserve(self.total_size):
+                    raise ValueError(f"Transfers in progress would hold more than {self.budget.limit} bytes")
+                self.reserved = self.total_size
+            self._preallocate = False
+            try:
+                self.buffer = bytearray(self.total_size)
+            except MemoryError:
+                print(f"MemoryError: Failed to allocate {self.total_size} bytes for chunk assembly.")
 
         if self.buffer is not None:
             # Optimal path: Direct write to the pre-allocated buffer.
@@ -157,7 +264,7 @@ class ChunkAssembler:
             # payloads are always full wire messages, so this goes through
             # decode_message: a reassembled CUIB frame yields zero-copy
             # memoryview slices into the assembly buffer (the views keep the
-            # bytearray alive after the assembler is pooled/reset).
+            # bytearray alive after the assembler is dropped).
             data_view = memoryview(self.buffer)
             return decode_message(data_view)
         else:
@@ -173,6 +280,12 @@ class ChunkAssembler:
                 offset += chunk_len
             return decode_message(combined)
 
+    def release(self) -> None:
+        """Return the bytes reserved for the buffer to the budget."""
+        if self.budget is not None and self.reserved:
+            self.budget.release(self.reserved)
+        self.reserved = 0
+
     def get_progress(self) -> dict[str, int | float]:
         """Get the current progress of the chunk transfer."""
         received = len(self.chunks_received)
@@ -182,98 +295,90 @@ class ChunkAssembler:
 
 
 class ChunkingManager:
-    """Manages multiple concurrent chunk transfers."""
+    """Manages multiple concurrent chunk transfers.
 
-    # Incomplete transfers hold their full pre-allocated buffer. If a single
-    # chunk is lost (sender reconnected mid-transfer), the assembler would
-    # otherwise sit in memory until the whole client disconnects — so stale
-    # transfers are swept lazily on every start_receiving/process_chunk call.
+    Every header is validated before anything is allocated; a rejected
+    header is reported through its error callback and leaves an open
+    transfer of the same id alone. A chunk that does not fit drops its whole
+    transfer and reports it once. A transfer reserves its buffer in the
+    budget with its first chunk and fails when the budget has no room left.
+    """
+
+    # an incomplete transfer holds its full buffer, a timer drops it this long after its last chunk
     _STALE_TRANSFER_TTL: float = 30.0
-    # Sweeping on every chunk of a large transfer is pure overhead — one
-    # sweep per second is more than enough for a 30s TTL.
+    # sweeping on every chunk of a large transfer is pure overhead
     _SWEEP_INTERVAL: float = 1.0
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        max_transfer_size: int | None = None,
+        max_transfers: float = MAX_CONCURRENT_TRANSFERS,
+        budget: TransferBudget | None = None,
+    ) -> None:
+        """
+        Args:
+            max_transfer_size: Largest accepted totalSize in bytes. None or 0
+                means DEFAULT_MAX_TRANSFER_SIZE.
+            max_transfers: Transfers kept open at once, math.inf for no limit.
+            budget: Bytes the buffers of open transfers may hold, shared with
+                other managers. None gives the manager its own budget of
+                max_transfer_size.
+        """
         self.assemblers: dict[str, ChunkAssembler] = {}
         self.completed_callbacks: dict[str, Callable[[Any], None]] = {}
         self.error_callbacks: dict[str, Callable[[Exception], None]] = {}
-        self._assembler_pool: list[ChunkAssembler] = []
+        self.max_transfer_size: int = max_transfer_size or DEFAULT_MAX_TRANSFER_SIZE
+        self.max_transfers: float = max_transfers
+        self.budget: TransferBudget = budget if budget is not None else TransferBudget(self.max_transfer_size)
         self._last_activity: dict[str, float] = {}
         self._last_sweep: float = 0.0
-
-    def _get_assembler(self, transfer_id: str) -> ChunkAssembler:
-        """Get a reusable assembler from a pool or create a new one."""
-        if self._assembler_pool:
-            assembler = self._assembler_pool.pop()
-            # Reset the state of the reused assembler
-            assembler.id = transfer_id
-            assembler.chunks_received.clear()
-            assembler.total_chunks = None
-            assembler.total_size = 0
-            assembler.buffer = None
-            assembler.temp_chunks.clear()
-            return assembler
-        return ChunkAssembler(transfer_id)
-
-    def _return_assembler(self, assembler: ChunkAssembler) -> None:
-        """Return an assembler to the pool for reuse."""
-        # Clear large memory structures to free up memory before pooling.
-        assembler.buffer = None
-        assembler.temp_chunks.clear()
-        if len(self._assembler_pool) < 10:  # Limit pool size
-            self._assembler_pool.append(assembler)
+        self._timer: asyncio.TimerHandle | None = None
 
     def start_receiving(
         self,
         transfer_id: str,
-        total_chunks: int,
+        total_chunks: Any,
         on_complete: Callable[[Any], None],
         on_error: Callable[[Exception], None],
-        total_size: int | None = None,
-        chunk_size: int | None = None,
+        total_size: Any = None,
+        chunk_size: Any = None,
     ) -> None:
         """
         Start a new chunk transfer, preparing an assembler for it.
+
+        The header values must be integers with 0 < chunk_size <= MAX_CHUNK_SIZE,
+        0 < total_size <= max_transfer_size and total_chunks equal to
+        ceil(total_size / chunk_size), and at most max_transfers may be
+        open. Otherwise on_error is called and nothing is allocated.
 
         Args:
             transfer_id: The unique ID for the transfer.
             total_chunks: The total number of chunks to expect.
             on_complete: Callback to execute when the transfer is complete.
-            chunk_size: The size of each chunk (from sender).
             on_error: Callback to execute if an error occurs.
             total_size: The total size of the final data for pre-allocation.
+            chunk_size: The size of each chunk (from sender).
         """
         self._sweep_stale()
-        assembler = self._get_assembler(transfer_id)
-        assembler.set_expected_chunks(total_chunks, total_size, chunk_size)
+        problem = _header_problem(total_chunks, total_size, chunk_size, self.max_transfer_size)
+        if problem is None and transfer_id in self.assemblers:
+            self._drop(transfer_id)
+        if problem is None and len(self.assemblers) >= self.max_transfers:
+            problem = f"{self.max_transfers} transfers already open"
+        if problem is not None:
+            on_error(ValueError(f"Rejected chunked transfer {transfer_id}: {problem}"))
+            return
+
+        assembler = ChunkAssembler(transfer_id)
+        assembler.set_expected_chunks(
+            cast(int, _as_int(total_chunks)), _as_int(total_size), _as_int(chunk_size)
+        )
+        assembler.budget = self.budget
         self.assemblers[transfer_id] = assembler
         self.completed_callbacks[transfer_id] = on_complete
         self.error_callbacks[transfer_id] = on_error
         self._last_activity[transfer_id] = time.monotonic()
-
-    def _sweep_stale(self) -> None:
-        """Drop incomplete transfers with no activity for _STALE_TRANSFER_TTL.
-
-        Rate-limited to at most one sweep per _SWEEP_INTERVAL — this runs on
-        every start_receiving/process_chunk call.
-        """
-        if not self._last_activity:
-            return
-        now = time.monotonic()
-        if now - self._last_sweep < self._SWEEP_INTERVAL:
-            return
-        self._last_sweep = now
-        cutoff = now - self._STALE_TRANSFER_TTL
-        stale = [tid for tid, ts in self._last_activity.items() if ts < cutoff]
-        for transfer_id in stale:
-            error_callback = self.error_callbacks.pop(transfer_id, None)
-            assembler = self.assemblers.pop(transfer_id, None)
-            if assembler:
-                self._return_assembler(assembler)
-            self.completed_callbacks.pop(transfer_id, None)
-            self._last_activity.pop(transfer_id, None)
-            if error_callback:
-                error_callback(RuntimeError("Transfer timed out"))
+        self._arm()
 
     def process_chunk(self, chunk: dict[str, Any]) -> None:
         """Process an incoming chunk for a specific transfer."""
@@ -301,13 +406,8 @@ class ChunkingManager:
             if assembler.add_chunk(chunk):
                 # The transfer is now complete
                 data = assembler.get_data()
-                callback = self.completed_callbacks.pop(transfer_id, None)
-
-                # Cleanup and return assembler to the pool
-                del self.assemblers[transfer_id]
-                self.error_callbacks.pop(transfer_id, None)
-                self._last_activity.pop(transfer_id, None)
-                self._return_assembler(assembler)
+                callback = self.completed_callbacks.get(transfer_id)
+                self._drop(transfer_id)
 
                 if callback:
                     callback(data)
@@ -315,23 +415,80 @@ class ChunkingManager:
         except Exception as e:
             self._handle_error(transfer_id, e)
 
-    def _handle_error(self, transfer_id: str, error: Exception) -> None:
-        """Handle a transfer error and perform cleanup."""
-        error_callback = self.error_callbacks.pop(transfer_id, None)
-        assembler = self.assemblers.pop(transfer_id, None)
-        if assembler:
-            self._return_assembler(assembler)
-        self.completed_callbacks.pop(transfer_id, None)
-        self._last_activity.pop(transfer_id, None)
-
-        if error_callback:
-            error_callback(error)
-
     def cancel(self, transfer_id: str) -> None:
         """Cancel an ongoing transfer."""
         self._handle_error(transfer_id, RuntimeError("Transfer cancelled"))
+
+    def discard(self, transfer_id: str) -> None:
+        """Drop a transfer without calling its callbacks."""
+        self._drop(transfer_id)
 
     def get_progress(self, transfer_id: str) -> dict[str, int | float] | None:
         """Get the progress of a specific transfer."""
         assembler = self.assemblers.get(transfer_id)
         return assembler.get_progress() if assembler else None
+
+    def close(self) -> None:
+        """Stop the stale-transfer timer and drop every open transfer without calling its callbacks."""
+        for assembler in self.assemblers.values():
+            assembler.release()
+        self.assemblers.clear()
+        self.completed_callbacks.clear()
+        self.error_callbacks.clear()
+        self._last_activity.clear()
+        self._cancel_timer()
+
+    def _cancel_timer(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _arm(self) -> None:
+        if self._timer is not None or not self._last_activity:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        due = min(self._last_activity.values()) + self._STALE_TRANSFER_TTL - time.monotonic()
+        self._timer = loop.call_later(max(0.0, due) + 0.1, self._on_timer)
+
+    def _on_timer(self) -> None:
+        self._timer = None
+        self._last_sweep = 0.0
+        self._sweep_stale()
+        self._arm()
+
+    def _sweep_stale(self) -> None:
+        """Drop incomplete transfers with no activity for _STALE_TRANSFER_TTL.
+
+        Rate-limited to at most one sweep per _SWEEP_INTERVAL.
+        """
+        if not self._last_activity:
+            return
+        now = time.monotonic()
+        if now - self._last_sweep < self._SWEEP_INTERVAL:
+            return
+        self._last_sweep = now
+        cutoff = now - self._STALE_TRANSFER_TTL
+        stale = [tid for tid, ts in self._last_activity.items() if ts < cutoff]
+        for transfer_id in stale:
+            self._handle_error(transfer_id, RuntimeError("Transfer timed out"))
+
+    def _handle_error(self, transfer_id: str, error: Exception) -> None:
+        """Handle a transfer error and perform cleanup."""
+        error_callback = self.error_callbacks.get(transfer_id)
+        self._drop(transfer_id)
+
+        if error_callback:
+            error_callback(error)
+
+    def _drop(self, transfer_id: str) -> None:
+        assembler = self.assemblers.pop(transfer_id, None)
+        if assembler is not None:
+            assembler.release()
+        self.completed_callbacks.pop(transfer_id, None)
+        self.error_callbacks.pop(transfer_id, None)
+        self._last_activity.pop(transfer_id, None)
+        if not self._last_activity:
+            self._cancel_timer()

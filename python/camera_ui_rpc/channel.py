@@ -35,8 +35,10 @@ class Channel:
         self.__handlers: dict[str, dict[Callable[[Any], None | Awaitable[None]], bool]] = {}
         self.__close_handlers: dict[Callable[[], None | Awaitable[None]], bool] = {}
         self.__error_handlers: dict[Callable[[Exception], None | Awaitable[None]], bool] = {}
-        self.__subscriptions: list[Callable[[], Coroutine[Any, Any, None]]] = []
-        self.__isolated_client: RPCClient | None = None
+        # single underscore: RPCClient sets the two clients, PrivateChannel adds subscriptions
+        self._subscriptions: list[Callable[[], Coroutine[Any, Any, None]]] = []
+        self._isolated_client: RPCClient | None = None
+        self._parent_client: RPCClient | None = None
 
     @property
     def is_closed(self) -> bool:
@@ -87,7 +89,7 @@ class Channel:
         """Setup a request handler for this channel."""
         subject = f"channel.{self._channel_id}.request"
         unsubscribe = await self._client.on_request(subject, handler)
-        self.__subscriptions.append(unsubscribe)
+        self._subscriptions.append(unsubscribe)
         return unsubscribe
 
     @overload
@@ -195,7 +197,9 @@ class Channel:
         self.__error_handlers.clear()
 
         # Clear subscriptions
-        await asyncio.gather(*[unsub() for unsub in self.__subscriptions], return_exceptions=True)
+        subscriptions = list(self._subscriptions)
+        self._subscriptions.clear()
+        await asyncio.gather(*[unsub() for unsub in subscriptions], return_exceptions=True)
 
         # Unsubscribe from NATS
         if self._unsubscribe:
@@ -203,10 +207,15 @@ class Channel:
                 await self._unsubscribe()
             self._unsubscribe = None
 
-        # Disconnect isolated client if present
-        if self.__isolated_client:
+        isolated = self._isolated_client
+        if isolated is not None:
+            self._isolated_client = None
+            parent = self._parent_client
+            if parent is not None and isolated in parent.isolated_clients:
+                parent.isolated_clients.remove(isolated)
+            # shielded: a close from the channel's own message handler cancels the task it runs in
             with contextlib.suppress(Exception):
-                await self.__isolated_client.disconnect()
+                await asyncio.shield(isolated.disconnect())
 
 
 class PrivateChannel(Channel):
@@ -300,7 +309,9 @@ class PrivateChannel(Channel):
         """Setup a request handler for this private channel."""
         sorted_ids = sorted([self.__client_id, self.__target_client_id])
         subject = f"channel.private.{self._channel_id}.{'.'.join(sorted_ids)}.request"
-        return await self._client.on_request(subject, handler)
+        unsubscribe = await self._client.on_request(subject, handler)
+        self._subscriptions.append(unsubscribe)
+        return unsubscribe
 
     async def close(self) -> None:
         """Close the private channel gracefully."""

@@ -2,29 +2,61 @@
 
 import asyncio
 import contextlib
+import inspect
+import math
 import ssl
+import sys
 import time
 import traceback
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
+from collections import deque
+from collections.abc import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Generic, Literal, TypeVar, cast, overload
 
-from nats import (
-    connect,  # pyright: ignore[reportUnknownVariableType]
-    errors,
-)
+import nats.aio.client as nats_aio_client
+from nats import errors
 from nats.aio.client import NO_RESPONDERS_STATUS, ErrorCallback
 from nats.aio.client import Client as NATSClient
 from nats.aio.msg import Msg
-from nats.aio.subscription import Subscription
+from nats.aio.subscription import (
+    DEFAULT_SUB_PENDING_BYTES_LIMIT,
+    DEFAULT_SUB_PENDING_MSGS_LIMIT,
+    Subscription,
+)
 from nats.js.api import Header
+from nats.protocol import command as nats_command
 
 from .channel import Channel, PrivateChannel
-from .chunking import ChunkingManager, create_chunks
+from .chunking import (
+    CHUNK_RESERVE,
+    MAX_CONCURRENT_TRANSFERS,
+    MIN_PAYLOAD_LIMIT,
+    ChunkingManager,
+    TransferBudget,
+    create_chunks,
+    parse_chunk_index,
+)
 from .codec import decode, decode_message, encode, encode_message
 from .decorators import extract_nested_methods_with_decorators, extract_nested_methods_without_decorators
-from .errors import RPCException, create_error
+from .errors import (
+    LocalNoRespondersError,
+    RPCException,
+    RPCTimeoutError,
+    create_error,
+    create_error_from_dict,
+    is_local_no_responders,
+    reported_error,
+)
 from .executor import get_executor
 from .handler import (
     format_error_dict,
@@ -32,8 +64,12 @@ from .handler import (
     handle_normal_rpc,
     handle_pull_callback_request,
     handle_pull_iterator_request,
-    handle_stream_request,
+    refuse_stream,
+    run_in_background,
+    set_up_session,
+    start_stream_request,
 )
+from .patches import ARRIVAL_STAMPS, ArrivalMsg, NatsConnection, connect
 from .service import RPCService
 from .types import (
     CallbackParams,
@@ -41,6 +77,7 @@ from .types import (
     ConnectionOptions,
     ErrorCode,
     NoResponderRetryOptions,
+    OrphanProbeOptions,
     PullCallbackParams,
     PullIteratorRequest,
     PullIteratorResponse,
@@ -62,6 +99,405 @@ from .utils import (
 )
 
 T = TypeVar("T")
+
+_Teardown = Callable[[], Coroutine[Any, Any, None]]
+
+NATS_READ_BUFFER_SIZE = 256 * 1024
+"""Socket read size for nats-py; its 32 KB default costs a frame-sized message dozens of reads."""
+
+# nats-py looks the constant up on every connect and read, so this also covers reconnects;
+# a bigger value set by someone else is kept
+if (
+    isinstance(getattr(nats_aio_client, "DEFAULT_BUFFER_SIZE", None), int)
+    and nats_aio_client.DEFAULT_BUFFER_SIZE < NATS_READ_BUFFER_SIZE
+):
+    nats_aio_client.DEFAULT_BUFFER_SIZE = NATS_READ_BUFFER_SIZE
+
+
+def _inline_delivery_supported() -> bool:
+    """Whether nats-py resolves a subscription's ``future`` from its read loop, before queueing."""
+    try:
+        has_param = "future" in inspect.signature(NATSClient.subscribe).parameters
+        names = set(NATSClient._process_msg.__code__.co_names)  # pyright: ignore[reportPrivateUsage]
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return has_param and {"_future", "cancelled", "set_result"} <= names
+
+
+INLINE_REPLY_DELIVERY = _inline_delivery_supported()
+"""True when the reply mux can run straight from nats-py's read loop (see _InlineSink)."""
+
+
+class _InlineSink:
+    """Stands in for the future nats-py resolves for old-style request inboxes.
+
+    nats-py hands a message to ``set_result`` from its read loop instead of
+    queueing it for the subscription task, which saves the reply mux one task
+    hop per message.
+    """
+
+    __slots__ = ("_handler", "_pattern")
+
+    def __init__(self, handler: Callable[[Msg], None], pattern: str) -> None:
+        self._handler = handler
+        self._pattern = pattern
+
+    def cancelled(self) -> bool:
+        return False
+
+    def set_result(self, msg: Msg) -> None:
+        # an exception escaping here ends nats-py's read loop and leaves the connection silently dead
+        try:
+            self._handler(msg)
+        except Exception as e:
+            print(f"Error processing message for {self._pattern}:", e)
+            print(traceback.format_exc())
+
+
+async def _idle_callback(_msg: Msg) -> None:
+    pass
+
+
+METHODS_METHOD = "__methods"
+"""Every registration also answers ``rpc.<namespace>.__methods`` with its method names."""
+
+DEFAULT_DRAIN_TIMEOUT_MS = 250
+"""How long a teardown lets calls the handlers already received finish."""
+
+EXPIRY_SLACK_MS = 5
+"""How much longer than its caller's timeout a request may wait before an opted-in method skips it."""
+
+DEFAULT_RETRY_DELAYS = (0.025, 0.05, 0.1, 0.325, 1.0, 2.0)
+"""No-responder retry when the caller sets neither delays nor max_retries: about 3.5 s, the first retry soon."""
+
+LEGACY_RETRY_DELAYS = (0.5, 1.0, 2.0)
+LEGACY_MAX_RETRIES = 3
+"""What a caller gets that sets only one of delays and max_retries."""
+
+METHOD_PROBE_WINDOW = 0.5
+"""Seconds the method list of a namespace may take to answer, also when the first retry delay is shorter."""
+
+
+def _queued_ping_supported() -> bool:
+    """Whether a PING can queue behind nats-py's pending commands and be answered on a future of our own."""
+    try:
+        nc = NATSClient()
+        return (
+            inspect.iscoroutinefunction(NATSClient._send_command)  # pyright: ignore[reportPrivateUsage]
+            and inspect.iscoroutinefunction(NATSClient._flush_pending)  # pyright: ignore[reportPrivateUsage]
+            and isinstance(nc._pongs, list)  # pyright: ignore[reportPrivateUsage]
+            and {"_pongs", "pop", "set_result"} <= set(NATSClient._process_pong.__code__.co_names)  # pyright: ignore[reportPrivateUsage]
+            and getattr(nats_aio_client, "PING_PROTO", None) == b"PING\r\n"
+        )
+    except Exception:
+        return False
+
+
+QUEUED_PING = _queued_ping_supported()
+"""True when a PING can trail the SUBs and UNSUBs nats-py has not written yet."""
+
+
+def _handler_drain_supported() -> bool:
+    """Whether nats-py keeps what the handler drain uses where it expects it.
+
+    The drain queues UNSUB and PING behind each other in the pending buffer,
+    waits for the PONG on its own future and then for each subscription's
+    message queue.
+    """
+    try:
+        nc = NATSClient()
+        sub = Subscription(nc, 7, "rpc.x", cb=_idle_callback)
+        return (
+            QUEUED_PING
+            and nats_command.unsub_cmd(7, 0) == b"UNSUB 7 \r\n"
+            and sub._id == 7  # pyright: ignore[reportPrivateUsage]
+            and sub._wait_for_msgs_task is None  # pyright: ignore[reportPrivateUsage]
+            and isinstance(sub._pending_queue, asyncio.Queue)  # pyright: ignore[reportPrivateUsage]
+            and {"_pending_queue", "_cb", "task_done"} <= set(Subscription._wait_for_msgs.__code__.co_names)  # pyright: ignore[reportPrivateUsage]
+        )
+    except Exception:
+        return False
+
+
+HANDLER_DRAIN = _handler_drain_supported()
+"""True when teardowns can drain handler subscriptions, otherwise they end them at once."""
+
+SUBSCRIBE_CONFIRM_TIMEOUT = 1
+"""Seconds a registration waits for the server to confirm its subscriptions, a half-dead link must not stall it."""
+
+
+async def _queue_ping(nc: NATSClient) -> asyncio.Future[bool]:
+    """Queue a PING behind the commands nats-py has pending, the returned future resolves with its PONG."""
+    pong: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    nc._pongs.append(pong)  # pyright: ignore[reportPrivateUsage]
+    # through the pending buffer: nats-py's flush() writes its PING ahead of queued commands
+    await nc._send_command(nats_aio_client.PING_PROTO)  # pyright: ignore[reportPrivateUsage]
+    await nc._flush_pending()  # pyright: ignore[reportPrivateUsage]
+    return pong
+
+
+class _ChunkScope:
+    """Chunk reassembly of one subscription, shared by queue members with the same pattern and queue name.
+
+    A namespace subscription keeps one manager per registered method in
+    ``methods``, so each method has the transfer limit it would have with a
+    subscription of its own. ``methods`` is created with the first such
+    transfer, every other subscription leaves it at None.
+    """
+
+    __slots__ = ("key", "manager", "methods", "refs")
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        self.manager: ChunkingManager | None = None
+        self.methods: dict[str, ChunkingManager] | None = None
+        self.refs = 0
+
+    def close(self) -> None:
+        if self.manager is not None:
+            self.manager.close()
+            self.manager = None
+        methods, self.methods = self.methods, None
+        for manager in (methods or {}).values():
+            manager.close()
+
+
+class _Lane:
+    """The calls of one method under a namespace subscription, served in arrival order.
+
+    Its task runs only while calls wait. ``pending_msgs`` mirrors the
+    attribute of a nats-py subscription, the reply path reads it.
+    """
+
+    __slots__ = ("_dispatch", "_items", "pending_bytes", "task")
+
+    def __init__(self, dispatch: Callable[[Any], Coroutine[Any, Any, None]]) -> None:
+        self._dispatch = dispatch
+        self._items: deque[tuple[Any, int]] = deque()
+        self.pending_bytes = 0
+        self.task: asyncio.Task[None] | None = None
+
+    @property
+    def pending_msgs(self) -> int:
+        return len(self._items)
+
+    def push(self, item: Any, size: int) -> None:
+        self._items.append((item, size))
+        self.pending_bytes += size
+        if self.task is None:
+            self.task = asyncio.get_running_loop().create_task(self._run())
+
+    def take(self) -> list[Any]:
+        """Remove and return what still waits."""
+        items = [item for item, _ in self._items]
+        self._items.clear()
+        self.pending_bytes = 0
+        return items
+
+    def stop(self) -> asyncio.Task[None] | None:
+        """Drop what waits and cancel the running call, returns its task to await."""
+        self.take()
+        task = self.task
+        if task is None or task is asyncio.current_task():
+            return None
+        task.cancel()
+        return task
+
+    async def dispatch(self, item: Any) -> None:
+        await self._dispatch(item)
+
+    async def _run(self) -> None:
+        try:
+            while self._items:
+                item, size = self._items.popleft()
+                self.pending_bytes -= size
+                await self._dispatch(item)
+        finally:
+            self.task = None
+
+
+class _Registration:
+    """The handler subscriptions of one register_handler() call, drained together."""
+
+    __slots__ = ("calls", "entries", "expired", "lanes")
+
+    def __init__(self) -> None:
+        self.entries: list[dict[str, Any]] = []
+        # calls of methods with a concurrency limit, run outside their subscription task
+        self.calls: set[asyncio.Task[None]] = set()
+        # method lanes of a namespace subscription
+        self.lanes: list[_Lane] = []
+        # past the drain deadline: requests still unanswered get CONNECTION_CLOSED
+        self.expired = False
+
+
+def _stop_lanes(registrations: Iterable[_Registration]) -> list[asyncio.Task[None]]:
+    """Drop what the lanes of the registrations hold and cancel their calls, returns the tasks to await."""
+    return [task for r in registrations for lane in r.lanes if (task := lane.stop()) is not None]
+
+
+DEFAULT_ORPHAN_PROBE_INTERVAL_MS = 30_000
+DEFAULT_ORPHAN_PROBE_GRACE_MS = 300_000
+
+
+class _OrphanProbe:
+    """Notices that the consumer of a session this client serves vanished without a cancel.
+
+    At most once per interval a publish of the session carries a reply on this
+    client's reply inbox, an idle session sends a ping instead. The server
+    answers a message nobody receives with a no-responder status there. A
+    probe that stays unanswered means the consumer was there; statuses for
+    the whole grace period end the session.
+    """
+
+    __slots__ = (
+        "_client",
+        "_grace",
+        "_interval",
+        "_last",
+        "_missing_since",
+        "_on_gone",
+        "_ping",
+        "_stopped",
+        "_timer",
+        "_token",
+        "due",
+        "sent",
+    )
+
+    def __init__(self, client: "RPCClient", interval: float, grace: float) -> None:
+        self._client = client
+        self._interval = interval
+        self._grace = grace
+        # last probe or word from the consumer
+        self._last = time.monotonic()
+        self.sent = False
+        self.due = False
+        self._token: str | None = None
+        self._missing_since: float | None = None
+        self._timer: asyncio.TimerHandle | None = None
+        self._ping: Callable[[str], Coroutine[Any, Any, None]] | None = None
+        self._on_gone: Callable[[], None] | None = None
+        self._stopped = False
+
+    def start(self, ping: Callable[[str], Coroutine[Any, Any, None]], on_gone: Callable[[], None]) -> None:
+        if self._stopped:
+            return
+        self._ping = ping
+        self._on_gone = on_gone
+        self._arm(self._interval)
+
+    def reply(self) -> str:
+        """Reply subject for the publish that takes a due probe, empty when it cannot go out."""
+        if not self.due or self._stopped or not self._client.is_connected:
+            return ""
+        return self._next_probe(time.monotonic())
+
+    def touch(self) -> None:
+        """The consumer just spoke to the session."""
+        self._last = time.monotonic()
+        self._missing_since = None
+
+    def stop(self) -> None:
+        self._stopped = True
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+        if self._token is not None:
+            self._client.status_handlers.pop(self._token, None)
+            self._token = None
+
+    def _next_probe(self, now: float) -> str:
+        self.due = False
+        token = self._token
+        # still registered: no status came back, the consumer received the last probe
+        if token is not None and self._client.status_handlers.pop(token, None) is not None:
+            self._missing_since = None
+        self._last = now
+        token = self._token = generate_id(self._client._reply_prefix)
+        self._client.status_handlers[token] = self._on_status
+        return f"rpc.reply.{token}"
+
+    def _on_status(self, _error: Exception) -> None:
+        if self._stopped:
+            return
+        now = time.monotonic()
+        if self._missing_since is None:
+            self._missing_since = now
+        if now - self._missing_since >= self._grace:
+            on_gone = self._on_gone
+            self.stop()
+            if on_gone is not None:
+                on_gone()
+
+    def _arm(self, delay: float) -> None:
+        self._timer = asyncio.get_running_loop().call_later(delay, self._tick)
+
+    def _tick(self) -> None:
+        self._timer = None
+        if self._stopped:
+            return
+        now = time.monotonic()
+        since = now - self._last
+        if since < self._interval:
+            self._arm(self._interval - since)
+            return
+        sent, self.sent = self.sent, False
+        if sent:
+            # the session publishes, its next publish carries the probe
+            self.due = True
+        elif self._client.is_connected and self._ping is not None:
+            run_in_background(self._ping(self._next_probe(now)))
+        self._arm(self._interval)
+
+
+def _expired(message: Any, arrived: float) -> bool:
+    """Whether a request waited longer than its caller's timeout (``__ttl``) before its handler could start."""
+    ttl = message.get("__ttl") if isinstance(message, dict) else None
+    if not isinstance(ttl, int | float) or isinstance(ttl, bool) or ttl <= 0:
+        return False
+    return (time.monotonic() - arrived) * 1000 > ttl + EXPIRY_SLACK_MS
+
+
+def _namespace_subscribable(namespace: str) -> bool:
+    first = namespace.split(".", 1)[0]
+    return first not in ("reply", "cb")
+
+
+def _reply_error(error: Any) -> RPCException:
+    # runs after the call's timer is cancelled, so it must not raise
+    if isinstance(error, dict):
+        return create_error_from_dict(cast(dict[str, Any], error))
+    return create_error(ErrorCode.INTERNAL_ERROR, f"Malformed error in reply: {error!r}")
+
+
+def _forbidden(subject: str) -> RPCException:
+    return create_error(ErrorCode.FORBIDDEN, f'Permission denied for "{subject}"', {"subject": subject})
+
+
+def _refused_publish_subject(error: Exception) -> str | None:
+    """The subject of a publish nats-server refused, None for any other error."""
+    marker = 'permissions violation for publish to "'
+    text = str(error)
+    start = text.lower().find(marker)
+    if start < 0:
+        return None
+    subject, quote, _ = text[start + len(marker) :].partition('"')
+    return subject if quote and subject else None
+
+
+def _forget_session(cleanups: dict[str, Any], ids: set[str], session_id: str) -> None:
+    cleanups.pop(session_id, None)
+    ids.discard(session_id)
+
+
+async def _cancel_tasks(tasks: Iterable[asyncio.Task[None]]) -> None:
+    # a handler that tears its own client down must not wait for itself
+    current = asyncio.current_task()
+    pending = [task for task in tasks if task is not current]
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
 
 
 def create_rpc_client(options: RPCClientOptions) -> RPCClientProtocol:
@@ -91,15 +527,37 @@ class RPCClient(RPCClientProtocol):
     """RPC client for NATS-based communication."""
 
     def __init__(self, options: RPCClientOptions):
-        """Initialize RPC client with options."""
+        """Initialize RPC client with options.
+
+        Raises ValueError for a ``max_payload_size`` that is not an int, from
+        1 to 16383 bytes or below 0; 16384 is the smallest limit that leaves
+        room for a chunk and 0 means the server's limit.
+        """
+        payload_cap = options.get("max_payload_size")
+        # bool is an int too, a float would make chunk sizes floats
+        if payload_cap is not None and type(payload_cap) is not int:
+            raise ValueError(f"max_payload_size {payload_cap!r} is not an integer")
+        if payload_cap and payload_cap < MIN_PAYLOAD_LIMIT:
+            raise ValueError(
+                f"max_payload_size {payload_cap} is too small, chunking needs at least {MIN_PAYLOAD_LIMIT} bytes"
+            )
         self.options: RPCClientOptions = options
         self.service: RPCService = RPCService(cast(Any, self))
 
         self.nc: NATSClient | None = None
         self._subscription_seq: int = 0
         self._subscription_entries: dict[int, dict[str, Any]] = {}
-        self.chunking_manager: ChunkingManager = ChunkingManager()
+        self._chunk_budget: TransferBudget = TransferBudget(options.get("max_transfer_size"))
+        self._chunk_scopes: dict[str, _ChunkScope] = {}
+        # service endpoint managers, closed with the connection like the scopes
+        self._endpoint_chunking: set[ChunkingManager] = set()
+        # public attribute kept for compatibility, subscriptions reassemble in their own scope
+        self.chunking_manager: ChunkingManager = self._new_chunking_manager()
+        # one transfer per pending call, so the calls bound it instead of a transfer cap
+        self._mux_chunking: ChunkingManager = self._new_chunking_manager(math.inf)
         self._max_payload_size: int = 1024 * 1024  # Default 1MB
+        # set while the server's limit is below MIN_PAYLOAD_LIMIT: messages over it fail instead of being chunked
+        self._unchunkable_limit: int | None = None
         self._connection_task: asyncio.Task[NATSClient] | None = None
 
         # First dot-separated segment of every id this client generates.
@@ -127,10 +585,24 @@ class RPCClient(RPCClientProtocol):
         self.isolated_clients: list[RPCClient] = []
         self.pull_iterator_cleanups: dict[str, Callable[[], Coroutine[Any, Any, None]]] = {}
         self.callback_cleanups: dict[str, Callable[[], Coroutine[Any, Any, None]]] = {}
+        # push streams this client serves, ended by unregister, suspend() and disconnect()
+        self.stream_cleanups: dict[str, Callable[[], Coroutine[Any, Any, None]]] = {}
         self._pull_iterator_settles: set[Callable[[], None]] = set()
+        # handler calls of methods registered with a concurrency limit, run outside their subscription task
+        self._concurrent_calls: set[asyncio.Task[None]] = set()
+        self._registrations: set[_Registration] = set()
+        # their message task ends at the drain, the teardown that drains them drops the entries
+        self._drained_subs: set[Subscription] = set()
 
         self._closed = False
         self._suspending = False
+        # nats-py closed the connection for good on its own, the next connect() replaces it
+        self._connection_lost = False
+        # per subject: when the last drop was logged and the drops since
+        self._slow_consumer_log: dict[str, tuple[float, int]] = {}
+        # set by the first registration with drop_expired, see _stamp_arrivals()
+        self._arrival_stamps = False
+        self._error_cb: ErrorCallback = self._make_error_cb()
 
         self.io_pool: ThreadPoolExecutor = get_executor()
 
@@ -154,8 +626,13 @@ class RPCClient(RPCClientProtocol):
         return RPCClient(options)
 
     async def connect(self) -> NATSClient:
-        """Connect to NATS server."""
-        if self.nc and self.nc.is_connected:
+        """Connect to NATS server.
+
+        Returns the current connection while nats-py reconnects it; publishes
+        are buffered until the link is back and calls stay bounded by their
+        timeout. Only a missing or closed connection opens a new one.
+        """
+        if self.nc is not None and not self.nc.is_closed:
             return self.nc
 
         if not self._connection_task:
@@ -174,39 +651,95 @@ class RPCClient(RPCClientProtocol):
         nats-py's default callback dumps full tracebacks to stderr for every transport
         hiccup. During shutdown the broker goes away under us, so connection-reset and
         reconnect errors are expected and pure noise — swallow them. A consumer-provided
-        error_cb still wins outside that case.
+        error_cb still wins outside that case. Without one, dropped messages of a slow
+        consumer are logged with their subject.
         """
         user_cb: ErrorCallback | None = self.options.get("error_cb")
 
         async def _error_cb(error: Exception) -> None:
             if self._closed:
                 return
+            if (subject := _refused_publish_subject(error)) is not None:
+                self._fail_refused_publish(subject)
             if user_cb is not None:
                 await user_cb(error)
+            elif isinstance(error, errors.SlowConsumerError):
+                self._log_slow_consumer(error.subject)
 
         return _error_cb
 
+    def _fail_refused_publish(self, subject: str) -> None:
+        """nats-server refused a publish to ``subject``: the calls and stream starts waiting there fail now.
+
+        They would only run into their timeout, and nothing retries a refused
+        subject. nats-py lowercases the server's text, so subjects compare
+        without case.
+        """
+        refused = subject.lower()
+        for request_id, pending in list(self.pending_requests.items()):
+            target = pending.get("subject")
+            if not isinstance(target, str) or target.lower() != refused:
+                continue
+            del self.pending_requests[request_id]
+            if timeout_handle := pending.get("timeout"):
+                timeout_handle.cancel()
+            if transfer_key := pending.get("transfer_key"):
+                self._mux_chunking.discard(transfer_key)
+            future: asyncio.Future[Any] | None = pending.get("future")
+            if future is not None and not future.done():
+                future.set_exception(_forbidden(target))
+        for handler in list(self.stream_handlers.values()):
+            target = handler.get("subject")
+            if isinstance(target, str) and target.lower() == refused:
+                handler["error"](_forbidden(target))
+
+    def _log_slow_consumer(self, subject: str) -> None:
+        # nats-py reports every dropped message, one line per subject and second is enough
+        now = time.monotonic()
+        logged, dropped = self._slow_consumer_log.get(subject, (-math.inf, 0))
+        dropped += 1
+        if now - logged < 1:
+            self._slow_consumer_log[subject] = (logged, dropped)
+            return
+        self._slow_consumer_log[subject] = (now, 0)
+        print(f"rpc: slow consumer on {subject}, dropped {dropped} message(s)", file=sys.stderr)
+
+    def _report_slow_consumer(self, subject: str) -> None:
+        """A message for ``subject`` was dropped because its handler is too far behind."""
+        error = errors.SlowConsumerError(subject=subject, reply="", sid=0, sub=cast(Subscription, None))
+        run_in_background(self._error_cb(error))
+
     async def _connect(self) -> NATSClient:
         """Internal connection method."""
+        reconnect = self.options.get("reconnect", True)
         # Build connection options
         connect_opts: ConnectionOptions = {
             "servers": self.options["servers"],
             "name": self.options["name"],
-            "allow_reconnect": self.options.get("reconnect", True),
-            "max_reconnect_attempts": self.options.get("max_reconnect_attempts", -1),
-            "reconnect_time_wait": int(
-                self.options.get("reconnect_time_wait", 2000) / 1000
-            ),  # Convert to seconds
+            "allow_reconnect": reconnect,
+            # nats-py dials the first connect forever with -1 and with 0, 1 gives up after the second dial
+            "max_reconnect_attempts": self.options.get("max_reconnect_attempts", -1 if reconnect else 1),
+            # float seconds, 500 ms must not turn into 0; nats-py has no jitter, the floor keeps 0 from busy-looping
+            "reconnect_time_wait": max(self.options.get("reconnect_time_wait", 2000), 100) / 1000,
             # nats-py defaults to 2s, which a host name resolving to a dead ::1
             # first burns entirely before the ipv4 fallback is even tried
-            "connect_timeout": int(self.options.get("connect_timeout", 10000) / 1000),
+            "connect_timeout": max(self.options.get("connect_timeout", 10000), 1) / 1000,
             # "no_echo": True,  # Don't echo messages back to the client
             "pending_size": 6 * 1024 * 1024,  # 6MB pending buffer
-            "error_cb": self._make_error_cb(),
+            "error_cb": self._error_cb,
         }
 
         if reconnected_cb := self.options.get("reconnected_cb"):
             connect_opts["reconnected_cb"] = reconnected_cb
+
+        # bound to this connection, so the late close of a replaced one changes nothing
+        opened: list[NATSClient] = []
+
+        async def closed_cb() -> None:
+            if opened:
+                await self._on_connection_lost(opened[0])
+
+        connect_opts["closed_cb"] = closed_cb
 
         # Add auth if provided
         if auth := self.options.get("auth"):
@@ -226,6 +759,9 @@ class RPCClient(RPCClientProtocol):
                 connect_opts["tls"] = context
 
         self.nc = await connect(**connect_opts)
+        opened.append(self.nc)
+        if self._arrival_stamps and ARRIVAL_STAMPS:
+            self.nc.msg_class = ArrivalMsg
 
         # A client that was disconnect()ed is revivable by an explicit
         # connect(). Without this reset, auto-connect in _call_once and the
@@ -235,11 +771,17 @@ class RPCClient(RPCClientProtocol):
         # Initialize service
         self.service.init(self.nc)
 
-        # Get max_payload from server info
-        self._max_payload_size = self.nc.max_payload
-
-        # Reserve 8KB for NATS protocol overhead and MsgPack envelope per message
-        self._max_payload_size = self._max_payload_size - 8192
+        # the option only lowers the server's limit: a larger message would be refused,
+        # a smaller cap keeps messages fit for a leaf link with a lower one
+        limits = [
+            limit
+            for limit in (self.nc.max_payload, self.options.get("max_payload_size"))
+            if limit is not None and limit > 0
+        ]
+        limit = min(limits) if limits else 1024 * 1024
+        # below the floor no chunk fits next to the reserve, a message goes out whole or fails
+        self._unchunkable_limit = limit if limit < MIN_PAYLOAD_LIMIT else None
+        self._max_payload_size = limit if limit < MIN_PAYLOAD_LIMIT else limit - CHUNK_RESERVE
 
         # Register the muxed reply inbox (idempotent). Registered as a normal
         # subscription entry so the restore loop below (re-)subscribes it on
@@ -249,45 +791,45 @@ class RPCClient(RPCClientProtocol):
         # Restore subscriptions after reconnect (from suspend). Entries keep
         # their identity so unsubscribe closures held by callers stay valid
         # across the restore.
+        restored = False
         for entry in list(self._subscription_entries.values()):
             sub = entry.get("sub")
             if sub is None or getattr(sub, "_closed", False):
-                await self._nats_subscribe(entry)
+                await self._nats_subscribe(entry, yield_after=False)
+                restored = restored or entry is not self._mux_entry
+        if restored:
+            await self._confirm_subscriptions()
+
+        if self._connection_lost:
+            self._connection_lost = False
+            # nats-py reports only reconnects of one connection, not its replacement
+            if reconnected_cb:
+                run_in_background(reconnected_cb())
+
+        # isolated clients come back with their subscriptions after a suspend(), a closed one stays closed
+        if children := [child for child in self.isolated_clients if not child.is_closed]:
+            await asyncio.gather(*(child.connect() for child in children), return_exceptions=True)
 
         return self.nc
 
     async def disconnect(self) -> None:
-        """Disconnect from NATS server."""
+        """Disconnect from NATS server.
+
+        Calls the handlers already received may finish first, see
+        ``drain_timeout_ms``.
+        """
+        registrations = list(self._registrations)
+        # before the client counts as closed and its pending calls fail: running handlers may still call out
+        await self._drain_handlers(keep=False)
         self._closed = True
+        self._connection_lost = False
 
-        # Cleanup pending requests. RPC calls are muxed (no per-call
-        # subscription); service-path calls still hold a per-call reply entry
-        # which the cleanup hook drops.
-        await self._cleanup_pending_requests()
-        self.status_handlers.clear()
-
-        # Cleanup stream handlers
-        for handler in self.stream_handlers.values():
-            try:
-                if end := handler.get("end"):
-                    end()
-            except Exception:
-                pass
-        self.stream_handlers.clear()
-
-        self._settle_pull_iterators()
-
-        # Cleanup pull iterators
-        await asyncio.gather(
-            *[cleanup() for cleanup in self.pull_iterator_cleanups.values()], return_exceptions=True
-        )
-        self.pull_iterator_cleanups.clear()
-
-        # Cleanup callbacks
-        await asyncio.gather(
-            *[cleanup() for cleanup in self.callback_cleanups.values()], return_exceptions=True
-        )
-        self.callback_cleanups.clear()
+        # RPC calls are muxed (no per-call subscription); service-path calls
+        # still hold a per-call reply entry which the cleanup hook drops.
+        cleanups = self._end_session()
+        sessions = self._take_handler_sessions()
+        await self._run_cleanups(cleanups)
+        await self._end_handler_sessions(sessions)
 
         # Unsubscribe all subscriptions
         for entry in list(self._subscription_entries.values()):
@@ -296,11 +838,15 @@ class RPCClient(RPCClientProtocol):
                     await sub.unsubscribe()
             entry["sub"] = None
         self._subscription_entries.clear()
+
+        # after the unsubscribe: a slot freed by a cancelled call would start the next queued call
+        await asyncio.gather(*_stop_lanes(registrations), return_exceptions=True)
+        await _cancel_tasks(self._concurrent_calls)
         # Entries were dropped — a revive-connect() must re-register the mux.
         self._mux_entry = None
 
-        # Clear chunking manager
-        self.chunking_manager = ChunkingManager()
+        self._reset_chunking()
+        self._chunk_scopes.clear()
 
         # Shutdown thread pool
         # self.io_pool.shutdown(wait=False)
@@ -321,47 +867,146 @@ class RPCClient(RPCClientProtocol):
             self.nc = None
 
     async def suspend(self) -> None:
-        """Suspend the connection without marking as closed, preserving subscription metadata for reconnect."""
+        """Suspend the connection without marking as closed, preserving subscription metadata for reconnect.
+
+        Isolated clients are suspended with it and come back with connect().
+        """
+        await self._suspend(drain=True)
+
+    async def _suspend(self, drain: bool) -> None:
         # Block on_finish-driven cleanup from dropping subscription entries
         # while we tear the transport down — the msg tasks ending here are not
         # user-initiated unsubscribes; connect() must be able to restore the
         # entries.
         self._suspending = True
+        self._connection_lost = False
         try:
+            if drain:
+                await self._drain_handlers(keep=True)
             await self._do_suspend()
         finally:
             self._suspending = False
+            # connect() restores the subscriptions of these registrations
+            for registration in self._registrations:
+                registration.expired = False
+
+    async def _drain_handlers(self, keep: bool) -> None:
+        """Drain the handlers of this client and of its isolated clients side by side.
+
+        ``keep`` keeps the registrations for a later connect(), here and in the
+        isolated clients the teardown that follows suspends too.
+        """
+        registrations = list(self._registrations)
+        if not keep:
+            self._registrations.clear()
+        if not self.isolated_clients:
+            await self._drain_registrations(registrations)
+            return
+        await asyncio.gather(
+            self._drain_registrations(registrations),
+            *(client._drain_handlers(keep=keep) for client in self.isolated_clients),
+            return_exceptions=True,
+        )
+
+    async def _drain_registrations(self, registrations: Iterable[_Registration]) -> None:
+        """Let the calls handlers already received finish before their subscriptions go.
+
+        UNSUB goes out first, so new calls see a no-responder and their retry
+        finds another instance. Calls received before it run until
+        ``drain_timeout_ms``; whatever is unanswered then, started or still
+        queued, gets CONNECTION_CLOSED. The subscriptions stay with their
+        entries for the teardown that follows.
+        """
+        timeout_ms = self.options.get("drain_timeout_ms", DEFAULT_DRAIN_TIMEOUT_MS)
+        nc = self.nc
+        if timeout_ms <= 0 or not HANDLER_DRAIN or not isinstance(nc, NATSClient) or not nc.is_connected:
+            return
+        registrations = list(registrations)
+        drained = [
+            (entry, sub)
+            for registration in registrations
+            for entry in registration.entries
+            if isinstance(sub := entry.get("sub"), Subscription) and not sub._closed  # pyright: ignore[reportPrivateUsage]
+        ]
+        if not drained and not any(
+            registration.calls or registration.lanes for registration in registrations
+        ):
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_ms / 1000
+        # a handler that tears down its own registration must not wait for itself
+        current = asyncio.current_task()
+        queues: list[asyncio.Queue[Msg]] = []
+        try:
+            for _, sub in drained:
+                self._drained_subs.add(sub)
+                await nc._send_command(nats_command.unsub_cmd(sub._id, 0))  # pyright: ignore[reportPrivateUsage]
+                if sub._wait_for_msgs_task is not current:  # pyright: ignore[reportPrivateUsage]
+                    queues.append(sub._pending_queue)  # pyright: ignore[reportPrivateUsage]
+
+            # the PONG trails every call the server routed here before the UNSUBs
+            pong = await _queue_ping(nc)
+            # no wait_for: nats-py sets a PONG future's result without checking for a cancel
+            await asyncio.wait((pong,), timeout=max(0.0, deadline - loop.time()))
+
+            async def settle() -> None:
+                for queue in queues:
+                    await queue.join()
+                for registration in registrations:
+                    while running := [
+                        t
+                        for t in (*registration.calls, *(lane.task for lane in registration.lanes))
+                        if t is not None and t is not current and not t.done()
+                    ]:
+                        await asyncio.wait(running)
+
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(settle(), max(0.0, deadline - loop.time()))
+
+            for registration in registrations:
+                registration.expired = True
+            # a call task created just now starts, so its cancel reaches the handler
+            await asyncio.sleep(0)
+            stopped: list[asyncio.Task[Any]] = []
+            for _, sub in drained:
+                task = cast("asyncio.Task[None] | None", sub._wait_for_msgs_task)  # pyright: ignore[reportPrivateUsage]
+                if task is not None and task is not current and not task.done():
+                    task.cancel()
+                    stopped.append(task)
+            for registration in registrations:
+                for task in (*registration.calls, *(lane.task for lane in registration.lanes)):
+                    if task is not None and task is not current and not task.done():
+                        task.cancel()
+                        stopped.append(task)
+            await asyncio.gather(*stopped, return_exceptions=True)
+
+            # requests that never started get CONNECTION_CLOSED through their subscription's own dispatch
+            for entry, sub in drained:
+                dispatch = entry.get("dispatch")
+                queue = sub._pending_queue  # pyright: ignore[reportPrivateUsage]
+                while dispatch is not None and not queue.empty():
+                    msg = queue.get_nowait()
+                    try:
+                        await dispatch(msg)
+                    finally:
+                        queue.task_done()
+            for registration in registrations:
+                for lane in registration.lanes:
+                    for item in lane.take():
+                        await lane.dispatch(item)
+        finally:
+            self._drained_subs.difference_update(sub for _, sub in drained)
 
     async def _do_suspend(self) -> None:
-        # Cleanup pending requests. RPC calls are muxed (no per-call
-        # subscription); service-path calls still hold a per-call reply entry
-        # which the cleanup hook drops — otherwise a suspended in-flight call
-        # would be restored as a dead reply subscription on the next connect().
-        await self._cleanup_pending_requests()
-        self.status_handlers.clear()
-
-        # Cleanup stream handlers
-        for handler in self.stream_handlers.values():
-            try:
-                if end := handler.get("end"):
-                    end()
-            except Exception:
-                pass
-        self.stream_handlers.clear()
-
-        self._settle_pull_iterators()
-
-        # Cleanup pull iterators
-        await asyncio.gather(
-            *[cleanup() for cleanup in self.pull_iterator_cleanups.values()], return_exceptions=True
-        )
-        self.pull_iterator_cleanups.clear()
-
-        # Cleanup callbacks
-        await asyncio.gather(
-            *[cleanup() for cleanup in self.callback_cleanups.values()], return_exceptions=True
-        )
-        self.callback_cleanups.clear()
+        # RPC calls are muxed (no per-call subscription); service-path calls
+        # still hold a per-call reply entry which the cleanup hook drops,
+        # otherwise a suspended in-flight call would be restored as a dead
+        # reply subscription on the next connect().
+        cleanups = self._end_session()
+        sessions = self._take_handler_sessions()
+        await self._run_cleanups(cleanups)
+        await self._end_handler_sessions(sessions)
 
         # Unsubscribe all subscriptions but keep the entries — connect()
         # restores them on the fresh transport.
@@ -371,13 +1016,16 @@ class RPCClient(RPCClientProtocol):
                     await sub.unsubscribe()
             entry["sub"] = None
 
-        # Clear chunking manager
-        self.chunking_manager = ChunkingManager()
+        # after the unsubscribe: a slot freed by a cancelled call would start the next queued call
+        await asyncio.gather(*_stop_lanes(self._registrations), return_exceptions=True)
+        await _cancel_tasks(self._concurrent_calls)
 
-        # Disconnect all isolated clients, continue even if some fail
+        self._reset_chunking()
+
+        # drained above, connect() brings them back with their subscriptions
         if self.isolated_clients:
             await asyncio.gather(
-                *[client.disconnect() for client in self.isolated_clients],
+                *[client._suspend(drain=False) for client in self.isolated_clients],
                 return_exceptions=True,
             )
 
@@ -388,23 +1036,156 @@ class RPCClient(RPCClientProtocol):
                 await asyncio.wait_for(self.nc.close(), timeout=timeout)
             self.nc = None
 
-    async def _cleanup_pending_requests(self) -> None:
-        """Settle and tear down all in-flight call() requests.
+    async def _on_connection_lost(self, nc: NATSClient) -> None:
+        """Tear down at the close of a connection nats-py gave up on.
 
-        Runs on disconnect/suspend: cancels the timeout, invokes the per-call
-        cleanup hook (which removes the reply/inbox subscriptions and their
-        entries) and rejects the awaiting caller.
+        Our own suspend() and disconnect() tear down themselves. Entries and
+        their chunk scopes stay, so the next call or connect() dials a new
+        connection and restores them, as after suspend().
         """
-        for pending in list(self.pending_requests.values()):
+        if nc is not self.nc or self._suspending or self._closed:
+            return
+        self.nc = None
+        self._connection_lost = True
+        for entry in self._subscription_entries.values():
+            entry["sub"] = None
+        self._reset_chunking()
+        cleanups = self._end_session()
+        sessions = self._take_handler_sessions()
+        # the next call may dial a new connection meanwhile, its calls and sessions stay
+        calls = set(self._concurrent_calls)
+        lanes = _stop_lanes(list(self._registrations))
+
+        await self._run_cleanups(cleanups)
+        await self._end_handler_sessions(sessions)
+        await asyncio.gather(*lanes, return_exceptions=True)
+        await _cancel_tasks(calls)
+
+    def _reset_chunking(self) -> None:
+        # the managers are reusable after close(), so the budget lives as long as the client
+        for scope in self._chunk_scopes.values():
+            scope.close()
+        for manager in self._endpoint_chunking:
+            manager.close()
+        self._endpoint_chunking.clear()
+        self.chunking_manager.close()
+        self._mux_chunking.close()
+
+    def _orphan_probe_settings(
+        self, override: OrphanProbeOptions | Literal[False] | None = None
+    ) -> tuple[float, float] | None:
+        """Interval and grace in seconds for the sessions of a registration, None when probing is off."""
+        src = override if override is not None else self.options.get("orphan_probe", OrphanProbeOptions())
+        if src is False:
+            return None
+        interval = src.get("interval_ms")
+        grace = src.get("grace_ms")
+        if interval is None or interval <= 0:
+            interval = DEFAULT_ORPHAN_PROBE_INTERVAL_MS
+        if grace is None or grace <= 0:
+            grace = DEFAULT_ORPHAN_PROBE_GRACE_MS
+        return interval / 1000, grace / 1000
+
+    def _stamp_arrivals(self) -> None:
+        """Have this client's connections note when each message arrived, for the requests drop_expired skips."""
+        self._arrival_stamps = True
+        if ARRIVAL_STAMPS and isinstance(self.nc, NATSClient):
+            self.nc.msg_class = ArrivalMsg
+
+    def _new_orphan_probe(self, settings: tuple[float, float] | None) -> _OrphanProbe | None:
+        return None if settings is None else _OrphanProbe(self, *settings)
+
+    def _new_chunking_manager(self, max_transfers: float = MAX_CONCURRENT_TRANSFERS) -> ChunkingManager:
+        return ChunkingManager(self.options.get("max_transfer_size"), max_transfers, self._chunk_budget)
+
+    def _open_endpoint_chunking(self) -> ChunkingManager:
+        manager = self._new_chunking_manager()
+        self._endpoint_chunking.add(manager)
+        return manager
+
+    def _close_endpoint_chunking(self, manager: ChunkingManager) -> None:
+        self._endpoint_chunking.discard(manager)
+        manager.close()
+
+    def _join_chunk_scope(self, entry: dict[str, Any]) -> _ChunkScope:
+        # overlapping subscriptions each get a copy of every transfer, so each has its own scope;
+        # queue members of one pattern on one connection share one, the server spreads a transfer across them
+        queue = entry.get("queue") or ""
+        key = f"q:{entry['pattern']}\x00{queue}" if queue else f"s{entry['key']}"
+        scope = self._chunk_scopes.get(key)
+        if scope is None:
+            scope = self._chunk_scopes[key] = _ChunkScope(key)
+        scope.refs += 1
+        entry["chunks"] = scope
+        return scope
+
+    def _leave_chunk_scope(self, entry: dict[str, Any]) -> None:
+        scope: _ChunkScope | None = entry.pop("chunks", None)
+        if scope is None:
+            return
+        scope.refs -= 1
+        if scope.refs > 0:
+            return
+        if self._chunk_scopes.get(scope.key) is scope:
+            del self._chunk_scopes[scope.key]
+        scope.close()
+
+    def _end_session(self) -> list[Callable[[], Coroutine[Any, Any, None]]]:
+        """Settle everything that waits on the connection, without awaiting.
+
+        Rejects pending calls with CONNECTION_CLOSED, ends client streams and
+        settles client pull iterators. Returns the per-call cleanup hooks
+        (reply/inbox subscriptions of service calls) still to run.
+        """
+        cleanups: list[Callable[[], Coroutine[Any, Any, None]]] = []
+        for pending in self.pending_requests.values():
             if timeout_handle := pending.get("timeout"):
                 timeout_handle.cancel()
             if cleanup := pending.get("cleanup"):
-                with contextlib.suppress(Exception):
-                    await cleanup()
+                cleanups.append(cleanup)
             future = pending.get("future")
             if future is not None and not future.done():
                 future.set_exception(create_error(ErrorCode.CONNECTION_CLOSED, "Connection closed"))
         self.pending_requests.clear()
+        self.status_handlers.clear()
+
+        for handler in self.stream_handlers.values():
+            with contextlib.suppress(Exception):
+                if end := handler.get("end"):
+                    end()
+        self.stream_handlers.clear()
+
+        self._settle_pull_iterators()
+        return cleanups
+
+    @staticmethod
+    async def _run_cleanups(cleanups: list[Callable[[], Coroutine[Any, Any, None]]]) -> None:
+        for cleanup in cleanups:
+            with contextlib.suppress(Exception):
+                await cleanup()
+
+    def _track_session(self, sessions: dict[str, _Teardown], session_id: str, teardown: _Teardown) -> None:
+        """Keep the teardown of a session this client serves, so suspend(), disconnect() and a lost connection end it."""
+        if self._closed or self._suspending:
+            # the running teardown already took the sessions it ends
+            run_in_background(teardown())
+            return
+        sessions[session_id] = teardown
+
+    def _take_handler_sessions(self) -> tuple[list[_Teardown], list[_Teardown]]:
+        """Forget every session this client serves and return their teardowns, callbacks last."""
+        sessions = [*self.stream_cleanups.values(), *self.pull_iterator_cleanups.values()]
+        callbacks = list(self.callback_cleanups.values())
+        self.stream_cleanups.clear()
+        self.pull_iterator_cleanups.clear()
+        self.callback_cleanups.clear()
+        return sessions, callbacks
+
+    @staticmethod
+    async def _end_handler_sessions(taken: tuple[list[_Teardown], list[_Teardown]]) -> None:
+        sessions, callbacks = taken
+        await asyncio.gather(*[cleanup() for cleanup in sessions], return_exceptions=True)
+        await asyncio.gather(*[cleanup() for cleanup in callbacks], return_exceptions=True)
 
     def _settle_pull_iterators(self) -> None:
         """Force-settle every client-side pull iterator parked in a queue.get().
@@ -442,35 +1223,78 @@ class RPCClient(RPCClientProtocol):
         self,
         fn: Callable[[], Awaitable[T]],
         override: NoResponderRetryOptions | None = None,
+        namespace: str | None = None,
+        subject: str = "",
+        method_cache: list[Collection[str] | None] | None = None,
     ) -> T:
         """Retry a call on NoRespondersError with configurable delays.
+
+        Only a no-responder status this client observed itself is retried. An
+        error a responder sent back is raised at once, whatever its code or text.
 
         ``override`` lets a single call extend (or shrink) the retry window
         beyond the client-wide default — useful when a specific responder is
         known to be flaky (e.g. a child process that may be restarting).
+
+        With ``namespace`` (proxy calls) the first no-responder asks the
+        namespace for its methods, alongside the retries. When a live
+        responder lists them without this one, the error is raised at once
+        and ``method_cache`` gets the fresh list.
         """
-        src = override if override is not None else self.options.get("no_responder_retry", {}) or {}
-        max_retries = src.get("max_retries", 3)
-        delays = src.get("delays", [0.5, 1.0, 2.0])
+        max_retries, delays = self._retry_plan(override)
+        missing: asyncio.Future[bool] | None = None
+        try:
+            for attempt in range(max_retries + 1):
+                try:
+                    return await fn()
+                except Exception as e:
+                    if not is_local_no_responders(e) or attempt >= max_retries or self._closed:
+                        raise
 
-        for attempt in range(max_retries + 1):
-            try:
-                return await fn()
-            except Exception as e:
-                is_no_responder = (
-                    isinstance(e, errors.NoRespondersError)
-                    or ("no responders" in str(e).lower())
-                    or (isinstance(e, RPCException) and e.code == "503")
-                )
-
-                if not is_no_responder or attempt >= max_retries or self._closed:
-                    raise
-
-                delay = delays[min(attempt, len(delays) - 1)]
-                await asyncio.sleep(delay)
+                    delay = delays[min(attempt, len(delays) - 1)]
+                    if attempt == 0 and namespace is not None:
+                        missing = asyncio.ensure_future(
+                            self._method_missing(namespace, subject, method_cache, delay)
+                        )
+                    if await self._retry_wait(delay, missing):
+                        raise
+        finally:
+            if missing is not None:
+                missing.cancel()
 
         # Should never reach here, but satisfy type checker
         raise RuntimeError("Retry loop exhausted")
+
+    def _retry_plan(self, override: NoResponderRetryOptions | None) -> tuple[int, Sequence[float]]:
+        """Retries and delays of a no-responder retry, from ``override`` or else the client option.
+
+        A caller that sets neither gets DEFAULT_RETRY_DELAYS with one retry
+        per delay. Only max_retries set: delays of 0.5, 1 and 2 s. Only
+        delays set: 3 retries.
+        """
+        src = override if override is not None else self.options.get("no_responder_retry") or {}
+        max_retries = src.get("max_retries")
+        delays = src.get("delays")
+        if max_retries is None and delays is None:
+            return len(DEFAULT_RETRY_DELAYS), DEFAULT_RETRY_DELAYS
+        return (
+            max_retries if max_retries is not None else LEGACY_MAX_RETRIES,
+            delays if delays is not None else LEGACY_RETRY_DELAYS,
+        )
+
+    @staticmethod
+    async def _retry_wait(delay: float, missing: asyncio.Future[bool] | None) -> bool:
+        """Sleep one retry delay, True as soon as the method probe says the method is missing."""
+        if missing is None:
+            await asyncio.sleep(delay)
+            return False
+        started = time.monotonic()
+        if not missing.done():
+            await asyncio.wait((missing,), timeout=delay)
+        if missing.done() and not missing.cancelled() and missing.result():
+            return True
+        await asyncio.sleep(max(0.0, delay - (time.monotonic() - started)))
+        return False
 
     async def publish(
         self, subject: str, data: Any, headers: dict[str, str] | None = None, reply: str | None = None
@@ -478,8 +1302,19 @@ class RPCClient(RPCClientProtocol):
         """Public publish method with automatic chunking."""
         if not self.nc:
             raise RuntimeError("Not connected")
-
         encoded = encode_message(data)
+        # inline: a second coroutine per message costs every stream item and reply
+        if len(encoded) <= self._max_payload_size:
+            await self.nc.publish(subject, encoded, headers=headers, reply=reply if reply else "")
+            return
+        await self._publish_encoded(subject, encoded, headers, reply)
+
+    async def _publish_encoded(
+        self, subject: str, encoded: bytes, headers: dict[str, str] | None = None, reply: str | None = None
+    ) -> None:
+        """publish() of a payload encode_message() already built."""
+        if not self.nc:
+            raise RuntimeError("Not connected")
 
         replyTo = reply if reply else ""
 
@@ -487,6 +1322,11 @@ class RPCClient(RPCClientProtocol):
         if len(encoded) <= self._max_payload_size:
             await self.nc.publish(subject, encoded, headers=headers, reply=replyTo)
             return
+        if self._unchunkable_limit is not None:
+            raise create_error(
+                ErrorCode.PAYLOAD_TOO_LARGE,
+                f"Payload limit {self._unchunkable_limit} is too small for chunking",
+            )
 
         # Message is too large, chunk it
         transfer_id = generate_id()
@@ -502,7 +1342,7 @@ class RPCClient(RPCClientProtocol):
         }
 
         # Header message includes original headers if any
-        hdrs = headers or {}
+        hdrs = dict(headers) if headers else {}
         hdrs["x-chunked-transfer"] = "header"
         hdrs["x-chunk-id"] = transfer_id
 
@@ -519,6 +1359,20 @@ class RPCClient(RPCClientProtocol):
             if i > 0 and i % 50 == 0:
                 await asyncio.sleep(0)
 
+    async def _publish_reply(self, subject: str, response: RPCResponse, entry: dict[str, Any]) -> None:
+        """Publish the reply to a call, straight to the socket while no further call waits in its subscription."""
+        nc = self.nc
+        sub: Subscription | None = entry.get("sub")
+        # with further calls queued their replies leave together through nats-py's flusher
+        if not isinstance(nc, NatsConnection) or sub is None or sub.pending_msgs:
+            await self.publish(subject, response)
+            return
+        nc.write_through = True
+        try:
+            await self.publish(subject, response)
+        finally:
+            nc.write_through = False
+
     async def subscribe(
         self,
         pattern: str,
@@ -526,28 +1380,72 @@ class RPCClient(RPCClientProtocol):
         queue: str = "",
     ) -> Callable[[], Coroutine[Any, Any, None]]:
         """Public subscribe method with automatic chunk handling."""
+        return await self._subscribe(pattern, handler, queue, {})
+
+    async def _subscribe_session(
+        self,
+        pattern: str,
+        handler: Callable[[Any], None] | Callable[[Any], Coroutine[Any, Any, None]],
+    ) -> Callable[[], Coroutine[Any, Any, None]]:
+        """subscribe() for a session subject whose first message follows a publish of ours on this connection.
+
+        The SUB goes out with that publish, in order, so it needs no write of its own first.
+        """
+        return await self._subscribe(pattern, handler, "", {}, yield_after=False)
+
+    async def _confirm_subscriptions(self) -> None:
+        """Wait until the server has the SUBs sent so far, so a call from another connection finds them.
+
+        Best effort and bounded: a link that is down or half dead must not stall the caller.
+        """
+        nc = self.nc
+        if nc is None or not nc.is_connected:
+            return
+        if QUEUED_PING and isinstance(nc, NATSClient):
+            with contextlib.suppress(Exception):
+                pong = await _queue_ping(nc)
+                # no wait_for: nats-py sets a PONG future's result without checking for a cancel
+                await asyncio.wait((pong,), timeout=SUBSCRIBE_CONFIRM_TIMEOUT)
+            return
+        # nats-py's flush() writes its PING at once, the yield lets its flusher send the SUBs first
+        await asyncio.sleep(0)
+        with contextlib.suppress(Exception):
+            await nc.flush(timeout=SUBSCRIBE_CONFIRM_TIMEOUT)
+
+    async def _subscribe(
+        self,
+        pattern: str,
+        handler: Callable[[Any], None] | Callable[[Any], Coroutine[Any, Any, None]],
+        queue: str,
+        entry: dict[str, Any],
+        yield_after: bool = True,
+    ) -> Callable[[], Coroutine[Any, Any, None]]:
+        """subscribe() that fills the given dict as the subscription's entry."""
         if not self.nc:
             raise RuntimeError("Not connected")
 
         self._subscription_seq += 1
         key = self._subscription_seq
-        entry: dict[str, Any] = {
-            "key": key,
-            "pattern": pattern,
-            "handler": handler,
-            # Determined once here instead of per delivered message.
-            "handler_is_async": is_async_function(handler),
-            "queue": queue,
-            "sub": None,
-        }
+        entry.update(
+            {
+                "key": key,
+                "pattern": pattern,
+                "handler": handler,
+                # Determined once here instead of per delivered message.
+                "handler_is_async": is_async_function(handler),
+                "queue": queue,
+                "sub": None,
+            }
+        )
         self._subscription_entries[key] = entry
 
-        await self._nats_subscribe(entry)
+        await self._nats_subscribe(entry, yield_after)
 
         async def unsubscribe() -> None:
             # Drop bookkeeping first — the NATS-level unsubscribe below may be
             # interrupted when it tears down the very message task calling us.
             self._subscription_entries.pop(key, None)
+            self._leave_chunk_scope(entry)
             sub: Subscription | None = entry.get("sub")
             entry["sub"] = None
             if sub is not None:
@@ -556,11 +1454,13 @@ class RPCClient(RPCClientProtocol):
 
         return unsubscribe
 
-    async def _nats_subscribe(self, entry: dict[str, Any]) -> None:
+    async def _nats_subscribe(self, entry: dict[str, Any], yield_after: bool = True) -> None:
         """Create the NATS subscription for an entry.
 
         Called from subscribe() and again from connect() when restoring
-        entries after a suspend cycle.
+        entries after a suspend cycle. Without ``yield_after`` the SUB waits
+        in nats-py's pending buffer, for a later write or a
+        _confirm_subscriptions().
         """
         if not self.nc:
             raise RuntimeError("Not connected")
@@ -568,6 +1468,8 @@ class RPCClient(RPCClientProtocol):
         pattern: str = entry["pattern"]
         handler: Callable[[Any], None] | Callable[[Any], Coroutine[Any, Any, None]] = entry["handler"]
         handler_is_async: bool = entry["handler_is_async"]
+        # the handler takes the time nats-py read the message as its second argument
+        with_arrival: bool = entry.get("arrival", False)
 
         # Raw mode (muxed reply inbox): hand the undecoded Msg to the handler —
         # it needs headers (503 status, chunk markers) and the subject, and
@@ -583,7 +1485,18 @@ class RPCClient(RPCClientProtocol):
                     print(f"Error processing message for {pattern}:", e)
                     print(traceback.format_exc())
 
-            raw_sub = await self.nc.subscribe(pattern, queue=entry.get("queue") or "", cb=raw_message_handler)
+            if INLINE_REPLY_DELIVERY and isinstance(self.nc, NATSClient):
+                # the idle cb keeps nats-py's subscription task, which _watch_subscription_end follows
+                raw_sub = await self.nc.subscribe(
+                    pattern,
+                    queue=entry.get("queue") or "",
+                    cb=_idle_callback,
+                    future=cast(Any, _InlineSink(raw_handler, pattern)),
+                )
+            else:
+                raw_sub = await self.nc.subscribe(
+                    pattern, queue=entry.get("queue") or "", cb=raw_message_handler
+                )
             entry["sub"] = raw_sub
             self._watch_subscription_end(entry, raw_sub)
             return
@@ -594,6 +1507,9 @@ class RPCClient(RPCClientProtocol):
         # eagerly (create_task) would run handlers concurrently and out of
         # order, breaking backpressure-sensitive callers.
         assembled_queue: list[Any] = []
+        chunks: _ChunkScope | None = entry.get("chunks")
+        if chunks is None:
+            chunks = self._join_chunk_scope(entry)
 
         async def message_handler(msg: Msg) -> None:
             try:
@@ -604,7 +1520,7 @@ class RPCClient(RPCClientProtocol):
                     data = decode(msg.data)
                     chunk_id = msg.headers.get("x-chunk-id") if msg.headers else None
 
-                    if not chunk_id or data.get("transferId") != chunk_id:
+                    if not chunk_id or not isinstance(data, dict) or data.get("transferId") != chunk_id:
                         return
 
                     def on_complete(assembled_data: Any) -> None:
@@ -613,10 +1529,12 @@ class RPCClient(RPCClientProtocol):
                     def on_error(error: Exception) -> None:
                         print(f"Error assembling chunks for {pattern}: {error}")
 
-                    # Setup chunk assembly with pre-allocated buffer
-                    self.chunking_manager.start_receiving(
-                        data["transferId"],
-                        data["totalChunks"],
+                    manager = chunks.manager
+                    if manager is None:
+                        manager = chunks.manager = self._new_chunking_manager()
+                    manager.start_receiving(
+                        chunk_id,
+                        data.get("totalChunks"),
                         on_complete,
                         on_error,
                         data.get("totalSize"),  # Pass totalSize for pre-allocation
@@ -629,15 +1547,16 @@ class RPCClient(RPCClientProtocol):
                         return
 
                     chunk_id = msg.headers.get("x-chunk-id")
-                    chunk_index = int(msg.headers.get("x-chunk-index", "0"))
+                    chunk_index = parse_chunk_index(msg.headers.get("x-chunk-index"))
 
                     if not chunk_id:
                         return
 
-                    # Process raw chunk data
-                    self.chunking_manager.process_chunk(
-                        {"id": chunk_id, "chunkIndex": chunk_index, "data": msg.data, "isLast": False}
-                    )
+                    manager = chunks.manager
+                    if manager is not None:
+                        manager.process_chunk(
+                            {"id": chunk_id, "chunkIndex": chunk_index, "data": msg.data, "isLast": False}
+                        )
 
                     # Drain any transfer completed by this chunk inline (see
                     # assembled_queue above).
@@ -652,7 +1571,9 @@ class RPCClient(RPCClientProtocol):
                     # inline on the event loop — the thread-pool hop costs
                     # far more than the short callbacks used in this system.
                     data = decode_message(msg.data)
-                    if handler_is_async:
+                    if with_arrival:
+                        await cast(Any, handler)(data, getattr(msg, "arrived", None))
+                    elif handler_is_async:
                         await handler(data)  # type: ignore[misc]
                     else:
                         handler(data)
@@ -662,15 +1583,185 @@ class RPCClient(RPCClientProtocol):
                 print(traceback.format_exc())
 
         sub = await self.nc.subscribe(pattern, queue=entry.get("queue") or "", cb=message_handler)
+        # a drain hands it the messages left in the subscription's queue
+        entry["dispatch"] = message_handler
         # Yield once so nats-py's flusher pushes the SUB to the server before
         # we return. Publishes from OTHER connections have no ordering
         # guarantee against our pending SUB — without this yield a
         # subscribe-then-peer-publishes pattern loses messages intermittently
         # (reproduced via channel-native-request).
-        await asyncio.sleep(0)
+        if yield_after:
+            await asyncio.sleep(0)
 
         entry["sub"] = sub
         self._watch_subscription_end(entry, sub)
+
+    async def _subscribe_namespace(
+        self,
+        namespace: str,
+        dispatchers: Mapping[str, Callable[..., Coroutine[Any, Any, None]]],
+        list_methods: Callable[[Any], Coroutine[Any, Any, None]],
+        queue: str,
+        entry: dict[str, Any],
+        registration: _Registration,
+    ) -> Callable[[], Coroutine[Any, Any, None]]:
+        """Serve a registration through one subscription on ``rpc.<namespace>.>``.
+
+        The method is the rest of the subject. A method gets its lane on its
+        first call, one the registration does not have is answered at once.
+        Chunked requests are reassembled here, each registered method with its
+        own transfer limit, and go to the method their header names. A lane
+        holds as much as a nats-py subscription would, beyond that requests
+        are dropped and reported as a slow consumer.
+        """
+        prefix = f"rpc.{namespace}."
+        method_names = list(dispatchers)
+        lanes: dict[str, _Lane] = {}
+
+        def method_of(subject: str) -> str | None:
+            # only registered methods get a transfer scope, the others share the subscription's
+            method = subject[len(prefix) :]
+            return method if subject.startswith(prefix) and method in dispatchers else None
+
+        def open_lane(method: str) -> _Lane | None:
+            handle = dispatchers.get(method)
+            if handle is None:
+                return None
+            # a reply reads the lane's backlog from it like from a subscription
+            lane_entry: dict[str, Any] = {}
+
+            async def dispatch(item: tuple[Any, bool, float]) -> None:
+                payload, decoded, arrived = item
+                try:
+                    await handle(payload if decoded else decode_message(payload), arrived, entry=lane_entry)
+                except Exception as e:
+                    print(f"Error processing message for {prefix}{method}:", e)
+                    print(traceback.format_exc())
+
+            lane = lanes[method] = lane_entry["sub"] = _Lane(dispatch)
+            registration.lanes.append(lane)
+            return lane
+
+        def route(subject: str, payload: Any, decoded: bool, size: int) -> None:
+            if not subject.startswith(prefix):
+                return
+            method = subject[len(prefix) :]
+            if method == METHODS_METHOD:
+                run_in_background(list_methods(payload if decoded else decode_message(payload)))
+                return
+            lane = lanes.get(method) or open_lane(method)
+            if lane is None:
+                run_in_background(self._reply_missing_method(method, payload, decoded, method_names))
+                return
+            if (
+                lane.pending_msgs >= DEFAULT_SUB_PENDING_MSGS_LIMIT
+                or lane.pending_bytes + size > DEFAULT_SUB_PENDING_BYTES_LIMIT
+            ):
+                self._report_slow_consumer(prefix + method)
+                return
+            lane.push((payload, decoded, time.monotonic()), size)
+
+        entry["raw"] = True
+        return await self._subscribe(
+            f"rpc.{namespace}.>", self._raw_router(entry, route, method_of), queue, entry, yield_after=False
+        )
+
+    def _raw_router(
+        self,
+        entry: dict[str, Any],
+        deliver: Callable[[str, Any, bool, int], None],
+        method_of: Callable[[str], str | None] | None = None,
+    ) -> Callable[[Msg], None]:
+        """Message handler for a raw entry that reassembles chunked transfers first.
+
+        ``deliver(subject, payload, decoded, size)`` gets the message data, or
+        the decoded object of a transfer and the subject of its header. It runs
+        where nats-py delivers, in its read loop where that is supported, so it
+        must not block. A transfer whose subject ``method_of`` maps to a method
+        is reassembled in that method's manager, every other one in the
+        subscription's own.
+        """
+
+        def manager_for(scope: _ChunkScope, subject: str, create: bool) -> ChunkingManager | None:
+            method = method_of(subject) if method_of is not None else None
+            if method is None:
+                if scope.manager is None and create:
+                    scope.manager = self._new_chunking_manager()
+                return scope.manager
+            methods = scope.methods
+            manager = methods.get(method) if methods is not None else None
+            if manager is None and create:
+                if methods is None:
+                    methods = scope.methods = {}
+                manager = methods[method] = self._new_chunking_manager()
+            return manager
+
+        def on_message(msg: Msg) -> None:
+            subject = msg.subject
+            headers = msg.headers
+            chunk_type = headers.get("x-chunked-transfer") if headers else None
+            if not headers or chunk_type not in ("header", "chunk"):
+                deliver(subject, msg.data, False, len(msg.data))
+                return
+            chunk_id = headers.get("x-chunk-id")
+            if not chunk_id:
+                return
+            scope: _ChunkScope = entry.get("chunks") or self._join_chunk_scope(entry)
+            if chunk_type == "header":
+                header = decode(msg.data)
+                if not isinstance(header, dict) or header.get("transferId") != chunk_id:
+                    return
+                size = header.get("totalSize")
+                manager = cast(ChunkingManager, manager_for(scope, subject, True))
+                manager.start_receiving(
+                    chunk_id,
+                    header.get("totalChunks"),
+                    lambda assembled: deliver(subject, assembled, True, size if isinstance(size, int) else 0),
+                    lambda error: print(f"Error assembling chunks for {subject}: {error}"),
+                    size,
+                    header.get("chunkSize"),
+                )
+            elif (receiver := manager_for(scope, subject, False)) is not None:
+                receiver.process_chunk(
+                    {
+                        "id": chunk_id,
+                        "chunkIndex": parse_chunk_index(headers.get("x-chunk-index")),
+                        "data": msg.data,
+                        "isLast": False,
+                    }
+                )
+
+        return on_message
+
+    async def _subscribe_raw(
+        self, pattern: str, deliver: Callable[[str, Any, bool, int], None]
+    ) -> Callable[[], Coroutine[Any, Any, None]]:
+        """Session subscription whose messages reach ``deliver`` in wire order, see _raw_router()."""
+        entry: dict[str, Any] = {"raw": True}
+        return await self._subscribe(pattern, self._raw_router(entry, deliver), "", entry, yield_after=False)
+
+    async def _reply_missing_method(
+        self, method: str, payload: Any, decoded: bool, methods: list[str]
+    ) -> None:
+        """Answer a request for a method a namespace subscription does not have.
+
+        METHOD_NOT_FOUND with the method list, for a stream request on its
+        stream subject, where its caller listens.
+        """
+        message = payload if decoded else decode_message(payload)
+        if not isinstance(message, dict) or not isinstance(request_id := message.get("id"), str):
+            return
+        error = create_error(ErrorCode.METHOD_NOT_FOUND, f"Method not found: {method}").to_dict()
+        params = message.get("params")
+        with contextlib.suppress(Exception):
+            if isinstance(params, dict) and params.get("__stream") is not None:
+                subject = params.get("__streamSubject")
+                if isinstance(subject, str) and subject.startswith("stream."):
+                    frame: StreamMessage = {"id": request_id, "type": "error", "error": error}
+                    await self.publish(subject, frame)
+                return
+            response: RPCResponse = {"id": request_id, "error": error, "__methods": methods}
+            await self.publish(f"rpc.reply.{request_id}", response)
 
     def _watch_subscription_end(self, entry: dict[str, Any], sub: Subscription) -> None:
         """Drop the entry when its msg task ends cleanly (user unsubscribe)."""
@@ -684,10 +1775,14 @@ class RPCClient(RPCClientProtocol):
             # entry has already been restored onto a new subscription — in
             # both cases the entry must survive so connect() can restore
             # it (or keep the restored one alive).
-            if self._suspending or entry.get("sub") is not sub:
+            if self._suspending or entry.get("sub") is not sub or sub in self._drained_subs:
+                return
+            # nats-py ends the task the same way when it closes the connection for good
+            if getattr(getattr(sub, "_conn", None), "is_closed", False):
                 return
             entry["sub"] = None
             self._subscription_entries.pop(entry["key"], None)
+            self._leave_chunk_scope(entry)
             if entry is self._mux_entry:
                 self._mux_entry = None
 
@@ -739,8 +1834,9 @@ class RPCClient(RPCClientProtocol):
         - 503/no-responder status (empty payload + status header 503): the
           call/iterator is identified by the SUBJECT (`rpc.reply.<suffix>`) —
           the server echoes the request's reply subject, there is no payload.
-        - chunked transfer header/chunk: reassemble via chunking_manager, then
-          route the assembled response by envelope id.
+        - chunked transfer header/chunk: reassemble via _mux_chunking while the
+          call is pending, then route the assembled response by envelope id. A
+          reply that cannot be assembled rejects the call at once.
         - regular response: decode and route by envelope id.
         """
         data = msg.data
@@ -776,31 +1872,63 @@ class RPCClient(RPCClientProtocol):
 
         chunk_type = headers.get("x-chunked-transfer") if headers else None
 
-        if chunk_type == "header":
-            decoded = decode(data)
-            chunk_id = headers.get("x-chunk-id") if headers else None
-            if not chunk_id or decoded.get("transferId") != chunk_id:
-                print("Invalid chunk header on reply mux")
+        if headers and chunk_type in ("header", "chunk"):
+            # the subject suffix is the call id; without a pending call nobody reads the reply
+            call_id = msg.subject[len("rpc.reply.") :]
+            pending = self.pending_requests.get(call_id)
+            if pending is None:
                 return
-            self.chunking_manager.start_receiving(
-                decoded["transferId"],
-                decoded["totalChunks"],
-                self._route_mux_response,
-                lambda error: print(f"Error assembling chunked RPC response: {error}"),
-                decoded.get("totalSize"),
-                decoded.get("chunkSize"),
-            )
-        elif chunk_type == "chunk":
-            chunk_id = headers.get("x-chunk-id") if headers else None
+            chunk_id = headers.get("x-chunk-id")
             if not chunk_id:
-                print("Chunk missing chunk ID on reply mux")
+                print(
+                    "Invalid chunk header on reply mux"
+                    if chunk_type == "header"
+                    else "Chunk missing chunk ID on reply mux"
+                )
                 return
-            chunk_index = int(headers.get("x-chunk-index", "0")) if headers else 0
-            self.chunking_manager.process_chunk(
-                {"id": chunk_id, "chunkIndex": chunk_index, "data": data, "isLast": False}
-            )
+            transfer_key = f"{call_id}|{chunk_id}"
+
+            if chunk_type == "header":
+                decoded = decode(data)
+                if not isinstance(decoded, dict) or decoded.get("transferId") != chunk_id:
+                    print("Invalid chunk header on reply mux")
+                    return
+                # one transfer per call keeps the uncapped manager bounded
+                previous = pending.get("transfer_key")
+                if previous is not None and previous != transfer_key:
+                    self._mux_chunking.discard(previous)
+                pending["transfer_key"] = transfer_key
+                self._mux_chunking.start_receiving(
+                    transfer_key,
+                    decoded.get("totalChunks"),
+                    self._route_mux_response,
+                    lambda error: self._fail_chunked_reply(call_id, error),
+                    decoded.get("totalSize"),
+                    decoded.get("chunkSize"),
+                )
+            else:
+                chunk_index = parse_chunk_index(headers.get("x-chunk-index"))
+                self._mux_chunking.process_chunk(
+                    {"id": transfer_key, "chunkIndex": chunk_index, "data": data, "isLast": False}
+                )
         else:
             self._route_mux_response(decode_message(data))
+
+    def _fail_chunked_reply(self, call_id: str, error: Exception) -> None:
+        """Reject a call whose chunked reply cannot be assembled right away instead of at its timeout."""
+        pending = self.pending_requests.pop(call_id, None)
+        if pending is None:
+            return
+        if timeout_handle := pending.get("timeout"):
+            timeout_handle.cancel()
+        if transfer_key := pending.get("transfer_key"):
+            self._mux_chunking.discard(transfer_key)
+        future: asyncio.Future[Any] | None = pending.get("future")
+        if future is not None and not future.done():
+            subject = pending.get("subject") or call_id
+            future.set_exception(
+                create_error(ErrorCode.INTERNAL_ERROR, f'Chunked reply to "{subject}" failed: {error}')
+            )
 
     def _route_mux_response(self, data: Any) -> None:
         """Settle the pending request a (possibly reassembled) response belongs to.
@@ -825,8 +1953,11 @@ class RPCClient(RPCClientProtocol):
         if future is None or future.done():
             return
 
-        if "error" in response:
-            future.set_exception(RPCException.from_dict(response["error"]))
+        if (error := response.get("error")) is not None:
+            future.set_exception(_reply_error(error))
+        elif pending.get("meta"):
+            # proxies take __methods next to the result, which stays as the responder sent it
+            future.set_result((response.get("result"), response.get("__methods")))
         else:
             result = response.get("result")
             # Attach __methods to result for proxy method discovery
@@ -900,13 +2031,13 @@ class RPCClient(RPCClientProtocol):
 
             return cast(Any, decoded)
         except TimeoutError as e:
-            raise create_error(
-                ErrorCode.TIMEOUT, f"Request to {subject!r} timed out after {timeout or 5000}ms"
+            raise RPCTimeoutError(
+                ErrorCode.TIMEOUT.value, f'Request to "{subject}" timed out after {timeout or 5000}ms'
             ) from e
-        except Exception as e:
-            if "no responders" in str(e).lower():
-                raise create_error(ErrorCode.NOT_FOUND, "No responders available") from e
-            raise
+        except errors.NoRespondersError as e:
+            raise LocalNoRespondersError(
+                ErrorCode.NOT_FOUND.value, "No responders available", subject=subject
+            ) from e
 
     async def call(
         self,
@@ -914,23 +2045,41 @@ class RPCClient(RPCClientProtocol):
         *args: Any,
         no_responder_retry: NoResponderRetryOptions | None = None,
         discover: bool = False,
+        timeout: int | None = None,
     ) -> Any:
         """Make an RPC call with no-responder retry.
 
         ``no_responder_retry`` overrides the client-wide retry config for this
         single call.
 
+        ``timeout`` overrides the client-wide call timeout in milliseconds for
+        this call. Like the client option it applies to each attempt.
+
         ``discover`` puts ``__discover: True`` on the request envelope, asking
         the responder to attach its ``__methods`` list to the response.
         Proxies request this only while their method cache is empty.
         """
         return await self._with_no_responder_retry(
-            lambda: self._call_once(subject, *args, discover=discover),
+            lambda: self._call_once(subject, *args, discover=discover, timeout=timeout),
             override=no_responder_retry,
         )
 
-    async def _call_once(self, subject: str, *args: Any, discover: bool = False) -> Any:
-        """Make a single RPC call without retry."""
+    async def _call_once(
+        self,
+        subject: str,
+        *args: Any,
+        discover: bool = False,
+        timeout: int | None = None,
+        meta: bool = False,
+        on_cancel: Callable[[asyncio.Future[Any]], None] | None = None,
+    ) -> Any:
+        """Make a single RPC call without retry.
+
+        With ``meta`` it returns ``(result, __methods)``, see _call_with_meta().
+        When the caller is cancelled while the request goes out or waits for
+        its reply, ``on_cancel`` gets a future that the reply, the timeout or
+        the end of the connection settles instead.
+        """
         if not self.is_connected and not self.is_closed:
             await self.connect()
 
@@ -940,14 +2089,16 @@ class RPCClient(RPCClientProtocol):
         # Service calls (`<subject>.reply.<id>`) keep the legacy per-call
         # subscription flow — separate refactor later.
         if not subject.startswith("rpc."):
-            return await self._call_once_service(subject, *args)
+            result = await self._call_once_service(subject, *args, timeout=timeout, on_cancel=on_cancel)
+            return (result, None) if meta else result
 
         # Normally established by connect(); covers clients whose connection
         # was wired up out-of-band (tests). No-op when already subscribed.
         await self._ensure_mux_subscription()
 
         request_id = generate_id(self._reply_prefix)
-        timeout = self.options.get("timeout", 30000)
+        if timeout is None:
+            timeout = self.options.get("timeout", 30000)
         # The reply subject is derived from the id by pure string
         # concatenation — this is the wire contract with every responder
         # implementation (Node, Go, Python): they publish the response to
@@ -963,9 +2114,17 @@ class RPCClient(RPCClientProtocol):
         # routes them back here via pending_requests. Cleanup only has to
         # drop the map entry and the timer.
         def handle_timeout() -> None:
-            if self.pending_requests.pop(request_id, None) is not None and not future.done():
-                future.set_exception(
-                    errors.TimeoutError(f"RPC call to {subject!r} timed out after {timeout}ms")
+            pending = self.pending_requests.pop(request_id, None)
+            if pending is None:
+                return
+            if transfer_key := pending.get("transfer_key"):
+                self._mux_chunking.discard(transfer_key)
+            waiter: asyncio.Future[Any] = pending["future"]
+            if not waiter.done():
+                waiter.set_exception(
+                    RPCTimeoutError(
+                        ErrorCode.TIMEOUT.value, f'RPC call to "{subject}" timed out after {timeout}ms'
+                    )
                 )
 
         timeout_handle = asyncio.get_event_loop().call_later(timeout / 1000, handle_timeout)
@@ -977,35 +2136,126 @@ class RPCClient(RPCClientProtocol):
             "future": future,
             "timeout": timeout_handle,
             "subject": subject,
+            "meta": meta,
         }
 
         # Send request. `reply` is set to the call's own reply subject so the
         # NATS server delivers a no-responder 503 status to the SAME subject
         # the real response would use — the mux catches both.
+        # the effective timeout, a responder may skip a request that waited longer
         message: RPCMessage = {"id": request_id, "method": "call", "params": args}
+        if math.isfinite(timeout):
+            message["__ttl"] = max(1, math.ceil(timeout))
         if discover:
             # Envelope marker (never in params — must not leak into handler
             # args): ask the responder for its __methods list.
             message["__discover"] = True
         try:
-            await self.publish(subject, message, reply=reply_subject)
-        except Exception:
-            if self.pending_requests.pop(request_id, None) is not None:
-                timeout_handle.cancel()
+            try:
+                await self.publish(subject, message, reply=reply_subject)
+            except Exception:
+                if self.pending_requests.pop(request_id, None) is not None:
+                    timeout_handle.cancel()
+                raise
+            return await future
+        except asyncio.CancelledError:
+            # a cancel during the publish comes after nats-py queued the request
+            if on_cancel is not None:
+                if (pending := self.pending_requests.get(request_id)) is not None:
+                    pending["future"] = asyncio.get_running_loop().create_future()
+                    on_cancel(pending["future"])
+                else:
+                    # the call ended in the same loop step as the cancel
+                    on_cancel(future)
             raise
 
-        return await future
+    async def _call_with_meta(
+        self,
+        subject: str,
+        args: tuple[Any, ...],
+        *,
+        discover: bool,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
+        namespace: str | None = None,
+        method_cache: list[Collection[str] | None] | None = None,
+    ) -> tuple[Any, list[str] | None]:
+        """call() for proxies: returns the response's ``__methods`` next to the result.
 
-    async def _call_once_service(self, subject: str, *args: Any) -> Any:
+        The result is passed through as the responder sent it, whatever its
+        type, and ``__methods`` is never spliced into it. ``namespace`` and
+        ``method_cache`` let a missing method fail at once, see
+        _with_no_responder_retry().
+        """
+        return cast(
+            tuple[Any, "list[str] | None"],
+            await self._with_no_responder_retry(
+                lambda: self._call_once(subject, *args, discover=discover, timeout=timeout, meta=True),
+                override=no_responder_retry,
+                namespace=namespace,
+                subject=subject,
+                method_cache=method_cache,
+            ),
+        )
+
+    async def _list_methods(self, namespace: str, wait: float) -> list[str] | None:
+        """The methods a live responder of the namespace lists within ``wait`` seconds, None when none does."""
+        try:
+            methods = await self._call_once(
+                f"rpc.{namespace}.{METHODS_METHOD}", timeout=max(1, int(wait * 1000))
+            )
+        except Exception:
+            return None
+        return cast(list[str], methods) if isinstance(methods, list) else None
+
+    async def _method_missing(
+        self,
+        namespace: str,
+        subject: str,
+        method_cache: list[Collection[str] | None] | None,
+        delay: float,
+    ) -> bool:
+        """Ask the namespace for its methods, True when a live responder lists them without this one."""
+        methods = await self._list_methods(namespace, max(delay, METHOD_PROBE_WINDOW))
+        if methods is None or subject.removeprefix(f"rpc.{namespace}.") in methods:
+            return False
+        # a filled cache keeps its list: a method gone during a responder restart stays callable
+        if method_cache is not None and method_cache[0] is None:
+            method_cache[0] = methods
+        return True
+
+    async def _call_service(self, subject: str, args: tuple[Any, ...], direct: str) -> Any:
+        """call() of a service endpoint whose instance takes requests too big for one message on ``direct``."""
+        return await self._with_no_responder_retry(
+            lambda: self._call_once_service(subject, *args, direct=direct)
+        )
+
+    async def _call_once_service(
+        self,
+        subject: str,
+        *args: Any,
+        timeout: int | None = None,
+        direct: str | None = None,
+        on_cancel: Callable[[asyncio.Future[Any]], None] | None = None,
+    ) -> Any:
         """Legacy single-attempt call for service subjects (reply pattern
         `<subject>.reply.<id>`): per-call reply subscription + one-shot
         no-responder inbox. The rpc.* path is muxed — see _call_once.
+
+        A request too big for one message goes to ``direct`` when given, the
+        endpoint's subject on the chosen instance, and is answered there.
+        ``on_cancel`` works as in _call_once.
         """
         if not self.nc:
             raise RuntimeError("Not connected")
 
         request_id = generate_id(self._reply_prefix)
-        timeout = self.options.get("timeout", 30000)
+        if timeout is None:
+            timeout = self.options.get("timeout", 30000)
+        message: RPCMessage = {"id": request_id, "method": "call", "params": args}
+        encoded = encode_message(message)
+        if direct is not None and len(encoded) > self._max_payload_size:
+            subject = direct
         reply_subject = f"{subject}.reply.{request_id}"
 
         # Create future for the response
@@ -1030,12 +2280,15 @@ class RPCClient(RPCClientProtocol):
         # Setup timeout. The subscriptions are torn down by the except-branch
         # below once the future's exception propagates out of `await future`.
         def handle_timeout() -> None:
-            if request_id in self.pending_requests:
-                del self.pending_requests[request_id]
-                if not future.done():
-                    future.set_exception(
-                        errors.TimeoutError(f"RPC call to {subject!r} timed out after {timeout}ms")
+            if (pending := self.pending_requests.pop(request_id, None)) is None:
+                return
+            waiter: asyncio.Future[Any] = pending["future"]
+            if not waiter.done():
+                waiter.set_exception(
+                    RPCTimeoutError(
+                        ErrorCode.TIMEOUT.value, f'RPC call to "{subject}" timed out after {timeout}ms'
                     )
+                )
 
         timeout_handle = asyncio.get_event_loop().call_later(timeout / 1000, handle_timeout)
 
@@ -1045,6 +2298,7 @@ class RPCClient(RPCClientProtocol):
         self.pending_requests[request_id] = {
             "future": future,
             "timeout": timeout_handle,
+            "subject": subject,
             "cleanup": unsubscribe_all,
         }
 
@@ -1061,9 +2315,9 @@ class RPCClient(RPCClientProtocol):
                     # Settle the caller BEFORE tearing down subscriptions:
                     # unsubscribing the reply subscription cancels the message
                     # task this handler runs in, which could abort us mid-way.
-                    if "error" in response:
+                    if (error := response.get("error")) is not None:
                         if not pending["future"].done():
-                            pending["future"].set_exception(RPCException.from_dict(response["error"]))
+                            pending["future"].set_exception(_reply_error(error))
                     else:
                         result = response.get("result")
                         # Attach __methods to result for proxy method discovery
@@ -1081,24 +2335,37 @@ class RPCClient(RPCClientProtocol):
                 and msg.headers
                 and msg.headers.get(Header.STATUS) == NO_RESPONDERS_STATUS
             ):
-                if not future.done():
-                    future.set_exception(errors.NoRespondersError(subject))
+                pending = self.pending_requests.get(request_id)
+                waiter: asyncio.Future[Any] = pending["future"] if pending is not None else future
+                if not waiter.done():
+                    waiter.set_exception(errors.NoRespondersError(subject))
 
                 # Cleanup
                 await unsubscribe_all()
 
-        unsubscribe = await self.subscribe(reply_subject, handle_rpc_response)
-
-        inbox = self.nc.new_inbox()
-        sub = await self.nc.subscribe(inbox, cb=request_callback, max_msgs=1)
-
         try:
-            # Send request
-            message: RPCMessage = {"id": request_id, "method": "call", "params": args}
-            await self.publish(subject, message, reply=inbox)
+            unsubscribe = await self._subscribe_session(reply_subject, handle_rpc_response)
+
+            inbox = self.nc.new_inbox()
+            sub = await self.nc.subscribe(inbox, cb=request_callback, max_msgs=1)
+
+            await self._publish_encoded(subject, encoded, reply=inbox)
 
             # Wait for response
             return await future
+        except asyncio.CancelledError:
+            if on_cancel is not None and (pending := self.pending_requests.get(request_id)) is not None:
+                rest: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+                pending["future"] = rest
+                # the except-branch below no longer runs for this call
+                rest.add_done_callback(lambda _: run_in_background(unsubscribe_all()))
+                on_cancel(rest)
+            else:
+                # the timer only drops the pending entry, the subscriptions go here
+                run_in_background(unsubscribe_all())
+                if on_cancel is not None:
+                    on_cancel(future)
+            raise
         except Exception:
             # Cleanup on error
             await unsubscribe_all()
@@ -1112,7 +2379,9 @@ class RPCClient(RPCClientProtocol):
             del self.pending_requests[request_id]
             if not future.done():
                 future.set_exception(
-                    create_error(ErrorCode.TIMEOUT, f"RPC call to {subject!r} timed out after {timeout}ms")
+                    RPCTimeoutError(
+                        ErrorCode.TIMEOUT.value, f'RPC call to "{subject}" timed out after {timeout}ms'
+                    )
                 )
 
     def _handle_rpc_response(self, data: Any) -> None:
@@ -1131,7 +2400,7 @@ class RPCClient(RPCClientProtocol):
             else:
                 future.set_result(response.get("result"))
 
-    async def call_stream(
+    def call_stream(
         self,
         subject: str,
         *args: Any,
@@ -1139,34 +2408,60 @@ class RPCClient(RPCClientProtocol):
     ) -> AsyncGenerator[Any, None]:
         """Make a streaming RPC call, with automatic retry on no-responder errors.
 
+        Only a no-responder status this client observed before the first item is
+        retried; an error from the producer or after an item is raised at once.
+
         ``no_responder_retry`` overrides the client-wide retry config for this
         single call.
         """
-        src = (
-            no_responder_retry
-            if no_responder_retry is not None
-            else self.options.get("no_responder_retry", {}) or {}
-        )
-        max_retries = src.get("max_retries", 3)
-        delays = src.get("delays", [0.5, 1.0, 2.0])
+        return self._stream_with_retry(subject, args, no_responder_retry)
 
-        for attempt in range(max_retries + 1):
-            try:
-                async for value in self._call_stream_once(subject, *args):
-                    yield value
-                return
-            except Exception as e:
-                is_no_responder = (
-                    isinstance(e, errors.NoRespondersError)
-                    or ("no responders" in str(e).lower())
-                    or (isinstance(e, RPCException) and e.code == "503")
-                )
+    def _call_stream_with_probe(
+        self,
+        subject: str,
+        args: tuple[Any, ...],
+        *,
+        no_responder_retry: NoResponderRetryOptions | None,
+        namespace: str,
+        method_cache: list[Collection[str] | None],
+    ) -> AsyncGenerator[Any, None]:
+        """call_stream() for proxies: a method the live namespace lacks fails at once, see _with_no_responder_retry()."""
+        return self._stream_with_retry(subject, args, no_responder_retry, namespace, method_cache)
 
-                if not is_no_responder or attempt >= max_retries or self._closed:
-                    raise
+    async def _stream_with_retry(
+        self,
+        subject: str,
+        args: tuple[Any, ...],
+        no_responder_retry: NoResponderRetryOptions | None,
+        namespace: str | None = None,
+        method_cache: list[Collection[str] | None] | None = None,
+    ) -> AsyncGenerator[Any, None]:
+        max_retries, delays = self._retry_plan(no_responder_retry)
+        missing: asyncio.Future[bool] | None = None
+        try:
+            for attempt in range(max_retries + 1):
+                yielded = False
+                try:
+                    # closes the attempt inside our own aclose(), not later through the asyncgen finalizer
+                    async with contextlib.aclosing(self._call_stream_once(subject, *args)) as stream:
+                        async for value in stream:
+                            yielded = True
+                            yield value
+                    return
+                except Exception as e:
+                    if yielded or not is_local_no_responders(e) or attempt >= max_retries or self._closed:
+                        raise
 
-                delay = delays[min(attempt, len(delays) - 1)]
-                await asyncio.sleep(delay)
+                    delay = delays[min(attempt, len(delays) - 1)]
+                    if attempt == 0 and namespace is not None:
+                        missing = asyncio.ensure_future(
+                            self._method_missing(namespace, subject, method_cache, delay)
+                        )
+                    if await self._retry_wait(delay, missing):
+                        raise
+        finally:
+            if missing is not None:
+                missing.cancel()
 
     async def _call_stream_once(self, subject: str, *args: Any) -> AsyncGenerator[Any, None]:
         """Single attempt of a streaming RPC call."""
@@ -1206,10 +2501,11 @@ class RPCClient(RPCClientProtocol):
             queue.put_nowait(None)  # End marker
 
         # Setup handlers
-        handler: dict[str, Callable[..., None]] = {
+        handler: dict[str, Any] = {
             "push": on_push,
             "end": on_end,
             "error": on_error,
+            "subject": subject,
         }
 
         self.stream_handlers[request_id] = handler
@@ -1251,19 +2547,19 @@ class RPCClient(RPCClientProtocol):
                 stream_handler["error"](RPCException.from_dict(error_data))
                 await unsubscribe_all()
 
-        unsubscribe = await self.subscribe(stream_subject, handle_stream_message)
-
-        # No-responder detection via the muxed reply inbox: the request's
-        # reply subject `rpc.reply.<id>` only ever carries a 503 status —
-        # stream responders never publish a direct RPC response.
-        def on_no_responders(_err: Exception) -> None:
-            stream_handler = self.stream_handlers.get(request_id)
-            if stream_handler:
-                stream_handler["error"](errors.NoRespondersError(subject))
-
-        self.status_handlers[request_id] = on_no_responders
-
         try:
+            unsubscribe = await self._subscribe_session(stream_subject, handle_stream_message)
+
+            # No-responder detection via the muxed reply inbox: the request's
+            # reply subject `rpc.reply.<id>` only ever carries a 503 status:
+            # stream responders never publish a direct RPC response.
+            def on_no_responders(_err: Exception) -> None:
+                stream_handler = self.stream_handlers.get(request_id)
+                if stream_handler:
+                    stream_handler["error"](errors.NoRespondersError(subject))
+
+            self.status_handlers[request_id] = on_no_responders
+
             # Send request
             stream_params: dict[str, Any] = {
                 "__stream": True,
@@ -1273,29 +2569,16 @@ class RPCClient(RPCClientProtocol):
             message: RPCMessage = {"id": request_id, "method": "stream", "params": stream_params}
             await self.publish(subject, message, reply=f"rpc.reply.{request_id}")
 
-            # Generator implementation
+            # items queued before an error frame are delivered first, the error ends the stream
             while True:
-                if error:
-                    await unsubscribe_all()
-                    raise error
-
-                try:
-                    # Wait for next value
-                    value = await queue.get()
-                    if value is None:  # End marker
-                        if error:
-                            await unsubscribe_all()
-                            raise error
-                        await unsubscribe_all()
-                        return
-                    yield value
-                except Exception as e:
-                    await unsubscribe_all()
-                    raise e
-
-        except Exception:
+                value = await queue.get()
+                if value is None:  # End marker
+                    if error:
+                        raise error
+                    return
+                yield value
+        finally:
             await unsubscribe_all()
-            raise
 
     async def call_pull_iterator(self, subject: str, *args: Any) -> AsyncGenerator[Any, None]:
         """Make a pull-based iterator RPC call."""
@@ -1316,7 +2599,8 @@ class RPCClient(RPCClientProtocol):
         # on response_subject — only no-responder statuses land here.
         status_inbox = f"rpc.reply.{iterator_id}"
 
-        response_queue: asyncio.Queue[PullIteratorResponse] = asyncio.Queue()
+        # a no-responder this client saw is queued as the exception itself, so it keeps its marker
+        response_queue: asyncio.Queue[PullIteratorResponse | Exception] = asyncio.Queue()
         ended = False
         error: Exception | None = None
 
@@ -1346,17 +2630,16 @@ class RPCClient(RPCClientProtocol):
         # Initialize the pull iterator using regular call method
         # We pass a special __pullIterator marker as the first argument
         try:
-            init_response = await self.call(
-                subject, {"__pullIterator": True, "__iteratorId": iterator_id, "args": args}
+            await self._init_pull_session(
+                subject,
+                {"__pullIterator": True, "__iteratorId": iterator_id, "args": args},
+                request_subject,
+                iterator_id,
+                "pull iterator",
             )
-        except Exception:
+        except BaseException:
             self._pull_iterator_settles.discard(settle_on_disconnect)
             raise
-
-        # The response should contain the iterator ID (same as we sent)
-        if not init_response or init_response.get("iteratorId") != iterator_id:
-            self._pull_iterator_settles.discard(settle_on_disconnect)
-            raise RuntimeError("Failed to initialize pull iterator")
 
         # Subscribe to responses
         async def handle_response(msg: PullIteratorResponse) -> None:
@@ -1371,7 +2654,7 @@ class RPCClient(RPCClientProtocol):
 
             await response_queue.put(msg)
 
-        unsubscribe = await self.subscribe(response_subject, handle_response)
+        unsubscribe = await self._subscribe_session(response_subject, handle_response)
 
         async def cleanup() -> None:
             self._pull_iterator_settles.discard(settle_on_disconnect)
@@ -1393,13 +2676,8 @@ class RPCClient(RPCClientProtocol):
             nonlocal ended, error
 
             ended = True
-            error = create_error("503", str(errors.NoRespondersError(subject)))
-            status_msg: PullIteratorResponse = {
-                "type": "error",
-                "id": iterator_id,
-                "error": error.to_dict(),
-            }
-            response_queue.put_nowait(status_msg)
+            error = LocalNoRespondersError("503", str(errors.NoRespondersError(subject)), subject=subject)
+            response_queue.put_nowait(error)
 
         self.status_handlers[iterator_id] = on_no_responders
 
@@ -1420,6 +2698,8 @@ class RPCClient(RPCClientProtocol):
                 # Wait for response
                 response = await response_queue.get()
 
+                if isinstance(response, Exception):
+                    raise response
                 if response.get("type") == "error":
                     if error_data := response.get("error"):
                         raise RPCException.from_dict(error_data)
@@ -1471,13 +2751,29 @@ class RPCClient(RPCClientProtocol):
         # next `next()` request — which stalls the server at its own yield.
         # This is what gives true end-to-end backpressure.
         callback_is_async = {name: is_async_function(fn) for name, fn in callbacks.items()}
-        cb_queue: asyncio.Queue[tuple[Callable[..., Any], list[Any], str, bool]] = asyncio.Queue()
+        # callback messages, and for each batch boundary a future behind the callbacks that came before it
+        cb_queue: asyncio.Queue[tuple[Any, bool] | asyncio.Future[None]] = asyncio.Queue()
+        boundaries: deque[asyncio.Future[None]] = deque()
 
         async def consume_callbacks() -> None:
             while True:
-                fn, fn_args, method, fn_is_async = await cb_queue.get()
+                item = await cb_queue.get()
+                method: Any = None
                 try:
-                    if fn_is_async:
+                    if isinstance(item, asyncio.Future):
+                        if not item.done():
+                            item.set_result(None)
+                        continue
+                    payload, decoded = item
+                    msg = payload if decoded else decode_message(payload)
+                    if not isinstance(msg, dict):
+                        continue
+                    method = msg.get("method")
+                    # a producer's liveness probe carries no method of ours
+                    if not isinstance(method, str) or (fn := callbacks.get(method)) is None:
+                        continue
+                    fn_args = msg.get("args") or []
+                    if callback_is_async[method]:
                         await fn(*fn_args)
                     else:
                         fn(*fn_args)
@@ -1493,21 +2789,15 @@ class RPCClient(RPCClientProtocol):
             with contextlib.suppress(asyncio.CancelledError):
                 await consumer_task
 
-        # Subscribe to callback channel BEFORE init call.
-        async def handle_cb_msg(msg: Any) -> None:
-            if not isinstance(msg, dict):
-                return
-            method = msg.get("method")
-            if not isinstance(method, str):
-                return
-            fn = callbacks.get(method)
-            if fn is None:
-                return
-            cb_queue.put_nowait((fn, msg.get("args") or [], method, callback_is_async[method]))
+        # before the init call; both session subjects deliver in wire order,
+        # so a boundary queues behind the callbacks of its batch
+        def on_callback(_subject: str, payload: Any, decoded: bool, _size: int) -> None:
+            cb_queue.put_nowait((payload, decoded))
 
-        cb_unsub = await self.subscribe(callback_subject, handle_cb_msg)
+        cb_unsub = await self._subscribe_raw(callback_subject, on_callback)
 
-        response_queue: asyncio.Queue[PullIteratorResponse] = asyncio.Queue()
+        # a no-responder this client saw is queued as the exception itself, so it keeps its marker
+        response_queue: asyncio.Queue[PullIteratorResponse | Exception] = asyncio.Queue()
         ended = False
         error: Exception | None = None
 
@@ -1543,42 +2833,41 @@ class RPCClient(RPCClientProtocol):
         }
 
         try:
-            init_response = await self.call(subject, init_params)
-        except Exception:
+            await self._init_pull_session(
+                subject, init_params, request_subject, iterator_id, "pull-callback iterator"
+            )
+        except BaseException:
             self._pull_iterator_settles.discard(settle_on_disconnect)
             await cb_unsub()
             await stop_consumer()
             raise
 
-        if not init_response or init_response.get("iteratorId") != iterator_id:
-            self._pull_iterator_settles.discard(settle_on_disconnect)
-            await cb_unsub()
-            await stop_consumer()
-            raise RuntimeError("Failed to initialize pull-callback iterator")
-
-        async def handle_response(msg: PullIteratorResponse) -> None:
+        def on_response(_subject: str, payload: Any, decoded: bool, _size: int) -> None:
             nonlocal ended, error
+            data = payload if decoded else decode_message(payload)
+            if not isinstance(data, dict):
+                return
+            msg = cast(PullIteratorResponse, data)
             if msg.get("type") == "error":
                 if error_data := msg.get("error"):
                     error = RPCException.from_dict(error_data)
                 ended = True
             elif msg.get("type") == "done":
                 ended = True
-            await response_queue.put(msg)
+            elif msg.get("type") == "value":
+                boundary = asyncio.get_running_loop().create_future()
+                cb_queue.put_nowait(boundary)
+                boundaries.append(boundary)
+            response_queue.put_nowait(msg)
 
-        resp_unsub = await self.subscribe(response_subject, handle_response)
+        resp_unsub = await self._subscribe_raw(response_subject, on_response)
 
         def on_no_responders(_err: Exception) -> None:
             nonlocal ended, error
 
             ended = True
-            error = create_error("503", str(errors.NoRespondersError(subject)))
-            status_msg: PullIteratorResponse = {
-                "type": "error",
-                "id": iterator_id,
-                "error": error.to_dict(),
-            }
-            response_queue.put_nowait(status_msg)
+            error = LocalNoRespondersError("503", str(errors.NoRespondersError(subject)), subject=subject)
+            response_queue.put_nowait(error)
 
         self.status_handlers[iterator_id] = on_no_responders
 
@@ -1609,6 +2898,8 @@ class RPCClient(RPCClientProtocol):
 
                 response = await response_queue.get()
 
+                if isinstance(response, Exception):
+                    raise response
                 if response.get("type") == "error":
                     if error_data := response.get("error"):
                         raise RPCException.from_dict(error_data)
@@ -1618,16 +2909,49 @@ class RPCClient(RPCClientProtocol):
                     await cb_queue.join()
                     break
                 elif response.get("type") == "value":
-                    # Wait until every callback message received so far has
-                    # been processed (batch boundary only after all frames of
-                    # the batch). If a handler awaits a bounded queue
-                    # (backpressure), this stalls the iterator here until the
-                    # handler releases, which suspends the server at its own
-                    # yield.
-                    await cb_queue.join()
+                    # only this batch's callbacks; a slow handler stalls the producer at its yield
+                    await boundaries.popleft()
                     yield None
         finally:
             await cleanup()
+
+    async def _init_pull_session(
+        self, subject: str, params: Any, request_subject: str, iterator_id: str, kind: str
+    ) -> None:
+        """call() that opens a pull session.
+
+        One cancel to the session's request subject follows every init call
+        that went out and did not open the session. A caller cancelled while
+        the call goes out or waits for its reply gets its CancelledError at
+        once, and the cancel follows once the call ended.
+        """
+
+        def follow(rest: asyncio.Future[Any]) -> None:
+            run_in_background(self._cancel_after_init(rest, request_subject, iterator_id))
+
+        try:
+            response = await self._with_no_responder_retry(
+                lambda: self._call_once(subject, params, on_cancel=follow)
+            )
+            if not response or response.get("iteratorId") != iterator_id:
+                raise RuntimeError(f"Failed to initialize {kind}")
+        except Exception:
+            await self._cancel_pull_session(request_subject, iterator_id)
+            raise
+
+    async def _cancel_after_init(
+        self, init: asyncio.Future[Any], request_subject: str, iterator_id: str
+    ) -> None:
+        # a cancel ahead of the init reply can arrive before the responder listens on the request subject
+        await asyncio.wait((init,))
+        if not init.cancelled():
+            init.exception()
+        await self._cancel_pull_session(request_subject, iterator_id)
+
+    async def _cancel_pull_session(self, request_subject: str, iterator_id: str) -> None:
+        cancel: PullIteratorRequest = {"id": iterator_id, "type": "cancel"}
+        with contextlib.suppress(Exception):
+            await self.publish(request_subject, cancel)
 
     def _handle_stream_message(self, msg: StreamMessage) -> None:
         """Handle streaming message."""
@@ -1676,7 +3000,7 @@ class RPCClient(RPCClientProtocol):
                 elif msg.get("type") == "error":
                     print(f"[rpc] Callback error: {msg.get('error')}")
 
-        unsub = await self.subscribe(callback_subject, handle_callback_msg)
+        unsub = await self._subscribe_session(callback_subject, handle_callback_msg)
 
         # Send RPC request with callback marker
         callback_params: CallbackParams = {
@@ -1706,8 +3030,59 @@ class RPCClient(RPCClientProtocol):
         isolated_connection: bool = False,
         without_decorators: bool = False,
         queue: str = "",
+        *,
+        concurrency: Mapping[str, int] | None = None,
+        orphan_probe: OrphanProbeOptions | Literal[False] | None = None,
+        namespace_subscription: bool = False,
+        drop_expired: bool | Collection[str] = False,
     ) -> Callable[[], Coroutine[Any, Any, None]]:
-        """Register RPC handlers."""
+        """Register RPC handlers.
+
+        Calls of one method run one after another in arrival order. With
+        ``concurrency`` a method can opt into overlapping calls: it maps a wire
+        method name to the most calls of that method in flight at once. Calls
+        still start in arrival order, and further calls wait in the
+        subscription until a slot frees up. Only plain calls of async handlers
+        use the limit; streams, iterators, callbacks and sync handlers stay
+        serial, and limits below 2 change nothing. Only opt in methods whose
+        calls share no state, never setters or ordered writers.
+
+        ``namespace_subscription`` serves the namespace with one subscription on
+        ``rpc.<namespace>.>`` instead of one per method, which saves setup time
+        and server interest on namespaces with many methods. Each method keeps
+        its own lane: its calls run in arrival order, other methods do not wait
+        for them. A call for a method the handlers do not have gets
+        METHOD_NOT_FOUND at once instead of no responders, and every subject
+        below the namespace reaches this registration, also one another process
+        serves.
+
+        ``drop_expired`` (True for every method, or a collection of method
+        names) skips a request without a reply when it waited longer for its
+        handler than its caller's timeout: the caller has given up on it. Only
+        for methods whose calls may be lost, never for ordered writers that
+        must see every request.
+
+        ``orphan_probe`` overrides the client's ``orphan_probe`` option for the
+        callback, stream and pull sessions of these handlers: a session whose
+        consumer vanished without a cancel ends after the grace period.
+
+        Returns once the server confirmed the subscriptions (at most a second
+        on a bad link), so a call from another connection right after finds
+        them.
+
+        The returned cleanup, suspend() and disconnect() stop new calls first
+        and let the calls already received finish for up to
+        ``drain_timeout_ms``. Calls still running then are cancelled and,
+        like calls that never started, answered with CONNECTION_CLOSED.
+
+        Raises ValueError for a namespace subscription on a namespace whose
+        first segment is ``reply`` or ``cb``: ``rpc.reply.>`` and ``rpc.cb.>``
+        carry the replies and callbacks of every client.
+        """
+        if namespace_subscription and not _namespace_subscribable(namespace):
+            raise ValueError(
+                f'Namespace "{namespace}" overlaps internal subjects and cannot take a namespace subscription'
+            )
         if not self.nc:
             raise RuntimeError("Not connected")
 
@@ -1725,8 +3100,14 @@ class RPCClient(RPCClientProtocol):
             self.isolated_clients.append(client)
 
         unsubscribers: list[Callable[[], Coroutine[Any, Any, None]]] = []
-        pull_iterator_ids: list[str] = []
-        callback_ids: list[str] = []
+        stream_ids: set[str] = set()
+        pull_iterator_ids: set[str] = set()
+        callback_ids: set[str] = set()
+        registration = _Registration()
+        limits = {name: limit for name, limit in (concurrency or {}).items() if limit >= 2}
+        probe_settings = client._orphan_probe_settings(orphan_probe)
+        # namespace subscription: method name to its message handler
+        dispatchers: dict[str, Callable[..., Coroutine[Any, Any, None]]] = {}
 
         # Extract methods based on option
         handlers_map = (
@@ -1735,20 +3116,144 @@ class RPCClient(RPCClientProtocol):
             else extract_nested_methods_with_decorators(handlers)
         )
         method_names = list(handlers_map.keys())
+        dropping: Collection[str] = (
+            method_names
+            if drop_expired is True
+            else ({drop_expired} if isinstance(drop_expired, str) else set(drop_expired or ()))
+        )
+        # a namespace subscription notes the arrival itself
+        if dropping and not namespace_subscription:
+            client._stamp_arrivals()
+
+        async def send_error(
+            message: Any, response: RPCResponse, e: Exception, entry: dict[str, Any]
+        ) -> None:
+            error_dict = format_error_dict(e)
+            response["error"] = error_dict
+            # a result that failed to go out would fail the error reply too
+            response.pop("result", None)
+
+            # Diagnostic aid: a METHOD_NOT_FOUND error always carries
+            # the method list, discovery requested or not (rare, small).
+            if error_dict["code"] == ErrorCode.METHOD_NOT_FOUND.value:
+                response["__methods"] = method_names
+
+            try:
+                # If handler raised an exception, send error response
+                reply_subject = f"rpc.reply.{message['id']}"
+                await client._publish_reply(reply_subject, response, entry)
+            except Exception as publish_error:
+                if client.is_closed:
+                    return  # Ignore publish errors if client is closed
+
+                print(f"Failed to send error response: {publish_error}")
+
+        async def call_normal(
+            handler: Any, handler_is_async: bool, message: Any, response: RPCResponse, entry: dict[str, Any]
+        ) -> None:
+            wants_timing = message.get("__timing") is True
+            start = time.time() * 1000 if wants_timing else 0.0
+            result = await handle_normal_rpc(
+                handler,
+                message.get("params", []),
+                client.io_pool,
+                handler_is_async,
+            )
+            if wants_timing:
+                response["__timing"] = {
+                    "start": int(start),
+                    "end": int(time.time() * 1000),
+                }
+            response["result"] = result
+
+            # Send response
+            reply_subject = f"rpc.reply.{message['id']}"
+            await client._publish_reply(reply_subject, response, entry)
+
+        async def answer_closed(message: Any, response: RPCResponse) -> None:
+            # only past the drain deadline; a call answered already keeps its reply, nothing goes out twice
+            if (
+                not registration.expired
+                or "result" in response
+                or "error" in response
+                or not client.is_connected
+            ):
+                return
+            params = message.get("params")
+            with contextlib.suppress(Exception):
+                if isinstance(params, dict) and params.get("__stream") is not None:
+                    await refuse_stream(client, message["id"], params.get("__streamSubject"))
+                    return
+                response["error"] = create_error(ErrorCode.CONNECTION_CLOSED, "Connection closed").to_dict()
+                await client.publish(f"rpc.reply.{message['id']}", response)
+
+        async def call_limited(
+            handler: Any, message: Any, response: RPCResponse, entry: dict[str, Any]
+        ) -> None:
+            try:
+                await call_normal(handler, True, message, response, entry)
+            except asyncio.CancelledError:
+                await answer_closed(message, response)
+                raise
+            except Exception as e:
+                await send_error(message, response, e, entry)
+
+        async def start_limited(
+            slots: asyncio.Semaphore,
+            handler: Any,
+            message: Any,
+            response: RPCResponse,
+            entry: dict[str, Any],
+            arrived: float | None,
+        ) -> None:
+            # the slot is taken here, in the subscription task: at the limit further
+            # messages stay in nats-py's pending queue and calls start in arrival order
+            await slots.acquire()
+            if arrived is not None and _expired(message, arrived):
+                slots.release()
+                return
+            if registration.expired:
+                # a task created now is cancelled before its first step and would never answer
+                slots.release()
+                await answer_closed(message, response)
+                return
+            task = asyncio.create_task(call_limited(handler, message, response, entry))
+            # a done callback also fires for a task cancelled before its first step
+            task.add_done_callback(lambda _: slots.release())
+            for tasks in (registration.calls, client._concurrent_calls):
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
 
         for method, handler in handlers_map.items():
             subject = f"rpc.{namespace}.{method}"
             # Determined once per handler instead of per message.
             handler_is_async = is_async_function(handler)
+            # outlives suspend()/connect(): the restored subscription keeps this closure
+            slots = asyncio.Semaphore(limits[method]) if handler_is_async and method in limits else None
+            # filled by _subscribe, a reply reads the method's queue from it
+            entry: dict[str, Any] = {"arrival": True} if method in dropping else {}
 
             async def handle_message(
                 msg: Any,
+                arrived: float | None = None,
+                *,
                 handler: Any = handler,
                 method_names: list[str] = method_names,
                 handler_is_async: bool = handler_is_async,
+                slots: asyncio.Semaphore | None = slots,
+                entry: dict[str, Any] = entry,
+                drops: bool = method in dropping,
             ) -> None:
                 message = msg
                 response: RPCResponse = {"id": message["id"]}
+                if registration.expired:
+                    await answer_closed(message, response)
+                    return
+                if not drops:
+                    arrived = None
+                elif arrived is not None and _expired(message, arrived):
+                    # its caller gave up already, skipped without a reply
+                    return
 
                 # Method discovery on demand: only a request whose envelope
                 # carries __discover (a proxy with an empty method cache) pays
@@ -1806,39 +3311,55 @@ class RPCClient(RPCClientProtocol):
                         stream_subject = cast(str, _params["__streamSubject"])
                         args = cast(list[Any], _params.get("args", []))
 
-                        # Don't await stream requests - they run in background and send data via streamSubject
-                        # Awaiting would block the subscription handler and prevent processing of new messages
-                        async def run_stream() -> None:
-                            try:
-                                await handle_stream_request(
-                                    handler,
-                                    args,
-                                    stream_subject,
-                                    message["id"],
-                                    client,
-                                    client.io_pool,
-                                )
-                            except Exception as e:
-                                print(f"Stream request error for {method}: {e}")
-
-                        asyncio.create_task(run_stream())
+                        # Streams run in their own task and send data via streamSubject, awaiting
+                        # them would block the subscription handler for the next messages
+                        stream_id = cast(str, message["id"])
+                        try:
+                            stream_cleanup, _ = start_stream_request(
+                                handler,
+                                args,
+                                stream_subject,
+                                stream_id,
+                                client,
+                                client.io_pool,
+                                on_finished=partial(
+                                    _forget_session, client.stream_cleanups, stream_ids, stream_id
+                                ),
+                                probe=client._new_orphan_probe(probe_settings),
+                            )
+                        except Exception as e:
+                            print(f"Stream request error for {method}: {e}")
+                            return
+                        stream_ids.add(stream_id)
+                        client._track_session(client.stream_cleanups, stream_id, stream_cleanup)
                         return  # Don't send RPC response for stream requests
                     elif is_pull_iterator:
                         # Handle pull iterator request
                         args = cast(list[Any], pull_params.get("args", []))
                         iterator_id = cast(str, pull_params.get("__iteratorId", message["id"]))
-                        cleanup = await handle_pull_iterator_request(
-                            handler,
-                            args,
-                            iterator_id,
+                        cleanup = await set_up_session(
+                            handle_pull_iterator_request(
+                                handler,
+                                args,
+                                iterator_id,
+                                client,
+                                client.io_pool,
+                                on_finished=partial(
+                                    _forget_session,
+                                    client.pull_iterator_cleanups,
+                                    pull_iterator_ids,
+                                    iterator_id,
+                                ),
+                                probe=client._new_orphan_probe(probe_settings),
+                            ),
                             client,
-                            client.io_pool,
-                            on_finished=partial(client.pull_iterator_cleanups.pop, iterator_id, None),
+                            f"rpc.reply.{message['id']}",
+                            response,
                         )
 
                         # Store cleanup function for later
-                        client.pull_iterator_cleanups[iterator_id] = cleanup
-                        pull_iterator_ids.append(iterator_id)
+                        pull_iterator_ids.add(iterator_id)
+                        client._track_session(client.pull_iterator_cleanups, iterator_id, cleanup)
                         response["result"] = {"iteratorId": iterator_id}
 
                         # Send response with iterator ID
@@ -1851,19 +3372,30 @@ class RPCClient(RPCClientProtocol):
                         pc_callback_subject = cast(str, pc_params.get("__callbackSubject", ""))
                         pc_oneway_methods = cast(list[str], pc_params.get("__onewayMethods", []))
 
-                        pc_cleanup = await handle_pull_callback_request(
-                            handler,
-                            pc_args,
-                            pc_iterator_id,
-                            pc_callback_subject,
-                            pc_oneway_methods,
+                        pc_cleanup = await set_up_session(
+                            handle_pull_callback_request(
+                                handler,
+                                pc_args,
+                                pc_iterator_id,
+                                pc_callback_subject,
+                                pc_oneway_methods,
+                                client,
+                                client.io_pool,
+                                on_finished=partial(
+                                    _forget_session,
+                                    client.pull_iterator_cleanups,
+                                    pull_iterator_ids,
+                                    pc_iterator_id,
+                                ),
+                                probe=client._new_orphan_probe(probe_settings),
+                            ),
                             client,
-                            client.io_pool,
-                            on_finished=partial(client.pull_iterator_cleanups.pop, pc_iterator_id, None),
+                            f"rpc.reply.{message['id']}",
+                            response,
                         )
 
-                        client.pull_iterator_cleanups[pc_iterator_id] = pc_cleanup
-                        pull_iterator_ids.append(pc_iterator_id)
+                        pull_iterator_ids.add(pc_iterator_id)
+                        client._track_session(client.pull_iterator_cleanups, pc_iterator_id, pc_cleanup)
                         response["result"] = {"iteratorId": pc_iterator_id}
 
                         reply_subject = f"rpc.reply.{message['id']}"
@@ -1886,83 +3418,106 @@ class RPCClient(RPCClientProtocol):
                         callback_subject = cast(str, _cb_params["__callbackSubject"])
                         cb_args = cast(list[Any], _cb_params.get("args", []))
 
-                        cb_cleanup = await handle_callback_request(
-                            handler,
-                            cb_args,
-                            callback_subject,
-                            message["id"],
+                        cb_cleanup = await set_up_session(
+                            handle_callback_request(
+                                handler,
+                                cb_args,
+                                callback_subject,
+                                message["id"],
+                                client,
+                                client.io_pool,
+                                on_finished=partial(
+                                    _forget_session, client.callback_cleanups, callback_ids, message["id"]
+                                ),
+                                probe=client._new_orphan_probe(probe_settings),
+                            ),
                             client,
-                            client.io_pool,
-                            on_finished=partial(client.callback_cleanups.pop, message["id"], None),
+                            f"rpc.reply.{message['id']}",
+                            response,
                         )
-                        client.callback_cleanups[message["id"]] = cb_cleanup
-                        callback_ids.append(message["id"])
+                        callback_ids.add(message["id"])
+                        client._track_session(client.callback_cleanups, message["id"], cb_cleanup)
 
                         response["result"] = {"ok": True}
                         reply_subject = f"rpc.reply.{message['id']}"
                         await client.publish(reply_subject, response)
+                    elif slots is not None:
+                        await start_limited(slots, handler, message, response, entry, arrived)
                     else:
                         # Normal RPC call
-                        wants_timing = message.get("__timing") is True
-                        start = time.time() * 1000 if wants_timing else 0.0
-                        result = await handle_normal_rpc(
-                            handler,
-                            message.get("params", []),
-                            client.io_pool,
-                            handler_is_async,
-                        )
-                        if wants_timing:
-                            response["__timing"] = {
-                                "start": int(start),
-                                "end": int(time.time() * 1000),
-                            }
-                        response["result"] = result
+                        await call_normal(handler, handler_is_async, message, response, entry)
 
-                        # Send response
-                        reply_subject = f"rpc.reply.{message['id']}"
-                        await client.publish(reply_subject, response)
-
+                except asyncio.CancelledError:
+                    await answer_closed(message, response)
+                    raise
                 except Exception as e:
-                    error_dict = format_error_dict(e)
-                    response["error"] = error_dict
+                    await send_error(message, response, e, entry)
 
-                    # Diagnostic aid: a METHOD_NOT_FOUND error always carries
-                    # the method list, discovery requested or not (rare, small).
-                    if error_dict["code"] == ErrorCode.METHOD_NOT_FOUND.value:
-                        response["__methods"] = method_names
-
-                    try:
-                        # If handler raised an exception, send error response
-                        reply_subject = f"rpc.reply.{message['id']}"
-                        await client.publish(reply_subject, response)
-                    except Exception as publish_error:
-                        if client.is_closed:
-                            return  # Ignore publish errors if client is closed
-
-                        print(f"Failed to send error response: {publish_error}")
-
-            unsubscribe = await client.subscribe(subject, handle_message, queue=queue)
+            if namespace_subscription:
+                dispatchers[method] = handle_message
+                continue
+            unsubscribe = await client._subscribe(subject, handle_message, queue, entry, yield_after=False)
             unsubscribers.append(unsubscribe)
+            registration.entries.append(entry)
+
+        async def list_methods(msg: Any) -> None:
+            if isinstance(msg, dict) and isinstance(request_id := msg.get("id"), str):
+                response: RPCResponse = {"id": request_id, "result": method_names}
+                await client.publish(f"rpc.reply.{request_id}", response)
+
+        if namespace_subscription:
+            namespace_entry: dict[str, Any] = {}
+            unsubscribers.append(
+                await client._subscribe_namespace(
+                    namespace, dispatchers, list_methods, queue, namespace_entry, registration
+                )
+            )
+            registration.entries.append(namespace_entry)
+        else:
+            # after the methods, so an answer means all of them are subscribed; it goes first at teardown
+            methods_entry: dict[str, Any] = {}
+            unsubscribers.insert(
+                0,
+                await client._subscribe(
+                    f"rpc.{namespace}.{METHODS_METHOD}", list_methods, queue, methods_entry, yield_after=False
+                ),
+            )
+            registration.entries.insert(0, methods_entry)
+        client._registrations.add(registration)
+        await client._confirm_subscriptions()
 
         # Return combined unsubscribe function
         async def cleanup() -> None:
+            # taken out first, so a disconnect() of the client meanwhile does not drain it a second time
+            client._registrations.discard(registration)
+            await client._drain_registrations((registration,))
             # Unsubscribe all handlers
             await asyncio.gather(*(unsub() for unsub in unsubscribers), return_exceptions=True)
+            await asyncio.gather(*_stop_lanes((registration,)), return_exceptions=True)
+            await _cancel_tasks(registration.calls)
 
-            # Cleanup pull iterators / callbacks — only the ones THIS
+            # Cleanup streams / pull iterators / callbacks: only the ones THIS
             # register_handler call created. The client maps are shared across
             # register_handler calls; sweeping them wholesale would kill the
             # live sessions of every other namespace.
-            async def cleanup_iterator(iterator_id: str) -> None:
-                if fn := client.pull_iterator_cleanups.pop(iterator_id, None):
+            async def end_session(
+                cleanups: dict[str, Callable[[], Coroutine[Any, Any, None]]], session_id: str
+            ) -> None:
+                if fn := cleanups.pop(session_id, None):
                     await fn()
 
             await asyncio.gather(
-                *(cleanup_iterator(iterator_id) for iterator_id in pull_iterator_ids),
+                *(end_session(client.stream_cleanups, stream_id) for stream_id in list(stream_ids)),
+                *(
+                    end_session(client.pull_iterator_cleanups, iterator_id)
+                    for iterator_id in list(pull_iterator_ids)
+                ),
                 return_exceptions=True,
             )
+            stream_ids.clear()
+            pull_iterator_ids.clear()
 
-            for cb_id in callback_ids:
+            for cb_id in list(callback_ids):
                 if cb_cleanup := client.callback_cleanups.pop(cb_id, None):
                     with contextlib.suppress(Exception):
                         await cb_cleanup()
@@ -2004,13 +3559,18 @@ class RPCClient(RPCClientProtocol):
             except Exception as e:
                 # Send error response
                 if msg.reply:
-                    error_response = encode_message(
-                        {
-                            "error": str(e),
-                            "code": e.code if isinstance(e, RPCException) else ErrorCode.INTERNAL_ERROR.value,
-                        }
+                    reported = reported_error(e)
+                    text = (
+                        reported.message
+                        if isinstance(reported, RPCException) and reported is not e
+                        else str(e)
                     )
-                    await msg.respond(error_response)
+                    code = (
+                        reported.code
+                        if isinstance(reported, RPCException)
+                        else ErrorCode.INTERNAL_ERROR.value
+                    )
+                    await msg.respond(encode_message({"error": text, "code": code}))
 
         sub = await self.nc.subscribe(pattern, cb=handle_request)
         # See _nats_subscribe: yield so the flusher sends the SUB before we
@@ -2043,7 +3603,8 @@ class RPCClient(RPCClientProtocol):
 
         # Store reference for cleanup if isolated
         if isolated_connection:
-            setattr(channel, "_isolated_client", client)  # noqa: B010
+            channel._isolated_client = client
+            channel._parent_client = self
 
         return channel
 
@@ -2066,30 +3627,67 @@ class RPCClient(RPCClientProtocol):
 
         # Store reference for cleanup if isolated
         if isolated_connection:
-            setattr(channel, "_isolated_client", client)  # noqa: B010
+            channel._isolated_client = client
+            channel._parent_client = self
 
         return channel
 
     @overload
     def create_proxy(
-        self, namespace: str, type_class: type[T], isolated_connection: Literal[False] | None = None
+        self,
+        namespace: str,
+        type_class: type[T],
+        isolated_connection: Literal[False] | None = None,
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> T: ...
     @overload
     def create_proxy(
-        self, namespace: str, type_class: type[T], isolated_connection: Literal[True]
+        self,
+        namespace: str,
+        type_class: type[T],
+        isolated_connection: Literal[True],
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> ProxyWithClose[T]: ...
     @overload
     def create_proxy(
-        self, namespace: str, type_class: None = None, isolated_connection: Literal[False] | None = None
+        self,
+        namespace: str,
+        type_class: None = None,
+        isolated_connection: Literal[False] | None = None,
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> Any: ...
     @overload
     def create_proxy(
-        self, namespace: str, type_class: None = None, isolated_connection: Literal[True] = True
+        self,
+        namespace: str,
+        type_class: None = None,
+        isolated_connection: Literal[True] = True,
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> ProxyWithClose[Any]: ...
     def create_proxy(
-        self, namespace: str, type_class: type[T] | None = None, isolated_connection: bool | None = False
+        self,
+        namespace: str,
+        type_class: type[T] | None = None,
+        isolated_connection: bool | None = False,
+        *,
+        no_responder_retry: NoResponderRetryOptions | None = None,
+        timeout: int | None = None,
     ) -> T | Any | ProxyWithClose[T] | ProxyWithClose[Any]:
-        """Create proxy for type-safe RPC calls."""
+        """Create proxy for type-safe RPC calls.
+
+        ``no_responder_retry`` applies to every call and stream made through
+        this proxy, ``timeout`` (milliseconds, per attempt) to every call, as
+        if passed to each ``call()``. ``{"max_retries": 0}`` turns the
+        no-responder retry off.
+        """
         if isolated_connection:
             # Create an isolated proxy with its own connection
             client = self.create_isolated_client(
@@ -2097,14 +3695,18 @@ class RPCClient(RPCClientProtocol):
             )
             self.isolated_clients.append(client)
 
-            proxy = create_proxy(cast(Any, client), namespace)
+            proxy = create_proxy(
+                cast(Any, client), namespace, no_responder_retry=no_responder_retry, timeout=timeout
+            )
 
             # Store references for potential cleanup
             setattr(proxy, "_isolated_client", client)  # noqa: B010
             setattr(proxy, "_parent_client", self)  # noqa: B010
             return ProxyWithClose(proxy)
         else:
-            return create_proxy(cast(Any, self), namespace)
+            return create_proxy(
+                cast(Any, self), namespace, no_responder_retry=no_responder_retry, timeout=timeout
+            )
 
     @overload
     async def create_service_proxy(

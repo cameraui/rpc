@@ -1,5 +1,7 @@
 import type { ErrorCode, RPCError } from './types.js';
 
+const LOCAL_NO_RESPONDERS = Symbol('rpc.localNoResponders');
+
 /**
  * RPC Exception class for structured error handling
  */
@@ -45,6 +47,30 @@ export function createError(code: ErrorCode | string, message: string, data?: an
  */
 export function isRPCError(error: any): error is RPCException {
   return error instanceof RPCException;
+}
+
+/**
+ * Mark an error this client raised for a no-responder status it saw itself.
+ * A handler that passes such an error on reports `upstream unavailable`
+ * instead, so its caller does not take it for a missing responder of its own.
+ *
+ * Internal: client.ts and handler.ts use it.
+ */
+export function markLocalNoResponders<E extends Error>(error: E, subject: string): E {
+  Object.defineProperty(error, LOCAL_NO_RESPONDERS, { value: subject });
+  return error;
+}
+
+/**
+ * The subject of a no-responder error from markLocalNoResponders(),
+ * undefined for any other value.
+ *
+ * Internal: handler.ts uses it.
+ */
+export function localNoRespondersSubject(error: unknown): string | undefined {
+  if (error === null || typeof error !== 'object') return undefined;
+  const subject = (error as { [LOCAL_NO_RESPONDERS]?: unknown })[LOCAL_NO_RESPONDERS];
+  return typeof subject === 'string' ? subject : undefined;
 }
 
 /**

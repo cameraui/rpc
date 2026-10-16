@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from nats import errors as nats_errors
+
 from .types import ErrorCode, RPCError
 
 
@@ -40,6 +42,49 @@ class RPCException(Exception):
     def __repr__(self) -> str:
         """Developer representation."""
         return f"RPCException(code={self.code!r}, message={self.message!r}, data={self.data!r})"
+
+
+class RPCTimeoutError(RPCException, nats_errors.TimeoutError):
+    """A call or request that got no reply within its timeout.
+
+    Code TIMEOUT, the message names the subject and the timeout. It is also a
+    nats.errors.TimeoutError and a builtin TimeoutError, so except clauses
+    written for the error the client raised before keep matching.
+    """
+
+
+class LocalNoRespondersError(RPCException):
+    """A no-responder status this client saw itself, as opposed to an error a responder sent back.
+
+    Code and message are what callers saw before; ``subject`` names the
+    subject nobody served.
+    """
+
+    def __init__(self, code: str, message: str, data: Any | None = None, *, subject: str | None = None):
+        super().__init__(code, message, data)
+        self.subject: str | None = subject
+
+
+def is_local_no_responders(e: BaseException) -> bool:
+    """Whether ``e`` is a no-responder this client saw itself, never one decoded from a reply."""
+    return isinstance(e, (nats_errors.NoRespondersError, LocalNoRespondersError))
+
+
+def reported_error(e: Exception) -> Exception:
+    """The error a responder puts on the wire for ``e``.
+
+    A no-responder that a handler's own call ran into becomes INTERNAL_ERROR
+    'upstream unavailable' with the subject in ``data``: for the handler's
+    caller it is a failed call, not a missing responder its retry could find.
+    Everything else is reported as it is.
+    """
+    if not is_local_no_responders(e):
+        return e
+    subject = getattr(e, "subject", None)
+    if subject is None and e.args and isinstance(e.args[0], str):
+        # the client raises nats' NoRespondersError with the subject as its only argument
+        subject = e.args[0]
+    return RPCException(ErrorCode.INTERNAL_ERROR.value, "upstream unavailable", {"subject": subject})
 
 
 def create_error(code: ErrorCode | str, message: str, data: Any | None = None) -> RPCException:

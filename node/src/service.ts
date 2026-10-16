@@ -1,13 +1,45 @@
 import { Svcm } from '@nats-io/services';
 
+import { parseChunkIndex } from './chunking.js';
 import { decode, decodeMessage } from './codec.js';
 import { extractNestedMethodsWithDecorators } from './decorators.js';
-import { formatErrorObject, handleNormalRPC, handlePullIteratorRequest, handleStreamRequest } from './handler.js';
+import { formatErrorObject, handleNormalRPC, handleStreamRequest, openSession, probeSettings, SessionOwner, sessionKind } from './handler.js';
 
+import type { Msg } from '@nats-io/nats-core';
 import type { Service as NATSService, ServiceClient, ServiceConfig, ServiceGroup, ServiceInfo, ServiceMsg, ServiceStats } from '@nats-io/services';
 import type { NatsConnection } from '@nats-io/transport-node';
+import type { ChunkingManager } from './chunking.js';
 import type { RPCClient } from './client.js';
 import type { RPCResponse } from './types.js';
+
+/**
+ * Service metadata: each instance also takes requests on its own subject,
+ * see directSubject().
+ *
+ * Internal: utils.ts uses it.
+ */
+export const DIRECT_SUBJECT_METADATA = 'cui.chunk.direct';
+
+/**
+ * The subject of one service instance for an endpoint. The header and chunks
+ * of a chunked request go there: a queue group would hand them to different
+ * instances.
+ *
+ * Internal: utils.ts uses it.
+ */
+export function directSubject(instanceId: string, path: string): string {
+  return `$CUI.SVC.${instanceId}.${path}`;
+}
+
+/**
+ * The endpoint subject only this service has, next to the bare one that two
+ * services with the same method name share.
+ *
+ * Internal: utils.ts uses it.
+ */
+export function serviceSubject(serviceName: string, path: string): string {
+  return `svc.${serviceName}.${path}`;
+}
 
 /**
  * RPC Service wrapper with automatic encoding/decoding and streaming support
@@ -37,15 +69,23 @@ export class RPCService {
 
   /**
    * Add a service with automatic RPC endpoint wrapping
-   * Supports objects, classes, nested structures, streaming, and chunking
+   * Supports objects, classes, nested structures, streaming, callbacks,
+   * pull iterators and chunking.
+   *
+   * Every method is served on its bare endpoint subject, on
+   * svc.<service name>.<path>, which no other service shares, and for
+   * chunked requests on a subject of this instance alone (announced in the
+   * service metadata). A request is answered on <its subject>.reply.<id>.
    */
   public async registerHandler(config: ServiceConfig, handlers: object, options?: { isolatedConnection?: boolean }): Promise<Service> {
     if (!this.svc) {
       throw new Error('RPCService is not initialized. Call init() first.');
     }
 
-    // Track pull iterator cleanups for this service
-    const pullIteratorCleanups = new Map<string, () => Promise<void>>();
+    // the stream and pull sessions of this service, stop() ends them
+    const owner = new SessionOwner();
+    const probe = probeSettings(this.client.options.orphanProbe);
+    const endpointChunking: ChunkingManager[] = [];
 
     // Use isolated connection if requested
     let serviceClient = this.client;
@@ -65,8 +105,10 @@ export class RPCService {
       svc = new Svcm(nc);
     }
 
-    const service = await svc.add(config);
+    const service = await svc.add({ ...config, metadata: { ...config.metadata, [DIRECT_SUBJECT_METADATA]: '1' } });
     this.services.push(service);
+    const instanceId = service.info().id;
+    const directUnsubscribes: (() => void)[] = [];
 
     // Store reference to isolated connection if used
     if (options?.isolatedConnection) {
@@ -98,8 +140,11 @@ export class RPCService {
         target = groups.get(groupPath)!;
       }
 
-      // Add endpoint with auto-encoding/decoding
-      target.addEndpoint(methodName, async (err: Error | null, msg: ServiceMsg) => {
+      // one manager per endpoint keeps the transfer cap per endpoint
+      const chunking = serviceClient.createEndpointChunking();
+      endpointChunking.push(chunking);
+
+      const endpointHandler = async (err: Error | null, msg: ServiceMsg): Promise<void> => {
         if (err) {
           msg.respondError(500, err.message);
           return;
@@ -113,13 +158,13 @@ export class RPCService {
             const data = decode(msg.data);
             const chunkId = msg.headers?.get('x-chunk-id');
 
-            if (!chunkId || data.transferId !== chunkId) {
+            if (!chunkId || data?.transferId !== chunkId) {
               console.error('Invalid chunk header');
               return;
             }
 
-            // Setup chunk assembly with pre-allocated buffer (optimized)
-            serviceClient.chunkingManager.startReceiving(
+            // Setup chunk assembly, the buffer is allocated with the first chunk
+            chunking.startReceiving(
               data.transferId,
               data.totalChunks,
               async (assembledData) => {
@@ -129,13 +174,13 @@ export class RPCService {
               (error) => {
                 console.error(`Error assembling chunks for ${methodName}:`, error);
               },
-              data.totalSize, // Pass totalSize for pre-allocated buffer optimization
+              data.totalSize, // Pass totalSize for the single assembly buffer
               data.chunkSize, // Pass chunkSize for correct offset calculation
             );
           } else if (chunkType === 'chunk') {
             // Chunk data
             const chunkId = msg.headers?.get('x-chunk-id');
-            const chunkIndex = parseInt(msg.headers?.get('x-chunk-index') ?? '0');
+            const chunkIndex = parseChunkIndex(msg.headers?.get('x-chunk-index'));
 
             if (!chunkId) {
               console.error('Chunk missing chunk ID');
@@ -143,7 +188,7 @@ export class RPCService {
             }
 
             // Process raw chunk data
-            serviceClient.chunkingManager.processChunk({
+            chunking.processChunk({
               id: chunkId,
               chunkIndex,
               data: msg.data,
@@ -158,47 +203,30 @@ export class RPCService {
           console.error(`Error processing message for ${methodName}:`, error);
         }
 
-        // Define the RPC message processor function
+        // Define the RPC message processor function. The reply goes to the
+        // subject the request came on, also for the svc. and direct subjects.
         async function processRPCMessage(rpcMsg: any, originalMsg: ServiceMsg) {
           const response: RPCResponse = { id: rpcMsg.id };
 
           try {
-            // Handle stream request
-            if (rpcMsg.params?.__stream && rpcMsg.params?.__streamSubject) {
+            const kind = sessionKind(rpcMsg.params);
+            if (kind === 'stream') {
               const streamSubject = rpcMsg.params.__streamSubject;
               const args = rpcMsg.params.args ?? [];
 
-              await handleStreamRequest(handler, args, streamSubject, rpcMsg.id, serviceClient);
-            } else if (
-              // Check if it's a pull iterator request
-              // Could be direct object or wrapped in array from call()
-              rpcMsg.params?.__pullIterator ||
-              (Array.isArray(rpcMsg.params) && rpcMsg.params[0]?.__pullIterator)
-            ) {
-              // Extract pull iterator params
-              const pullParams = rpcMsg.params?.__pullIterator ? rpcMsg.params : rpcMsg.params[0];
-              const args = pullParams.args ?? [];
-              const iteratorId = pullParams.__iteratorId ?? rpcMsg.id;
-              const cleanup = await handlePullIteratorRequest(handler, args, iteratorId, serviceClient, () => pullIteratorCleanups.delete(iteratorId));
-
-              // Store cleanup function for later
-              pullIteratorCleanups.set(iteratorId, cleanup);
-              response.result = { iteratorId };
-
-              // Send response with iterator ID
-              const replySubject = `${originalMsg.subject}.reply.${rpcMsg.id}`;
-              await serviceClient.publish(replySubject, response);
+              await handleStreamRequest(handler, args, streamSubject, rpcMsg.id, serviceClient, owner, probe);
             } else {
-              // Normal RPC call
-              const result = await handleNormalRPC(handler, rpcMsg.params);
-              response.result = result;
+              response.result = kind
+                ? await openSession(kind, handler, rpcMsg.params, rpcMsg.id, serviceClient, owner, probe)
+                : await handleNormalRPC(handler, rpcMsg.params);
 
-              // Send response
               const replySubject = `${originalMsg.subject}.reply.${rpcMsg.id}`;
               await serviceClient.publish(replySubject, response);
             }
           } catch (error) {
             response.error = formatErrorObject(error);
+            // a result that failed to go out would fail the error reply too
+            delete response.result;
 
             try {
               const replySubject = `${originalMsg.subject}.reply.${rpcMsg.id}`;
@@ -212,22 +240,26 @@ export class RPCService {
             }
           }
         }
-      });
+      };
+
+      // Add endpoint with auto-encoding/decoding
+      target.addEndpoint(methodName, endpointHandler);
+      service.addEndpoint(methodName, { handler: endpointHandler, subject: serviceSubject(config.name, path) });
+      directUnsubscribes.push(serviceClient.subscribeMessages(directSubject(instanceId, path), (msg: Msg) => void endpointHandler(null, msg as ServiceMsg), false));
     }
 
-    // Extend service with cleanup management
-    const extendedService = service as NATSService & { _pullIteratorCleanups?: Map<string, () => Promise<void>> };
-    extendedService._pullIteratorCleanups = pullIteratorCleanups;
-
-    // Override stop method to clean up pull iterators
+    // Override stop method to end the open stream and pull sessions
     const originalStop = service.stop.bind(service);
     service.stop = async (err?: Error) => {
-      // Clean up all pull iterators
-      await Promise.allSettled(Array.from(pullIteratorCleanups.values()).map((cleanup) => cleanup()));
-      pullIteratorCleanups.clear();
+      for (const unsubscribe of directUnsubscribes.splice(0)) unsubscribe();
+      await Promise.allSettled(owner.stop());
 
       // Call original stop
-      return originalStop(err);
+      try {
+        return await originalStop(err);
+      } finally {
+        for (const manager of endpointChunking) serviceClient.releaseEndpointChunking(manager);
+      }
     };
 
     return new Service(service);

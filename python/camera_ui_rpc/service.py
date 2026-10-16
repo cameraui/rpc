@@ -4,10 +4,14 @@ import asyncio
 import contextlib
 import json
 from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
+from nats.aio.client import NO_RESPONDERS_STATUS
 from nats.aio.client import Client as NATSClient
+from nats.aio.msg import Msg
+from nats.js.api import Header
 from nats.micro.request import Request
 from nats.micro.service import (
     Group,
@@ -20,20 +24,54 @@ from nats.micro.service import (
     Service as NATSService,
 )
 
+from .chunking import ChunkingManager, parse_chunk_index
 from .codec import decode, decode_message, encode
 from .decorators import extract_nested_methods_with_decorators
+from .errors import RPCException, reported_error
 from .handler import (
     format_error_dict,
+    handle_callback_request,
     handle_normal_rpc,
+    handle_pull_callback_request,
     handle_pull_iterator_request,
-    handle_stream_request,
+    session_params,
+    set_up_session,
+    start_stream_request,
 )
 from .svcm import Svcm
 from .types import ErrorCode, RPCClientOptions
-from .utils import is_async_function
+from .utils import DIRECT_SUBJECT_METADATA, direct_subject, is_async_function, service_subject
 
 if TYPE_CHECKING:
     from .client import RPCClient
+
+_Teardown = Callable[[], Coroutine[Any, Any, None]]
+_Info = TypeVar("_Info")
+
+DISCOVERY_TIMEOUT = 2.0
+"""Seconds discovery waits for the first service to answer."""
+
+DISCOVERY_STALL = 0.01
+"""Seconds discovery waits for further services after the last answer."""
+
+
+def _forget_session(own: dict[str, _Teardown], tracked: dict[str, _Teardown], session_id: str) -> None:
+    own.pop(session_id, None)
+    tracked.pop(session_id, None)
+
+
+async def _serve_direct(handler: Callable[[Request], Awaitable[None]], msg: Msg) -> None:
+    # the instance subject is a plain subscription, its requests take the endpoint's way
+    with contextlib.suppress(Exception):
+        await handler(Request(msg))
+
+
+def _take_sessions(own: dict[str, _Teardown], tracked: dict[str, _Teardown]) -> list[_Teardown]:
+    for session_id in own:
+        tracked.pop(session_id, None)
+    teardowns = list(own.values())
+    own.clear()
+    return teardowns
 
 
 class RPCService:
@@ -87,15 +125,24 @@ class RPCService:
             # Create service manager for isolated connection
             svc = Svcm(nc)
 
-        service = await svc.add(config)
+        service = await svc.add(
+            replace(config, metadata={**(config.metadata or {}), DIRECT_SUBJECT_METADATA: "1"})
+        )
         self.__services.append(service)
+        instance_id = service.info().id
+        direct_subscriptions: list[Any] = []
 
         # Store reference to isolated connection if used
         if isolated_connection:
             setattr(service, "_isolated_client", service_client)  # noqa: B010
 
-        # Track pull iterator cleanups for this service
-        pull_iterator_cleanups: dict[str, Callable[[], Coroutine[Any, Any, None]]] = {}
+        # the client tracks them too, so its suspend(), disconnect() and a lost connection end them
+        pull_iterator_cleanups: dict[str, _Teardown] = {}
+        stream_cleanups: dict[str, _Teardown] = {}
+        callback_cleanups: dict[str, _Teardown] = {}
+        endpoint_chunks: list[ChunkingManager] = []
+
+        probe_settings = service_client._orphan_probe_settings()  # pyright: ignore[reportPrivateUsage]
 
         # Extract all methods including nested ones
         methods = extract_nested_methods_with_decorators(handlers)
@@ -123,6 +170,8 @@ class RPCService:
             def make_endpoint_handler(h: Callable[..., Any]) -> Callable[[Request], Awaitable[None]]:
                 # Determined once per endpoint instead of per message.
                 h_is_async = is_async_function(h)
+                chunks = service_client._open_endpoint_chunking()  # pyright: ignore[reportPrivateUsage]
+                endpoint_chunks.append(chunks)
 
                 async def handle_rpc_message(rpc_msg: dict[str, Any], original_msg: Request) -> None:
                     """Handle RPC protocol message."""
@@ -138,15 +187,29 @@ class RPCService:
                         ):
                             stream_subject = cast(str, params["__streamSubject"])
                             args = cast(list[Any], params.get("args", []))
+                            stream_id = cast(str, rpc_msg["id"])
 
-                            await handle_stream_request(
+                            stream_cleanup, stream_task = start_stream_request(
                                 h,
                                 args,
                                 stream_subject,
-                                rpc_msg["id"],
+                                stream_id,
                                 service_client,
                                 service_client.io_pool,
+                                on_finished=partial(
+                                    _forget_session,
+                                    stream_cleanups,
+                                    service_client.stream_cleanups,
+                                    stream_id,
+                                ),
+                                probe=service_client._new_orphan_probe(probe_settings),  # pyright: ignore[reportPrivateUsage]
                             )
+                            stream_cleanups[stream_id] = stream_cleanup
+                            service_client._track_session(  # pyright: ignore[reportPrivateUsage]
+                                service_client.stream_cleanups, stream_id, stream_cleanup
+                            )
+                            # one stream at a time per endpoint, the endpoint task waits for it
+                            await asyncio.wait((stream_task,))
                         elif (
                             # Check if it's a pull iterator request
                             # Could be direct object or wrapped in array from call()
@@ -167,21 +230,94 @@ class RPCService:
                             )
                             args = cast(list[Any], pull_params.get("args", []))
                             iterator_id = cast(str, pull_params.get("__iteratorId", rpc_msg["id"]))
-                            cleanup = await handle_pull_iterator_request(
-                                h,
-                                args,
-                                iterator_id,
+                            cleanup = await set_up_session(
+                                handle_pull_iterator_request(
+                                    h,
+                                    args,
+                                    iterator_id,
+                                    service_client,
+                                    service_client.io_pool,
+                                    on_finished=partial(
+                                        _forget_session,
+                                        pull_iterator_cleanups,
+                                        service_client.pull_iterator_cleanups,
+                                        iterator_id,
+                                    ),
+                                    probe=service_client._new_orphan_probe(probe_settings),  # pyright: ignore[reportPrivateUsage]
+                                ),
                                 service_client,
-                                service_client.io_pool,
-                                on_finished=partial(pull_iterator_cleanups.pop, iterator_id, None),
+                                f"{original_msg.subject}.reply.{rpc_msg['id']}",
+                                response,
                             )
 
                             # Store cleanup function for later
                             pull_iterator_cleanups[iterator_id] = cleanup
+                            service_client._track_session(  # pyright: ignore[reportPrivateUsage]
+                                service_client.pull_iterator_cleanups, iterator_id, cleanup
+                            )
                             response["result"] = {"iteratorId": iterator_id}
 
                             # Send response with iterator ID
                             reply_subject = f"{original_msg.subject}.reply.{rpc_msg['id']}"
+                            await service_client.publish(reply_subject, response)
+                        elif (pc_params := session_params(params, "__pullCallback")) is not None:
+                            pc_iterator_id = cast(str, pc_params.get("__iteratorId", rpc_msg["id"]))
+                            reply_subject = f"{original_msg.subject}.reply.{rpc_msg['id']}"
+                            cleanup = await set_up_session(
+                                handle_pull_callback_request(
+                                    h,
+                                    cast(list[Any], pc_params.get("args", [])),
+                                    pc_iterator_id,
+                                    cast(str, pc_params.get("__callbackSubject", "")),
+                                    cast(list[str], pc_params.get("__onewayMethods", [])),
+                                    service_client,
+                                    service_client.io_pool,
+                                    on_finished=partial(
+                                        _forget_session,
+                                        pull_iterator_cleanups,
+                                        service_client.pull_iterator_cleanups,
+                                        pc_iterator_id,
+                                    ),
+                                    probe=service_client._new_orphan_probe(probe_settings),  # pyright: ignore[reportPrivateUsage]
+                                ),
+                                service_client,
+                                reply_subject,
+                                response,
+                            )
+                            pull_iterator_cleanups[pc_iterator_id] = cleanup
+                            service_client._track_session(  # pyright: ignore[reportPrivateUsage]
+                                service_client.pull_iterator_cleanups, pc_iterator_id, cleanup
+                            )
+                            response["result"] = {"iteratorId": pc_iterator_id}
+                            await service_client.publish(reply_subject, response)
+                        elif (cb_params := session_params(params, "__callback")) is not None:
+                            callback_id = cast(str, rpc_msg["id"])
+                            reply_subject = f"{original_msg.subject}.reply.{callback_id}"
+                            cleanup = await set_up_session(
+                                handle_callback_request(
+                                    h,
+                                    cast(list[Any], cb_params.get("args", [])),
+                                    cast(str, cb_params.get("__callbackSubject")),
+                                    callback_id,
+                                    service_client,
+                                    service_client.io_pool,
+                                    on_finished=partial(
+                                        _forget_session,
+                                        callback_cleanups,
+                                        service_client.callback_cleanups,
+                                        callback_id,
+                                    ),
+                                    probe=service_client._new_orphan_probe(probe_settings),  # pyright: ignore[reportPrivateUsage]
+                                ),
+                                service_client,
+                                reply_subject,
+                                response,
+                            )
+                            callback_cleanups[callback_id] = cleanup
+                            service_client._track_session(  # pyright: ignore[reportPrivateUsage]
+                                service_client.callback_cleanups, callback_id, cleanup
+                            )
+                            response["result"] = {"ok": True}
                             await service_client.publish(reply_subject, response)
                         else:
                             # Normal RPC call
@@ -199,6 +335,8 @@ class RPCService:
 
                     except Exception as e:
                         response["error"] = format_error_dict(e)
+                        # a result that failed to go out would fail the error reply too
+                        response.pop("result", None)
 
                         try:
                             reply_subject = f"{original_msg.subject}.reply.{rpc_msg['id']}"
@@ -223,7 +361,11 @@ class RPCService:
                             data = decode(msg.data)
                             chunk_id = msg.headers.get("x-chunk-id") if msg.headers else None
 
-                            if not chunk_id or data.get("transferId") != chunk_id:
+                            if (
+                                not chunk_id
+                                or not isinstance(data, dict)
+                                or data.get("transferId") != chunk_id
+                            ):
                                 return
 
                             def on_complete(assembled_data: Any) -> None:
@@ -232,10 +374,9 @@ class RPCService:
                             def on_error(error: Exception) -> None:
                                 print(f"Error assembling chunks for {method_name}: {error}")
 
-                            # Setup chunk assembly with pre-allocated buffer
-                            service_client.chunking_manager.start_receiving(
-                                data["transferId"],
-                                data["totalChunks"],
+                            chunks.start_receiving(
+                                chunk_id,
+                                data.get("totalChunks"),
                                 on_complete,
                                 on_error,
                                 data.get("totalSize"),  # Pass totalSize for pre-allocation
@@ -244,13 +385,14 @@ class RPCService:
                         elif chunk_type == "chunk":
                             # Chunk data
                             chunk_id = msg.headers.get("x-chunk-id") if msg.headers else None
-                            chunk_index = int(msg.headers.get("x-chunk-index", "0") if msg.headers else "0")
+                            chunk_index = parse_chunk_index(
+                                msg.headers.get("x-chunk-index") if msg.headers else None
+                            )
 
                             if not chunk_id:
                                 return
 
-                            # Process raw chunk data
-                            service_client.chunking_manager.process_chunk(
+                            chunks.process_chunk(
                                 {
                                     "id": chunk_id,
                                     "chunkIndex": chunk_index,
@@ -267,15 +409,23 @@ class RPCService:
                         # Send error response
                         import traceback
 
+                        reported = reported_error(e)
+                        text = (
+                            reported.message
+                            if isinstance(reported, RPCException) and reported is not e
+                            else str(e)
+                        )
                         error_data: dict[str, Any] = {
-                            "message": str(e),
+                            "message": text,
                             "stack": traceback.format_exc() if hasattr(e, "__traceback__") else None,
-                            "code": getattr(e, "code", ErrorCode.INTERNAL_ERROR.value),
+                            "code": getattr(reported, "code", ErrorCode.INTERNAL_ERROR.value),
                         }
 
                         await msg.respond_error(
-                            code="408" if getattr(e, "code", None) == ErrorCode.TIMEOUT.value else "500",
-                            description=str(e),
+                            code="408"
+                            if getattr(reported, "code", None) == ErrorCode.TIMEOUT.value
+                            else "500",
+                            description=text,
                             data=encode(error_data),
                         )
 
@@ -283,6 +433,14 @@ class RPCService:
 
             handler_func = make_endpoint_handler(handler)
             await target.add_endpoint(name=method_name, handler=handler_func)
+            await service.add_endpoint(
+                name=method_name, handler=handler_func, subject=service_subject(config.name, path)
+            )
+            direct_subscriptions.append(
+                await service_client.nc.subscribe(  # type: ignore[union-attr]
+                    direct_subject(instance_id, path), cb=partial(_serve_direct, handler_func)
+                )
+            )
 
         # Extend service with cleanup management
         setattr(service, "_pull_iterator_cleanups", pull_iterator_cleanups)  # noqa: B010
@@ -291,16 +449,20 @@ class RPCService:
         original_stop = service.stop
 
         async def stop_with_cleanup() -> None:
-            # Clean up all pull iterators
-            await asyncio.gather(
-                *[
-                    cleanup()
-                    for cleanup in pull_iterator_cleanups.values()
-                    if asyncio.iscoroutinefunction(cleanup)
-                ],
-                return_exceptions=True,
-            )
-            pull_iterator_cleanups.clear()
+            for sub in direct_subscriptions:
+                with contextlib.suppress(Exception):
+                    await sub.unsubscribe()
+            direct_subscriptions.clear()
+            teardowns = [
+                *_take_sessions(stream_cleanups, service_client.stream_cleanups),
+                *_take_sessions(pull_iterator_cleanups, service_client.pull_iterator_cleanups),
+            ]
+            await asyncio.gather(*(teardown() for teardown in teardowns), return_exceptions=True)
+            # callbacks last, like the client's own teardown
+            callbacks = _take_sessions(callback_cleanups, service_client.callback_cleanups)
+            await asyncio.gather(*(teardown() for teardown in callbacks), return_exceptions=True)
+            for chunks in endpoint_chunks:
+                service_client._close_endpoint_chunking(chunks)  # pyright: ignore[reportPrivateUsage]
 
             # Call original stop
             await original_stop()
@@ -382,43 +544,8 @@ class ServiceMonitor:
         Returns:
             list of ping responses
         """
-        if not self.__client.nc:
-            raise RuntimeError("NATS client is not connected")
-
-        # Construct the ping subject
         subject = f"$SRV.PING.{service_name}" if service_name else "$SRV.PING"
-
-        # Collect all responses from services
-        responses: list[ServicePing] = []
-
-        try:
-            # Create inbox for responses
-            inbox = self.__client.nc.new_inbox()
-            sub = await self.__client.nc.subscribe(inbox)
-
-            # Send request
-            await self.__client.nc.publish(subject, b"", reply=inbox)
-
-            while True:
-                try:
-                    msg = await asyncio.wait_for(sub.next_msg(), timeout=0.01)
-                    json_data = json.loads(msg.data.decode("utf-8"))
-                    responses.append(ServicePing.from_dict(json_data))
-                except TimeoutError:
-                    # No more messages in this interval
-                    break
-                except Exception:
-                    # Skip malformed responses
-                    break
-
-            with contextlib.suppress(Exception):
-                await sub.unsubscribe()
-
-        except Exception:
-            # Return empty list on any error
-            pass
-
-        return responses
+        return await self._collect(subject, ServicePing.from_dict)
 
     async def info(self, service_name: str | None = None) -> list[ServiceInfo]:
         """
@@ -430,43 +557,8 @@ class ServiceMonitor:
         Returns:
             list of service information
         """
-        if not self.__client.nc:
-            raise RuntimeError("NATS client is not connected")
-
-        # Construct the info subject
         subject = f"$SRV.INFO.{service_name}" if service_name else "$SRV.INFO"
-
-        # Collect all responses from services
-        responses: list[ServiceInfo] = []
-
-        try:
-            # Create inbox for responses
-            inbox = self.__client.nc.new_inbox()
-            sub = await self.__client.nc.subscribe(inbox)
-
-            # Send request
-            await self.__client.nc.publish(subject, b"", reply=inbox)
-
-            while True:
-                try:
-                    msg = await asyncio.wait_for(sub.next_msg(), timeout=0.01)
-                    json_data = json.loads(msg.data.decode("utf-8"))
-                    responses.append(ServiceInfo.from_dict(json_data))
-                except TimeoutError:
-                    # No more messages in this interval
-                    break
-                except Exception:
-                    # Skip malformed responses
-                    break
-
-            with contextlib.suppress(Exception):
-                await sub.unsubscribe()
-
-        except Exception:
-            # Return empty list on any error
-            pass
-
-        return responses
+        return await self._collect(subject, ServiceInfo.from_dict)
 
     async def stats(self, service_name: str | None = None) -> list[ServiceStats]:
         """
@@ -478,40 +570,48 @@ class ServiceMonitor:
         Returns:
             list of service statistics
         """
-        if not self.__client.nc:
+        subject = f"$SRV.STATS.{service_name}" if service_name else "$SRV.STATS"
+        return await self._collect(subject, ServiceStats.from_dict)
+
+    async def _collect(self, subject: str, parse: Callable[[dict[str, Any]], _Info]) -> list[_Info]:
+        """Ask every service on ``subject`` and gather the answers.
+
+        Waits up to DISCOVERY_TIMEOUT for the first valid one, then until no
+        further one comes within DISCOVERY_STALL. A no-responder status ends at
+        once, a malformed answer is skipped.
+        """
+        nc = self.__client.nc
+        if not nc:
             raise RuntimeError("NATS client is not connected")
 
-        # Construct the stats subject
-        subject = f"$SRV.STATS.{service_name}" if service_name else "$SRV.STATS"
-
-        # Collect all responses from services
-        responses: list[ServiceStats] = []
-
+        responses: list[_Info] = []
         try:
-            # Create inbox for responses
-            inbox = self.__client.nc.new_inbox()
-            sub = await self.__client.nc.subscribe(inbox)
-
-            # Send request
-            await self.__client.nc.publish(subject, b"", reply=inbox)
-
-            while True:
-                try:
-                    msg = await asyncio.wait_for(sub.next_msg(), timeout=0.01)
-                    json_data = json.loads(msg.data.decode("utf-8"))
-                    responses.append(ServiceStats.from_dict(json_data))
-                except TimeoutError:
-                    # No more messages in this interval
-                    break
-                except Exception:
-                    # Skip malformed responses
-                    break
-
-            with contextlib.suppress(Exception):
-                await sub.unsubscribe()
-
+            inbox = nc.new_inbox()
+            sub = await nc.subscribe(inbox)
+            try:
+                await nc.publish(subject, b"", reply=inbox)
+                wait = DISCOVERY_TIMEOUT
+                while True:
+                    try:
+                        msg = await sub.next_msg(timeout=wait)
+                    except TimeoutError:
+                        break
+                    if (
+                        not msg.data
+                        and msg.headers
+                        and msg.headers.get(Header.STATUS) == NO_RESPONDERS_STATUS
+                    ):
+                        break
+                    try:
+                        responses.append(parse(json.loads(msg.data.decode("utf-8"))))
+                    except Exception:
+                        continue
+                    wait = DISCOVERY_STALL
+            finally:
+                with contextlib.suppress(Exception):
+                    await sub.unsubscribe()
         except Exception:
-            # Return empty list on any error
+            # return what came on any error
             pass
 
         return responses

@@ -3,6 +3,7 @@ package rpc
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestOnReconnectRunsEveryHandler(t *testing.T) {
@@ -84,5 +85,61 @@ func TestReconnectIsOnByDefault(t *testing.T) {
 		if got := NewClient(tc.opts).maxReconnects(); got != tc.want {
 			t.Errorf("%s: max reconnects = %d, want %d", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestReconnectDelay(t *testing.T) {
+	c := NewClient(ClientOptions{ReconnectWait: 2 * time.Second})
+	between := func(what string, d, lo, hi time.Duration) {
+		t.Helper()
+		if d < lo || d >= hi {
+			t.Errorf("%s: delay %v, want [%v, %v)", what, d, lo, hi)
+		}
+	}
+
+	between("never connected", c.reconnectDelay(1), 2*time.Second, 2100*time.Millisecond)
+
+	lived := time.Now().Add(-3 * time.Second)
+	c.connectedAt.Store(&lived)
+	between("first attempt after a long connection", c.reconnectDelay(1), 0, 10*time.Millisecond)
+	between("second attempt", c.reconnectDelay(2), 2*time.Second, 2100*time.Millisecond)
+
+	short := time.Now().Add(-time.Second)
+	c.connectedAt.Store(&short)
+	between("first attempt after a short connection", c.reconnectDelay(1), 2*time.Second, 2100*time.Millisecond)
+
+	tls := NewClient(ClientOptions{ReconnectWait: 2 * time.Second, TLS: &TLSOptions{}})
+	between("tls", tls.reconnectDelay(2), 2*time.Second, 3*time.Second)
+}
+
+func TestReconnectRunsAtOnceAfterALongConnection(t *testing.T) {
+	s := startFakeNATS(t)
+	wait := 400 * time.Millisecond
+	for _, tc := range []struct {
+		name    string
+		lived   time.Duration
+		atLeast time.Duration
+		atMost  time.Duration
+	}{
+		{"long", wait + 50*time.Millisecond, 0, 200 * time.Millisecond},
+		{"short", 0, wait, 2 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := connectFake(t, s, &ClientOptions{ReconnectWait: wait})
+			reconnected := make(chan time.Time, 1)
+			c.OnReconnect(func() { reconnected <- time.Now() })
+			time.Sleep(tc.lived)
+
+			kicked := time.Now()
+			s.kick()
+			select {
+			case at := <-reconnected:
+				if took := at.Sub(kicked); took < tc.atLeast || took > tc.atMost {
+					t.Errorf("reconnected after %v, want [%v, %v]", took, tc.atLeast, tc.atMost)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("no reconnect")
+			}
+		})
 	}
 }

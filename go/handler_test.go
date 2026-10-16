@@ -125,7 +125,7 @@ func TestCallHandler(t *testing.T) {
 	methods := ExtractMethods(handler)
 
 	fn := methods["getSnapshot"]
-	result, err := callHandler(fn, []any{"cam1"})
+	result, err := callHandler(t.Context(), fn, []any{"cam1"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestCallHandlerNested(t *testing.T) {
 	methods := ExtractMethods(handler)
 
 	fn := methods["db.find"]
-	result, err := callHandler(fn, []any{"mykey"})
+	result, err := callHandler(t.Context(), fn, []any{"mykey"})
 	if err != nil {
 		t.Fatal(err)
 	}
