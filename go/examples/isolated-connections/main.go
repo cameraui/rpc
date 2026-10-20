@@ -76,7 +76,7 @@ func testIsolatedChannels() error {
 
 	fmt.Println("Sending heavy traffic on isolated channel...")
 	isolatedStart := time.Now()
-	testBuffer := []byte(strings.Repeat("x", 10000)) // 10KB buffer
+	testBuffer := []byte(strings.Repeat("x", 10000))
 	var wg sync.WaitGroup
 	for i := range 1000 {
 		wg.Add(1)
@@ -261,7 +261,7 @@ func testMixedWorkload() error {
 	})
 
 	dataStart := time.Now()
-	dataBuffer := []byte(strings.Repeat("x", 100*1024)) // 100KB buffer
+	dataBuffer := []byte(strings.Repeat("x", 100*1024))
 	var dataWg sync.WaitGroup
 	for i := range 100 {
 		dataWg.Add(1)

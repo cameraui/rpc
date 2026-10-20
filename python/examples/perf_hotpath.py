@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""Hot-path benchmark: measures the production-critical RPC paths
-(NVR frame delivery, parallel/sequential calls, channel throughput).
-
-Setup happens outside the measurements; each section runs one
-unmeasured warmup round first.
-"""
-
 import asyncio
 import time
 from collections.abc import AsyncGenerator, Callable
@@ -22,9 +15,6 @@ CHANNEL_MESSAGES = 2000
 
 
 class FrameService:
-    """Server-side handler. Method name contains "pull" so it routes
-    through pull-callback mode."""
-
     async def pull_frames(
         self, batches: int, frames_per_batch: int, frame_size: int, invoker: CallbackInvoker
     ) -> AsyncGenerator[None, None]:
@@ -46,7 +36,6 @@ async def wait_for_condition(condition: Callable[[], bool], timeout: float = 30.
 
 
 async def run_oneway(proxy: Any, frame_size: int, batches: int, frames_per_batch: int) -> tuple[float, int]:
-    """Runs one pull-callback iteration; returns (elapsed_ms, bytes_received)."""
     expected = batches * frames_per_batch
     frames = 0
     total_bytes = 0
@@ -77,7 +66,6 @@ async def run_oneway(proxy: Any, frame_size: int, batches: int, frames_per_batch
 async def main() -> None:
     print("Perf Hotpath Benchmark (Python)\n")
 
-    # --- Setup (not measured) ---
     server = create_rpc_client(
         {
             "servers": ["nats://localhost:4222"],
@@ -103,27 +91,25 @@ async def main() -> None:
 
     echo_handlers: dict[str, Any] = {"echo": handle_echo}
     unsub_echo = await server.register_handler("hotpath-rpc", echo_handlers)
-    await asyncio.sleep(0.05)  # Let subscriptions settle
+    await asyncio.sleep(0.05)  # let the subscriptions settle
 
     frame_proxy = client.create_proxy("hotpath-frames")
     echo_proxy = client.create_proxy("hotpath-rpc")
 
-    # --- 1. Oneway callback throughput (NVR frame path) ---
     print("1. Oneway Callback Throughput (pull-callback iterator)")
 
-    await run_oneway(frame_proxy, 1024, 1, 50)  # warmup (not measured)
+    await run_oneway(frame_proxy, 1024, 1, 50)  # warmup
     oneway_1k_ms, _ = await run_oneway(frame_proxy, 1024, ONEWAY_BATCHES, ONEWAY_FRAMES_PER_BATCH)
     msgs_per_sec = (ONEWAY_BATCHES * ONEWAY_FRAMES_PER_BATCH) / (oneway_1k_ms / 1000)
     print(f"Oneway 1KB: {oneway_1k_ms:.2f}ms ({msgs_per_sec:.0f} msg/s)")
 
-    await run_oneway(frame_proxy, 100 * 1024, 1, 50)  # warmup (not measured)
+    await run_oneway(frame_proxy, 100 * 1024, 1, 50)  # warmup
     oneway_100k_ms, oneway_100k_bytes = await run_oneway(
         frame_proxy, 100 * 1024, ONEWAY_BATCHES, ONEWAY_FRAMES_PER_BATCH
     )
     mb_per_sec = oneway_100k_bytes / (1024 * 1024) / (oneway_100k_ms / 1000)
     print(f"Oneway 100KB: {oneway_100k_ms:.2f}ms ({mb_per_sec:.1f} MB/s)")
 
-    # --- 2. Parallel calls ---
     print("\n2. Parallel Calls")
 
     async def echo_call(i: int) -> None:
@@ -131,18 +117,17 @@ async def main() -> None:
         if result["seq"] != i:
             raise AssertionError(f"Echo seq mismatch at {i}")
 
-    await asyncio.gather(*(echo_call(i) for i in range(20)))  # warmup (not measured)
+    await asyncio.gather(*(echo_call(i) for i in range(20)))  # warmup
 
     parallel_start = time.perf_counter()
     await asyncio.gather(*(echo_call(i) for i in range(PARALLEL_CALLS)))
     parallel_ms = (time.perf_counter() - parallel_start) * 1000
     print(f"Parallel {PARALLEL_CALLS} calls: {parallel_ms:.2f}ms")
 
-    # --- 3. Sequential calls ---
     print("\n3. Sequential Calls")
 
     for i in range(10):
-        await echo_call(i)  # warmup (not measured)
+        await echo_call(i)  # warmup
 
     seq_start = time.perf_counter()
     for i in range(SEQUENTIAL_CALLS):
@@ -151,7 +136,6 @@ async def main() -> None:
     us_per_call = seq_ms * 1000 / SEQUENTIAL_CALLS
     print(f"Sequential {SEQUENTIAL_CALLS} calls: {seq_ms:.2f}ms ({us_per_call:.1f} µs/call)")
 
-    # --- 4. Channel throughput ---
     print("\n4. Channel Throughput")
 
     server_channel = await server.channel("hotpath-channel")
@@ -164,9 +148,9 @@ async def main() -> None:
         channel_received += 1
 
     server_channel.on("message", on_message)
-    await asyncio.sleep(0.05)  # Let subscription settle
+    await asyncio.sleep(0.05)  # let the subscription settle
 
-    # Warmup (not measured)
+    # warmup, not measured
     for i in range(10):
         await client_channel.send({"index": i, "warmup": True})
     await wait_for_condition(lambda: channel_received >= 10)
@@ -183,7 +167,6 @@ async def main() -> None:
     await server_channel.close()
     await client_channel.close()
 
-    # --- Cleanup ---
     await unsub_frames()
     await unsub_echo()
     await client.disconnect()

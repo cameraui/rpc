@@ -1,5 +1,3 @@
-"""Tests for chunk splitting and reassembly."""
-
 import asyncio
 import math
 

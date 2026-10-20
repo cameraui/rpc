@@ -10,7 +10,6 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// joins a chunked transfer the way receivers do: chunk i at i*chunkSize
 type collectPublisher struct {
 	single  []byte
 	buf     []byte

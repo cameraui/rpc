@@ -1,15 +1,5 @@
 #!/bin/bash
 
-# Run a single RPC example in a chosen language.
-#
-# Usage:
-#   ./run-test.sh --lang <node|python|go> --test <test-name>
-#
-# Example:
-#   ./run-test.sh --lang node   --test pull-callback-basic
-#   ./run-test.sh --lang python --test concurrent
-#   ./run-test.sh --lang go     --test unified-streaming
-
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -101,8 +91,7 @@ case "$LANG_ARG" in
     fi
     ;;
   python)
-    # Python routes via run_example.py; accept either an entry in that script
-    # or a matching file in examples/.
+    # an entry in run_example.py or a file in examples/
     if grep -qE "(elif|if) example_name == \"${TEST_UNDERSCORE}\":" "$SCRIPT_DIR/../python/run_example.py" 2>/dev/null; then
       EXAMPLE_LOCATION="run_example.py:${TEST_UNDERSCORE}"
     elif [[ -f "$SCRIPT_DIR/../python/examples/${TEST_UNDERSCORE}.py" ]]; then

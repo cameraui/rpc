@@ -9,10 +9,6 @@ import (
 	rpc "github.com/cameraui/rpc/go"
 )
 
-// ConfigService exposes properties via rpc_prop tags.
-// Fields tagged with `rpc_prop:"wireName"` automatically get:
-//   - a getter endpoint "wireName" that returns the current value
-//   - a setter endpoint "setWireName(value)" that updates the value
 type ConfigService struct {
 	Name           string `rpc_prop:"name"`
 	Version        string `rpc_prop:"version"`

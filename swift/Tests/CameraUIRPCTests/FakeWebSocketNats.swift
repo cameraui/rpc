@@ -4,8 +4,6 @@ import NIOHTTP1
 import NIOPosix
 import NIOWebSocket
 
-// NATS over WebSocket the way the camera.ui proxy serves it: answers PINGs,
-// and can turn an upgrade down or end a live link with a close code
 final class FakeWebSocketNats: @unchecked Sendable {
   private let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
   private let lock = NSLock()
@@ -49,7 +47,6 @@ final class FakeWebSocketNats: @unchecked Sendable {
     try? group.syncShutdownGracefully()
   }
 
-  // every upgrade from now on is answered with this close code, nil serves again
   func refuse(with code: UInt16?) {
     lock.lock()
     refusal = code

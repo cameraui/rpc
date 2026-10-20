@@ -163,7 +163,6 @@ describe('callStream retry', () => {
 });
 
 describe('createProxy retry and timeout options', () => {
-  // the method requests, without the __methods probe a proxy sends after a no-responder status
   function calls(nc: ReturnType<typeof createClient>['nc']) {
     return nc.published.filter((p) => !p.subject.endsWith('.__methods'));
   }
@@ -234,7 +233,6 @@ describe('no-responder retry plan', () => {
     vi.useRealTimers();
   });
 
-  // answers every request to `subject` with a no-responder status and records when each went out
   function noResponders({ client, nc }: ReturnType<typeof createClient>, subject: string): number[] {
     const times: number[] = [];
     const publish = nc.publish.bind(nc);
@@ -396,7 +394,7 @@ describe('callStream return()', () => {
     const publish = nc.publish.bind(nc);
     nc.publish = (subject, data, opts) => {
       publish(subject, data, opts);
-      if (subject === 'rpc.ns.generateItems') void stream.return(undefined);
+      if (subject === 'rpc.ns.generateItems') stream.return(undefined);
     };
 
     expect(await stream.next()).toEqual({ value: undefined, done: true });

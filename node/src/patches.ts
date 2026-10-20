@@ -84,7 +84,6 @@ interface NetModule {
   ): ReadSocket;
 }
 
-// startTLS() on a socket that reads into the shared buffer, connect() dials the stock way instead
 class TlsNeedsStockReads extends Error {}
 
 interface ConnectionInternals {
@@ -96,7 +95,7 @@ const isNode = typeof process !== 'undefined' && !!process.versions?.node;
 const encoder = new TextEncoder();
 const CRLF = Uint8Array.of(13, 10);
 
-// smaller frames cost less packed with their neighbours than in a socket write each (20 KB pull-callback frames)
+// smaller frames cost less packed with their neighbours than in a socket write each
 export const PUBLISH_FRAME_MIN_SIZE = 32 * 1024;
 const READ_BUFFER_SIZE = 64 * 1024;
 
@@ -106,21 +105,9 @@ const { DataBuffer, DenoBuffer, Parser, ProtocolHandler, State } = natsInternal 
 let parserPatched: boolean | undefined;
 let sendPathPatched: boolean | undefined;
 let readPathPatched: boolean | undefined;
-// reads not delivered yet because the transport had no 'data' listener at that moment
 const sharedReadSockets = new WeakMap<object, Uint8Array[]>();
-// servers that asked for TLS: their dials read the stock way from then on
 const tlsServers = new Set<string>();
 
-/**
- * Publish a CUIB frame as one buffer holding the PUB line, the frame and the
- * CRLF. nats-core queues a publish as three buffers and packs them into a
- * fresh copy before the socket write; a single queued buffer goes out as it
- * is. The buffer is allocated here, so no caller buffer is referenced after
- * return, the same as with the stock path.
- *
- * Node only. Returns false when the connection lacks the nats-core internals
- * this relies on, then the caller publishes the stock way.
- */
 export function publishFrame(nc: NatsConnection, subject: string, reply: string | undefined, parts: FrameParts): boolean {
   const conn = nc as unknown as ConnectionInternals;
   const protocol = conn.protocol;
@@ -146,18 +133,6 @@ export function publishFrame(nc: NatsConnection, subject: string, reply: string 
   return true;
 }
 
-/**
- * Publish a CUIB frame without copying its segments. The PUB line, the frame
- * header and the envelope go out as one new buffer, every segment as the
- * caller's own buffer, all in one corked socket write. The socket holds the
- * segments until the kernel has taken them, so the caller must not change or
- * release them before that; a reply to the request proves it.
- *
- * Node only and only while connected: a frame queued for a reconnect would
- * hold the segments for an unknown time. Returns false otherwise or when the
- * connection lacks the nats-core internals this relies on, then the caller
- * publishes a copy.
- */
 export function publishFrameZeroCopy(nc: NatsConnection, subject: string, reply: string | undefined, parts: FrameParts): boolean {
   const conn = nc as unknown as ConnectionInternals;
   const protocol = conn.protocol;
@@ -188,11 +163,6 @@ export function publishFrameZeroCopy(nc: NatsConnection, subject: string, reply:
   return true;
 }
 
-/**
- * Hand what nats-core has queued for the socket to the transport now instead
- * of in its microtask. Node only; a no-op when the connection lacks the
- * nats-core internals, then the queue is written as usual.
- */
 export function flushOutbound(nc: NatsConnection): void {
   const protocol = (nc as unknown as ConnectionInternals).protocol;
   if (isNode && hasProtocolShape(protocol)) {
@@ -200,19 +170,6 @@ export function flushOutbound(nc: NatsConnection): void {
   }
 }
 
-/**
- * Presize the payload buffer of a message that is split across socket reads.
- *
- * Stock nats-core copies the first part into a buffer of that size and grows
- * it by doubling, so a large message is copied several times and held in a
- * buffer up to twice its size. The patch moves the first part into a buffer
- * of the announced message size, later parts are written in place. Bytes and
- * events stay the same.
- *
- * Applied once per process and only under Node; the browser runs the forked
- * parser. Returns whether the patch is active: false when the installed
- * nats-core does not have the expected shape, then the stock parser runs.
- */
 export function presizeSplitPayloads(): boolean {
   parserPatched ??= installParserPatch();
   return parserPatched;
@@ -245,20 +202,6 @@ function installParserPatch(): boolean {
   return true;
 }
 
-/**
- * Lighter small publishes on Node TCP connections. nats-core encodes every
- * protocol line with a TextEncoder, packs the queued buffers into a fresh
- * copy and wraps each socket write in a promise with a catch. The patch
- * queues a line as a string, writes all that is queued into one Buffer at
- * the flush and hands it to the socket without a promise. Bytes, order, the
- * inline flush at the pending limit and the buffering while reconnecting
- * stay the same.
- *
- * Applied once per process and only under Node, to connections on the
- * NodeTransport of @nats-io/transport-node; any other transport keeps the
- * stock path. Returns whether the patch is active: false when the installed
- * nats-core does not have the expected shape, then the stock path runs.
- */
 export function packSmallPublishes(): boolean {
   sendPathPatched ??= installSendPatch();
   return sendPathPatched;
@@ -354,7 +297,6 @@ function installSendPatch(): boolean {
   return true;
 }
 
-// one publish through a protocol handler on a NodeTransport whose socket records the writes
 function probeSendPath(proto: SendPathInternals, Transport: NodeTransportClass): boolean {
   if (!DataBuffer) return false;
   try {
@@ -398,29 +340,11 @@ function hasSendShape(Transport: NodeTransportClass): boolean {
   );
 }
 
-/**
- * Read Node TCP connections through one buffer per process. Node allocates
- * a fresh 64 KiB buffer for every socket read; with the patch the socket
- * reads into a shared buffer and each read is copied out into a buffer of
- * its exact size before nats-core sees it, so no view of the shared buffer
- * escapes. Received bytes and their order stay the same.
- *
- * Applied once per process and only under Node, to the NodeTransport of
- * @nats-io/transport-node. A connection with TLS options, or to a server
- * that asked for TLS once, dials the stock way: TLS cannot start on such a
- * socket. Returns whether the patch is active: false when the installed
- * transport does not have the expected shape, then the stock path runs.
- */
 export function shareReadBuffer(): boolean {
   readPathPatched ??= installReadPatch();
   return readPathPatched;
 }
 
-/**
- * Whether a socket reads through the shared buffer of shareReadBuffer().
- *
- * Internal: the patch and its tests use it.
- */
 export function readsShared(socket: unknown): boolean {
   return typeof socket === 'object' && socket !== null && sharedReadSockets.has(socket);
 }
@@ -502,7 +426,6 @@ function installReadPatch(): boolean {
   return true;
 }
 
-// a read goes to the 'data' listener of the transport, kept back while the transport has none
 function deliverRead(socket: ReadSocket, frame: Uint8Array): void {
   if (socket.listenerCount('data') === 0) {
     sharedReadSockets.get(socket)?.push(frame);
@@ -549,9 +472,9 @@ function builtinModule<T>(id: string): T | undefined {
   return runtime?.getBuiltinModule?.(id) as T | undefined;
 }
 
-// loaded at run time under Node only: a static import would pull node:net into browser bundles
 function nodeTransportClass(): NodeTransportClass | undefined {
   try {
+    // a static import would pull node:net into browser bundles
     const nodeModule = builtinModule<{ createRequire?: (from: string) => (id: string) => unknown }>('node:module');
     const load = nodeModule?.createRequire?.(import.meta.url);
     const Transport = (load?.('@nats-io/transport-node/lib/node_transport.js') as { NodeTransport?: unknown } | undefined)?.NodeTransport;
@@ -574,7 +497,6 @@ function hasParserShape(): boolean {
   );
 }
 
-// feeds one MSG in two reads and checks the parser state between them and the event after
 function probeSplitMessage(presized: boolean): boolean {
   if (!Parser || !State || !DenoBuffer) return false;
   try {
@@ -592,8 +514,8 @@ function probeSplitMessage(presized: boolean): boolean {
   }
 }
 
-// nats-core writes a queue of one buffer as it is and packs a longer queue into a copy
 function sendNow(protocol: ProtocolInternals, buffer: Uint8Array): void {
+  // nats-core writes a queue of one buffer as it is and packs a longer queue into a copy
   protocol.sendCommand(buffer);
   protocol.flushPending();
 }

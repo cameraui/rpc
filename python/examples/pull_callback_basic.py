@@ -9,10 +9,6 @@ from camera_ui_rpc.handler import CallbackInvoker
 
 
 class DataService:
-    """Server-side handler. Method name must contain "pull" to route through
-    pull-callback mode.
-    """
-
     async def pull_batches(
         self, batch_count: int, chunks_per_batch: int, invoker: CallbackInvoker
     ) -> AsyncGenerator[None, None]:
@@ -82,7 +78,7 @@ async def main() -> None:
 
     elapsed_ms = (time.perf_counter() - start) * 1000
 
-    # Allow in-flight callback messages to land.
+    # let in-flight callback messages land
     await asyncio.sleep(0.05)
 
     print("\nResults")

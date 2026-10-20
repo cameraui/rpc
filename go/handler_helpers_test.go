@@ -161,7 +161,7 @@ func TestCallHandlerErrorReturn(t *testing.T) {
 
 func TestCallHandlerScalarParam(t *testing.T) {
 	methods := ExtractMethods(&helperHandler{})
-	// Scalar (non-slice) params are wrapped into a single-arg call.
+	// a scalar param is wrapped into a single-arg call
 	got, err := callHandler(t.Context(), methods["echo"], "direct")
 	if err != nil {
 		t.Fatal(err)

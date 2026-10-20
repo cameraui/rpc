@@ -13,7 +13,7 @@ import (
 	rpc "github.com/cameraui/rpc/go"
 )
 
-var largeBuffer = []byte(strings.Repeat("x", 5*1024*1024)) // 5MB
+var largeBuffer = []byte(strings.Repeat("x", 5*1024*1024))
 
 func main() {
 	totalStart := time.Now()

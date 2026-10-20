@@ -320,7 +320,7 @@ func testMemoryPressure(ctx context.Context, proxy *rpc.Proxy) {
 	if err != nil {
 		fatal("pull pullLargeData memory", err)
 	}
-	// Delay has no effect - nothing is generated yet
+	// the delay has no effect, nothing is generated yet
 	time.Sleep(1 * time.Second)
 
 	for val := range pullCh {

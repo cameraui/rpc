@@ -1,8 +1,5 @@
 package rpc
 
-// Behavioral spec: node/src/codec.ts + node/test/codec.test.ts ("message
-// codec (CUIB wire format)" suite). Keep the two in sync.
-
 import (
 	"bytes"
 	"encoding/binary"
@@ -11,9 +8,7 @@ import (
 	"testing"
 )
 
-// Extractable sizes are expressed relative to the threshold so the tests
-// survive threshold tuning.
-const T = binaryExtractThreshold
+const T = binaryExtractThreshold // sizes relative to the threshold survive its tuning
 
 func bytesN(n int, fill byte) []byte {
 	b := make([]byte, n)
@@ -68,10 +63,7 @@ func asBytes(t *testing.T, v any) []byte {
 }
 
 func TestEncodeMessagePlainMsgpackWithoutLargeBinaries(t *testing.T) {
-	// Byte-identity to Encode() cannot be asserted for Go maps (iteration
-	// order randomizes per encode); assert the format instead: no CUIB frame,
-	// plain msgpack, content preserved. The struct test below checks
-	// byte-identity on a deterministic encoding.
+	// Go map order changes per encode, so assert the format instead of byte identity
 	message := map[string]any{
 		"id":     "abc",
 		"method": "call",
@@ -131,8 +123,7 @@ func TestEncodeMessageFrameLayout(t *testing.T) {
 }
 
 func TestEncodeMessageMultipleSegmentsInTraversalOrder(t *testing.T) {
-	// []any traversal is deterministic (unlike Go maps), so the indices and
-	// segment layout are fixed.
+	// []any traversal is deterministic, so the indices and segment layout are fixed
 	a := bytesN(T, 1)
 	b := bytesN(T+500, 2)
 	c := bytesN(T+4096, 3)
@@ -306,8 +297,7 @@ func TestMessageRoundtripStructResult(t *testing.T) {
 }
 
 func TestMessageStructOmitEmptySiblingsPreserved(t *testing.T) {
-	// RPCResponse with nil Error/Methods (both omitempty): the re-emitted
-	// envelope map must omit them, like the struct encoder would.
+	// nil Error and Methods are omitempty, the re-emitted envelope must omit them too
 	bin := bytesN(T+2048, 1)
 	encoded := mustEncodeMessage(t, RPCResponse{ID: "x", Result: []any{bin}})
 	env, _ := envelopeOf(t, encoded)
@@ -344,8 +334,7 @@ func TestMessageRoundtripStructPointerAndNestedSlice(t *testing.T) {
 }
 
 func TestMessageRoundtripIntoTypedEnvelope(t *testing.T) {
-	// The dispatch paths decode into RPCMessage/StreamMessage etc. — the
-	// placeholder lands in the `any` payload field and must be restored there.
+	// the placeholder lands in the any payload field and must be restored there
 	bin := bytesN(T+8192, 0x77)
 	msg := RPCMessage{ID: "42", Method: "call", Params: []any{bin, "tail"}}
 	encoded := mustEncodeMessage(t, msg)
@@ -376,7 +365,7 @@ func TestDecodeMessageReturnsZeroCopyViews(t *testing.T) {
 	if &view[0] != &encoded[offset] {
 		t.Fatal("expected zero-copy subslice view into the received buffer")
 	}
-	// Mutating the receive buffer is visible through the view (no copy).
+	// the view shares the receive buffer
 	encoded[len(encoded)-1] = 0x99
 	if view[len(view)-1] != 0x99 {
 		t.Fatal("view does not alias the receive buffer")
@@ -411,8 +400,7 @@ func TestCollisionUserMapWithExtraKeys(t *testing.T) {
 }
 
 func TestCollisionPlaceholderShapedMapInBinaryFreeMessage(t *testing.T) {
-	// Without extracted binaries there is no CUIB frame, hence no placeholder
-	// substitution at all.
+	// without extracted binaries there is no CUIB frame, so no placeholder substitution
 	message := map[string]any{"params": []any{map[string]any{placeholderKey: 0, "l": 123}}}
 	result := messageRoundtrip(t, message).(map[string]any)
 	userMap := result["params"].([]any)[0].(map[string]any)
@@ -422,9 +410,7 @@ func TestCollisionPlaceholderShapedMapInBinaryFreeMessage(t *testing.T) {
 }
 
 func TestDecodeOutOfOrderPlaceholders(t *testing.T) {
-	// Go map serialization order is unspecified: placeholder 1 may appear
-	// before 0 in the envelope. Segments still lie back-to-back in index
-	// order. Build such a frame by hand.
+	// map order may put placeholder 1 before 0, segments still follow index order
 	seg0 := bytesN(T, 0xaa)
 	seg1 := bytesN(T+2048, 0xbb)
 	envelope, err := Encode(map[string]any{
@@ -479,7 +465,7 @@ func TestDecodeRejectsTrailingBytes(t *testing.T) {
 }
 
 func TestDecodeRejectsMissingPlaceholderIndex(t *testing.T) {
-	// Envelope references segment 1 only — segment 0 is missing.
+	// the envelope references segment 1 only, segment 0 is missing
 	envelope, err := Encode(map[string]any{"a": map[string]any{placeholderKey: 1, "l": 16}})
 	if err != nil {
 		t.Fatal(err)
@@ -501,8 +487,6 @@ type benchMeta struct {
 	Height int    `msgpack:"height"`
 }
 
-// BenchmarkEncodePooledSmallBaseline is the pre-CUIB encode cost of a small
-// envelope (reference point for the walk overhead).
 func BenchmarkEncodePooledSmallBaseline(b *testing.B) {
 	msg := RPCResponse{ID: "abc.123", Result: benchMeta{Camera: "front", Codec: "h264", Width: 1920, Height: 1080}}
 	b.ReportAllocs()
@@ -516,8 +500,6 @@ func BenchmarkEncodePooledSmallBaseline(b *testing.B) {
 	}
 }
 
-// BenchmarkEncodeMessageSmallStructNoBinary measures the walk overhead for a
-// small binary-free envelope carrying a typed struct result (early-out path).
 func BenchmarkEncodeMessageSmallStructNoBinary(b *testing.B) {
 	msg := RPCResponse{ID: "abc.123", Result: benchMeta{Camera: "front", Codec: "h264", Width: 1920, Height: 1080}}
 	b.ReportAllocs()
@@ -531,7 +513,6 @@ func BenchmarkEncodeMessageSmallStructNoBinary(b *testing.B) {
 	}
 }
 
-// BenchmarkEncodeMessageSmallMapNoBinary: binary-free map params.
 func BenchmarkEncodeMessageSmallMapNoBinary(b *testing.B) {
 	msg := RPCMessage{ID: "abc.123", Method: "call", Params: []any{"snapshot", map[string]any{"quality": 80, "camera": "front"}}}
 	b.ReportAllocs()
@@ -545,8 +526,6 @@ func BenchmarkEncodeMessageSmallMapNoBinary(b *testing.B) {
 	}
 }
 
-// BenchmarkEncodeMessageFrame100KB: the NVR frame hot path (struct with a
-// 100KB []byte field inside the response envelope).
 func BenchmarkEncodeMessageFrame100KB(b *testing.B) {
 	frame := bytesN(100_000, 0x5a)
 	msg := CallbackInvocation{Method: "onFrame", Args: []any{frame}}
@@ -578,8 +557,6 @@ func BenchmarkDecodeMessageFrame100KB(b *testing.B) {
 	}
 }
 
-// BenchmarkDecodePlain100KB is the pre-CUIB decode cost (vmihailenco copies
-// bin payloads on decode) — reference for the zero-copy gain.
 func BenchmarkDecodePlain100KB(b *testing.B) {
 	frame := bytesN(100_000, 0x5a)
 	encoded, err := Encode(CallbackInvocation{Method: "onFrame", Args: []any{frame}})
@@ -596,10 +573,6 @@ func BenchmarkDecodePlain100KB(b *testing.B) {
 	}
 }
 
-// Regression: sdk-style subscribers decode into concretely typed structs
-// (e.g. detectionEventMessage with a nested Thumbnail []byte). The direct
-// envelope decode chokes on the placeholder map in a typed []byte position;
-// DecodeMessageInto must fall back to the generic-restore-reencode path.
 func TestDecodeMessageIntoTypedByteFields(t *testing.T) {
 	type typedSegment struct {
 		Thumbnail []byte `msgpack:"thumbnail"`
@@ -643,7 +616,6 @@ func TestDecodeMessageIntoTypedByteFields(t *testing.T) {
 	}
 }
 
-// Small binaries stay inline — the typed fast path must not regress.
 func TestDecodeMessageIntoTypedInlineBinary(t *testing.T) {
 	type typedMessage struct {
 		Type string `msgpack:"type"`

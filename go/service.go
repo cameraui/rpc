@@ -12,12 +12,10 @@ import (
 )
 
 const (
-	// a service announces in its metadata that each instance takes chunked
-	// requests on $CUI.SVC.<instance id>.<method path>
+	// metadata key: each instance takes chunked requests on $CUI.SVC.<instance id>.<method path>
 	chunkDirectKey      = "cui.chunk.direct"
 	directSubjectPrefix = "$CUI.SVC."
-	// every method is also served on svc.<service name>.<method path>
-	svcSubjectPrefix = "svc."
+	svcSubjectPrefix    = "svc."
 )
 
 // ServiceConfig configures a NATS micro service.
@@ -43,21 +41,12 @@ func NewRPCService(client *Client) *RPCService {
 	}
 }
 
-// RegisterHandler registers an RPC handler as a NATS micro service. Methods
-// take an optional context.Context first parameter as with
-// Client.RegisterHandler; it also ends when the service stops.
-//
-// Every method is served on its bare endpoint subject and on
-// svc.<service name>.<path>, which no other service shares. Each instance also
-// takes chunked requests on $CUI.SVC.<instance id>.<path> and announces that
-// in its metadata under cui.chunk.direct, next to config.Metadata. A request is
-// answered on <its subject>.reply.<id>.
+// RegisterHandler registers an RPC handler as a NATS micro service.
 func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated ...bool) (_ *Service, err error) {
 	client := s.client
 
 	if len(isolated) > 0 && isolated[0] {
-		// a service is bound to its connection, a parent's Suspend and Connect
-		// could not move it, so the isolated client is the service's alone
+		// a service is bound to its connection, a parent's Suspend and Connect could not move it
 		client = s.client.createIsolatedClient("service-" + config.Name)
 		defer func() {
 			if err != nil {
@@ -100,7 +89,6 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 	owner := newSessionOwner()
 	orphan := client.orphanConfig(nil)
 
-	// Create groups for nested paths
 	groups := make(map[string]micro.Group)
 	endpointChunks := make([]*ChunkingManager, 0, len(methods))
 	directSubs := make([]*nats.Subscription, 0, len(methods))
@@ -138,7 +126,6 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 			target = groups[groupPath]
 		}
 
-		// processMessage handles a fully decoded RPC message for this endpoint.
 		processMessage := func(data []byte, subject string) {
 			var msg RPCMessage
 			if err := DecodeMessageInto(data, &msg); err != nil {
@@ -147,7 +134,6 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 
 			response := RPCResponse{ID: msg.ID}
 
-			// Handle stream request
 			if isStreamRequest(msg.Params) {
 				streamSubject, args := extractStreamParams(msg.Params)
 				go handleStreamRequestGo(owner, fnCopy, args, streamSubject, msg.ID, client, orphan, false)
@@ -166,7 +152,6 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 				}
 			}
 
-			// Handle pull iterator
 			if isPullIteratorRequest(msg.Params) {
 				iteratorID, args := extractPullIteratorParams(msg.Params, msg.ID)
 				cleanup, err := handlePullIteratorRequestGo(owner.ctx, fnCopy, args, iteratorID, client, orphan, func() {
@@ -204,7 +189,6 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 				return
 			}
 
-			// Normal RPC
 			ctx, cancel := callContext(owner.ctx, takesCtx)
 			defer cancel()
 			reply(callHandler(ctx, fnCopy, msg.Params))
@@ -214,7 +198,6 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 		client.addEndpointChunks(chunks)
 		endpointChunks = append(endpointChunks, chunks)
 		handle := func(headers nats.Header, data []byte, subject string) {
-			// Handle chunked transfer
 			chunkType := ""
 			if headers != nil {
 				chunkType = headers.Get("x-chunked-transfer")
@@ -244,7 +227,6 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 				return
 			}
 
-			// Non-chunked: process directly
 			processMessage(data, subject)
 		}
 		endpoint := micro.HandlerFunc(func(req micro.Request) {
@@ -364,8 +346,7 @@ func (s *Service) Stats() micro.Stats {
 	return s.svc.Stats()
 }
 
-// Stop stops the service and ends its stream and pull-iterator sessions, their
-// clients get a CONNECTION_CLOSED error.
+// Stop stops the service and ends its sessions, their clients get a CONNECTION_CLOSED error.
 func (s *Service) Stop() error {
 	if s.stopCleanups != nil {
 		s.stopCleanups()

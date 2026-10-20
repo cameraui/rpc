@@ -7,7 +7,7 @@ import type { CallbackInvocation, CallbackMessage, OrphanProbeOptions, PullItera
 const STREAM_SUBJECT_PREFIX = 'stream.';
 const CALLBACK_SUBJECT_PREFIX = 'rpc.cb.';
 const PULL_CALLBACK_SUBJECT_PREFIX = '_rpc.cb.';
-// a push stream lets the event loop run after publishing for this long, so its cancel is read
+// a push stream yields to the event loop after publishing this long, so its cancel gets read
 const STREAM_YIELD_MS = 2;
 const STOPPED = Symbol('stopped');
 const ORPHAN_PROBE_INTERVAL_MS = 30_000;
@@ -15,10 +15,8 @@ const ORPHAN_PROBE_GRACE_MS = 300_000;
 
 type Producer = AsyncGenerator<any, void, unknown>;
 
-/** What a request sets up besides a plain call. */
 export type SessionKind = 'stream' | 'pull' | 'pullCallback' | 'callback';
 
-/** A registered method, as registerHandler and services find it on the handler object. */
 export type MethodHandler = (...args: any[]) => unknown;
 
 interface SessionStore {
@@ -32,53 +30,18 @@ const sessionStore = createSessionStore();
 const yieldToEventLoop: () => Promise<void> =
   typeof setImmediate === 'function' ? () => new Promise((resolve) => setImmediate(resolve)) : () => new Promise((resolve) => setTimeout(resolve, 0));
 
-/**
- * The AbortSignal of the stream, pull-iterator, pull-callback or callback
- * session whose handler or generator runs right now. It aborts when the
- * session ends: the client cancels, the generator finishes or throws, a
- * value or frame does not fit the payload limit, a frame does not encode,
- * the handler is unregistered, the service stops, or the client
- * disconnects, suspends or loses its connection. A producer that waits for
- * data can hand it on and stop at once instead of at its next yield.
- *
- * Undefined outside a session (plain calls included), where
- * AsyncLocalStorage is not available (browsers), and where it runs on async
- * hooks (--no-async-context-frame), since that slows down every await of the
- * process.
- *
- * @example
- * async *frames(cameraId: string) {
- *   const signal = sessionSignal();
- *   while (true) yield await nextFrame(cameraId, { signal });
- * }
- */
 export function sessionSignal(): AbortSignal | undefined {
   return sessionStore?.getStore();
 }
 
-/**
- * Run `fn` outside of any session, so a connection it opens does not carry
- * the session of the code that triggered it.
- */
 export function outsideSession<R>(fn: () => R): R {
   return sessionStore ? sessionStore.exit(fn) : fn();
 }
 
-/**
- * The sessions of one handler registration or service. Its stop() reaches
- * every session, also one whose handler still sets up: that one ends with
- * CONNECTION_CLOSED once its handler returns.
- *
- * Internal: client.ts and service.ts use it.
- */
 export class SessionOwner {
   private stopped = false;
   private readonly teardowns = new Set<() => Promise<void>>();
 
-  /**
-   * Add the teardown of a session. False once the owner stopped, the session
-   * then ends on its own.
-   */
   public add(teardown: () => Promise<void>): boolean {
     if (this.stopped) return false;
     this.teardowns.add(teardown);
@@ -89,10 +52,6 @@ export class SessionOwner {
     this.teardowns.delete(teardown);
   }
 
-  /**
-   * End every session. Each stops publishing before this returns, the
-   * promises settle once their generators are closed.
-   */
   public stop(): Promise<void>[] {
     this.stopped = true;
     const teardowns = [...this.teardowns];
@@ -101,17 +60,11 @@ export class SessionOwner {
   }
 }
 
-/** Orphan probe settings with the defaults applied. */
 export interface ProbeSettings {
   intervalMs: number;
   graceMs: number;
 }
 
-/**
- * The settings of an orphanProbe option, undefined when it turns probing off.
- *
- * Internal: client.ts and service.ts use it.
- */
 export function probeSettings(option: OrphanProbeOptions | false | undefined): ProbeSettings | undefined {
   if (option === false) return undefined;
   const intervalMs = option?.intervalMs;
@@ -122,16 +75,7 @@ export function probeSettings(option: OrphanProbeOptions | false | undefined): P
   };
 }
 
-/**
- * Asks the server whether the consumer of a session still listens. At most
- * once per intervalMs a publish of the session carries a reply subject on
- * the client's reply inbox, so a subject nobody subscribes to comes back as a
- * no-responder status. When the session published nothing for intervalMs it
- * sends its idle probe instead. Once the probes have found no responders for
- * graceMs, `orphaned` runs; a probe that comes back clean resets that.
- */
 class OrphanProbe {
-  /** Publishes the idle probe with `reply`, false when it has nowhere to go */
   public idle: (reply: string) => boolean = () => false;
   public orphaned: () => void = () => {};
 
@@ -147,7 +91,6 @@ class OrphanProbe {
     private readonly settings: ProbeSettings,
   ) {}
 
-  /** The reply subject for the next publish of the session, when a probe is due. */
   public reply(): string | undefined {
     const now = performance.now();
     this.lastPublish = now;
@@ -167,7 +110,7 @@ class OrphanProbe {
   }
 
   private open(): string {
-    // the last probe had a whole interval to come back without responders and did not
+    // the last probe came back clean within a whole interval
     if (this.forget) {
       this.forget();
       this.noRespondersSince = undefined;
@@ -193,7 +136,6 @@ class OrphanProbe {
     this.timer.unref?.();
   }
 
-  // a session that published within the interval gets its probe with the next publish
   private tick(): void {
     this.timer = undefined;
     if (this.stopped) return;
@@ -217,17 +159,6 @@ class OrphanProbe {
   }
 }
 
-/**
- * Handle streaming request - common logic for client and service.
- *
- * The cancel listener exists before the handler runs. A cancel or a teardown
- * ends the session at once, also while the producer waits for its next item:
- * nothing is published after it except the CONNECTION_CLOSED error a teardown
- * sends, and the generator is closed without waiting for a step in flight.
- * A handler that fails ends the stream with an error message.
- *
- * @param owner - The registration or service the session belongs to
- */
 export async function handleStreamRequest(
   handler: Function,
   args: any[],
@@ -332,12 +263,6 @@ export async function handleStreamRequest(
   }
 }
 
-/**
- * The session a request sets up, undefined for a plain call. Pull and
- * callback params come as an object or wrapped in the args array of call().
- *
- * Internal: client.ts and service.ts use it.
- */
 export function sessionKind(params: any): SessionKind | undefined {
   if (params?.__stream && params?.__streamSubject) return 'stream';
   const first = Array.isArray(params) ? params[0] : undefined;
@@ -348,12 +273,6 @@ export function sessionKind(params: any): SessionKind | undefined {
   return undefined;
 }
 
-/**
- * Open the pull-iterator, pull-callback or callback session a request sets
- * up and return the result its setup call answers with.
- *
- * Internal: client.ts and service.ts use it.
- */
 export async function openSession(
   kind: Exclude<SessionKind, 'stream'>,
   handler: MethodHandler,
@@ -380,30 +299,15 @@ export async function openSession(
   return { iteratorId };
 }
 
-/**
- * Handle normal RPC call - common logic for client and service
- */
 export async function handleNormalRPC(handler: Function, params: any): Promise<any> {
   return callNormalRPC(handler, params);
 }
 
-/**
- * Invoke the handler of a normal RPC call and return what it returns, a
- * promise or a plain value. Throws synchronously when the handler does.
- */
 export function callNormalRPC(handler: Function, params: any): unknown {
-  // Ensure params is an array
   const args = Array.isArray(params) ? params : params != null ? [params] : [];
-
-  // Call the handler
   return handler(...args);
 }
 
-/**
- * Format exception as error object. A no-responder error this client saw
- * itself becomes INTERNAL_ERROR 'upstream unavailable' with the subject in
- * `data`: the caller's responder exists, only its own upstream is missing.
- */
 export function formatErrorObject(error: any): RPCError {
   const upstream = localNoRespondersSubject(error);
   if (upstream !== undefined) {
@@ -419,9 +323,6 @@ export function formatErrorObject(error: any): RPCError {
   }
 }
 
-/**
- * Handle pull-based iterator request
- */
 export async function handlePullIteratorRequest(
   handler: Function,
   args: any[],
@@ -442,27 +343,6 @@ export async function handlePullIteratorRequest(
   );
 }
 
-/**
- * Handle a pull-iterator-with-callbacks request.
- *
- * Builds a callback proxy whose methods publish oneway to `callbackSubject`,
- * invokes the user handler with (...args, callbackProxy), then drives the
- * returned async generator from iterator `next`/`cancel` requests. The proxy
- * publishes nothing once the session ended. A frame bigger than a payload
- * limit too small for chunking ends the session: the batch it belongs to is
- * answered with PAYLOAD_TOO_LARGE. A frame that does not encode ends it the
- * same way with INTERNAL_ERROR; the producer is closed at its next yield
- * and its sessionSignal() aborts with the error.
- *
- * Once 2 ms passed since the last time, a proxy call returns a promise that
- * lets the event loop run. A producer that awaits its callbacks has its
- * cancel read during a batch, also when it waits for nothing else; one that
- * does not await them stops at its next wait for I/O or a timer.
- *
- * The iterator yields `undefined` — its sole purpose is client-driven flow
- * control. Meaningful data travels over the callback channel. The first
- * batch starts once the session is set up, before the consumer asks for it.
- */
 export async function handlePullCallbackRequest(
   handler: Function,
   args: any[],
@@ -481,8 +361,6 @@ export async function handlePullCallbackRequest(
   const probe = probeOptions && new OrphanProbe(client, probeOptions);
   let lastYield = performance.now();
 
-  // Build callback proxy. Each method publishes a CallbackInvocation oneway.
-  // Methods not in onewayMethods reject with NotImplemented (request-reply is v2).
   const onewaySet = new Set(onewayMethods);
   const callbackProxy: Record<string, (...a: any[]) => Promise<void> | undefined> = {};
 
@@ -494,8 +372,7 @@ export async function handlePullCallbackRequest(
         const msg: CallbackInvocation = { method, args: a };
         try {
           const reply = probe?.reply();
-          // per-frame hot path: small payloads publish without a promise,
-          // oversized ones are chunked asynchronously
+          // per-frame hot path: a small payload publishes without a promise
           client.publishOrChunk(callbackSubject, msg, reply ? { reply } : undefined)?.catch((error: unknown) => {
             // a frame the payload limit cannot carry ends the session, other errors mean the connection is gone
             if (error instanceof RPCException && error.code === ERROR_CODES.PAYLOAD_TOO_LARGE) controller.abort(error);
@@ -529,12 +406,6 @@ export async function handlePullCallbackRequest(
   );
 }
 
-/**
- * Handle callback subscription request.
- * Creates a wrapper function, calls the handler with it,
- * and manages the subscription lifecycle. The handler sees the session's
- * signal through sessionSignal(), it aborts when the subscription ends.
- */
 export async function handleCallbackRequest(
   handler: Function,
   args: any[],
@@ -552,9 +423,7 @@ export async function handleCallbackRequest(
   let cancelUnsub: (() => void) | undefined = undefined;
   let untrack: (() => void) | undefined = undefined;
 
-  // Handler cleanup must run exactly once — the cancel message and a later
-  // registerHandler/disconnect cleanup would otherwise both invoke it. While
-  // the handler sets up it only ends the session, the setup cleans up after it.
+  // runs once, the cancel message and a later unregister or disconnect would both invoke it
   let cleanedUp = false;
   const runHandlerCleanup = async (): Promise<void> => {
     if (cleanedUp) return;
@@ -571,7 +440,6 @@ export async function handleCallbackRequest(
   untrack = track(client, owner, runHandlerCleanup);
   if (!untrack) throw connectionClosedException();
 
-  // Create wrapper callback that publishes to callbackSubject
   const wrapperCallback = async (value: any) => {
     if (!client.isConnected) return;
     const msg: CallbackMessage = {
@@ -583,18 +451,15 @@ export async function handleCallbackRequest(
     await client.publish(callbackSubject, msg, reply ? { reply } : undefined);
   };
 
-  // Call handler with args + wrapper callback
   try {
     const result = inSession(controller.signal, () => handler(...args, wrapperCallback));
-    // Handler may return cleanup sync or async
     if (result && typeof result.then === 'function') {
       handlerCleanup = await result;
     } else if (typeof result === 'function') {
       handlerCleanup = result;
     }
   } catch (error) {
-    void runHandlerCleanup();
-    // Send error to subscriber
+    runHandlerCleanup();
     const errorMsg: CallbackMessage = {
       id: requestId,
       type: 'error',
@@ -626,32 +491,22 @@ export async function handleCallbackRequest(
       client.publishOrChunk(callbackSubject, { id: requestId, type: 'ping' } satisfies CallbackMessage, { reply })?.catch(() => {});
       return true;
     };
-    probe.orphaned = () => void runHandlerCleanup();
+    probe.orphaned = () => {
+      runHandlerCleanup();
+    };
     probe.start();
   }
 
   return runHandlerCleanup;
 }
 
-// the caller names this subject and the handler publishes there with its own credentials
 function assertControlSubject(subject: unknown, prefix: string): void {
+  // the caller names this subject and the handler publishes there with its own credentials
   if (typeof subject !== 'string' || subject.length <= prefix.length || !subject.startsWith(prefix)) {
     throw createError(ERROR_CODES.INVALID_PARAMS, `Control subject must start with '${prefix}'`);
   }
 }
 
-/**
- * Open a pull session, serve its `next` and `cancel` requests and return its
- * teardown. The request callback never waits, so a cancel is read while a
- * step runs: it answers 'done' at once and whatever the step yields is
- * dropped. Steps run one after another in request order; an eager session
- * starts its first step right after subscribing and answers the first `next`
- * with it, so the consumer waits one round trip less. The teardown sends
- * one CONNECTION_CLOSED error while connected and waits only for a generator
- * that is not in a step. It is tracked and subscribed before the handler
- * runs; a session torn down while its handler sets up fails with
- * CONNECTION_CLOSED, one cancelled meanwhile ends right after the setup.
- */
 async function servePullSession(
   client: RPCClient,
   iteratorId: string,
@@ -679,10 +534,7 @@ async function servePullSession(
 
   const close = (): Promise<void> => (generator ? (closing ??= closeGenerator(generator)) : Promise.resolve());
 
-  // Natural end (done/cancel/error) and teardown: drop the request
-  // subscription and leave the client and the owner. Without this, every
-  // finished session leaves its `_rpc.iterator.*.request` subscription and
-  // teardown behind until the whole client disconnects.
+  // also on a natural end, or the request subscription stays until the client disconnects
   const finish = (): void => {
     if (!active) return;
     active = false;
@@ -723,12 +575,10 @@ async function servePullSession(
     if (response.type !== 'value') {
       finish();
       // a session aborted with an RPC error leaves its producer at a yield
-      void close();
+      close();
     }
 
     try {
-      // Sync fast path for small values; large values are chunked
-      // asynchronously.
       const reply = response.type === 'value' ? probe?.reply() : undefined;
       const chunked = client.publishOrChunk(responseSubject, response, reply ? { reply } : undefined);
       if (chunked) await chunked;
@@ -737,7 +587,7 @@ async function servePullSession(
       if (response.type === 'value' && active) {
         finish();
         sendQuietly(client, responseSubject, { id: iteratorId, type: 'error', error: formatErrorObject(error) } satisfies PullIteratorResponse);
-        void close();
+        close();
       }
     }
   };
@@ -745,7 +595,7 @@ async function servePullSession(
   const cancel = (): void => {
     finish();
     sendQuietly(client, responseSubject, { id: iteratorId, type: 'done' } satisfies PullIteratorResponse);
-    void close();
+    close();
   };
 
   const onRequest = (msg: PullIteratorRequest): void => {
@@ -779,14 +629,14 @@ async function servePullSession(
   } catch (error) {
     const tornDown = !active;
     finish();
-    void close();
+    close();
     throw tornDown ? connectionClosedException() : error;
   }
 
   // torn down while the handler set up
   if (!active) {
     unsub?.();
-    void close();
+    close();
     throw connectionClosedException();
   }
   if (cancelled) {
@@ -796,8 +646,7 @@ async function servePullSession(
 
   if (eager && generator) early = advance(generator);
   if (probe) {
-    // a pull consumer takes everything on its response subject for a step, so
-    // the probe goes to its reply inbox, where every consumer drops a message without an id
+    // a ping on the response subject would answer the step, a consumer drops one without an id on its reply inbox
     probe.idle = (reply) => {
       client.publishOrChunk(`rpc.reply.${iteratorId}`, { type: 'ping' }, { reply })?.catch(() => {});
       return true;
@@ -808,10 +657,6 @@ async function servePullSession(
   return teardown;
 }
 
-/**
- * Invoke the handler of a session inside it and coerce what it returns to an
- * async generator. A handler that fails ends the session.
- */
 async function openGenerator(handler: Function, args: any[], controller: AbortController, kind: string): Promise<Producer> {
   try {
     const result = inSession(controller.signal, () => handler(...args));
@@ -828,7 +673,6 @@ function toProducer(value: any, kind: string): Producer {
     return value[Symbol.asyncIterator]();
   }
   if (value && typeof value[Symbol.iterator] === 'function') {
-    // Sync generator/iterator - convert to async
     return (async function* () {
       for (const item of value) {
         yield item;
@@ -838,16 +682,15 @@ function toProducer(value: any, kind: string): Producer {
   throw createError(ERROR_CODES.INTERNAL_ERROR, `Handler must return a generator for ${kind}`);
 }
 
-// return() of an async generator runs only after a next() in flight settled, callers await it only between steps
 async function closeGenerator(generator: Producer): Promise<void> {
   try {
+    // waits for a next() in flight, callers await it only between steps
     await generator.return?.();
   } catch {
-    // ignore errors when closing the generator
+    // ignore
   }
 }
 
-// the session ends whether or not this message goes out
 function sendQuietly(client: RPCClient, subject: string, message: unknown): void {
   try {
     client.publishOrChunk(subject, message)?.catch(() => {});
@@ -864,8 +707,6 @@ function connectionClosedException(): RPCException {
   return createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed');
 }
 
-// the client ends the session on disconnect, suspend and connection loss, the owner on unregister and stop;
-// undefined once the owner stopped
 function track(client: RPCClient, owner: SessionOwner | undefined, teardown: () => Promise<void>): (() => void) | undefined {
   if (owner && !owner.add(teardown)) return undefined;
   const untrack = client.trackSession(teardown);
@@ -879,11 +720,11 @@ function inSession<R>(signal: AbortSignal, fn: () => R): R {
   return sessionStore ? sessionStore.run(signal, fn) : fn();
 }
 
-// no static import of node:async_hooks, the browser build bundles this file. The async_hooks
-// implementation (--no-async-context-frame) slows every await of the process once used
 function createSessionStore(): SessionStore | undefined {
   const runtime = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
+  // no static import, the browser build bundles this file
   const hooks = runtime?.getBuiltinModule?.('node:async_hooks') as { AsyncLocalStorage?: new () => SessionStore } | undefined;
   const Store = hooks?.AsyncLocalStorage;
+  // the async_hooks implementation (--no-async-context-frame) slows every await of the process
   return Store && !('_propagate' in Store.prototype) ? new Store() : undefined;
 }

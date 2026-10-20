@@ -1,5 +1,3 @@
-"""Common handler utilities for RPC client and service."""
-
 import asyncio
 import contextlib
 import contextvars
@@ -54,33 +52,21 @@ _leave_task: Callable[[asyncio.AbstractEventLoop, asyncio.Task[Any]], None] | No
 
 
 class SessionProbe(Protocol):
-    """Notices that the consumer of a session vanished, see OrphanProbeOptions."""
-
     sent: bool
-    """Set by every publish of the session, so only an idle session gets a ping."""
-
     due: bool
-    """The next publish of the session takes reply() as its reply subject."""
 
-    def start(self, ping: Callable[[str], Coroutine[Any, Any, None]], on_gone: Callable[[], None]) -> None:
-        """Probe from now on: ping(reply) for an idle session, on_gone() once the consumer stays missing."""
-        ...
+    def start(
+        self, ping: Callable[[str], Coroutine[Any, Any, None]], on_gone: Callable[[], None]
+    ) -> None: ...
 
-    def reply(self) -> str:
-        """Reply subject for the publish that takes a due probe, empty when it cannot go out."""
-        ...
+    def reply(self) -> str: ...
 
-    def touch(self) -> None:
-        """The consumer just spoke to the session."""
-        ...
+    def touch(self) -> None: ...
 
-    def stop(self) -> None:
-        """No more probes, the session is over."""
-        ...
+    def stop(self) -> None: ...
 
 
 def run_in_background(work: Awaitable[Any]) -> asyncio.Future[Any]:
-    """Run work without awaiting it, holding a reference until it is done (the loop holds only a weak one)."""
     future = asyncio.ensure_future(work)
     _background.add(future)
     future.add_done_callback(_background.discard)
@@ -88,8 +74,6 @@ def run_in_background(work: Awaitable[Any]) -> asyncio.Future[Any]:
 
 
 class _EagerStep(Coroutine[Any, Any, None]):
-    """A step that ran up to its first await before its task took over."""
-
     def __init__(self, coro: Coroutine[Any, Any, None]) -> None:
         self._coro = coro
         self._waiting: Any = None
@@ -116,8 +100,7 @@ class _EagerStep(Coroutine[Any, Any, None]):
             self._handed = True
             if self.finished or self._error is not None:
                 return self._first_yield()
-            # only a cancel reaches a task before its first step: like Task.cancel(), cancel what the
-            # step waits on and keep waiting for it
+            # only a cancel reaches a task before its first step: cancel what the step waits on and keep waiting
             if isinstance(self._waiting, asyncio.Future) and self._waiting.cancel():
                 return self._waiting
         return self._coro.throw(typ) if val is None and tb is None else self._coro.throw(typ, val, tb)
@@ -140,7 +123,6 @@ class _EagerStep(Coroutine[Any, Any, None]):
 
 
 def _start_step(step: Coroutine[Any, Any, None]) -> asyncio.Task[None] | None:
-    """Run a step up to its first await right away, returns None or a done task when it finished there."""
     loop = asyncio.get_running_loop()
     # eager: a producer with its value ready answers without an extra loop turn
     if _EAGER_STEPS:
@@ -188,8 +170,6 @@ def _connection_closed() -> RPCError:
 
 
 class _YieldGuard:
-    """Tells a publish loop to yield once the event loop has not run for 2 ms."""
-
     def __init__(self) -> None:
         self._since = time.monotonic()
         self._ran = True
@@ -213,12 +193,9 @@ async def _stream_generator(
 ) -> AsyncGenerator[Any, None]:
     generator: AsyncGenerator[Any, None]
 
-    # Get generator
     if is_async_generator(handler):
-        # Handler is an async generator function
         generator = handler(*args)
     elif is_sync_generator(handler):
-        # Handler is a sync generator function - convert to async
         sync_gen = handler(*args)
 
         async def async_wrapper() -> AsyncGenerator[Any, None]:
@@ -227,12 +204,11 @@ async def _stream_generator(
 
         generator = async_wrapper()
     elif is_async_function(handler):
-        # Handler is async function that might return a generator
         result = await handler(*args)
         if hasattr(result, "__aiter__"):
             generator = result
         elif hasattr(result, "__iter__"):
-            # Sync generator returned from async function
+
             async def async_wrapper() -> AsyncGenerator[Any, None]:
                 for value in result:
                     yield value
@@ -241,7 +217,6 @@ async def _stream_generator(
         else:
             raise create_error(ErrorCode.INTERNAL_ERROR, "Handler must return a generator for stream")
     else:
-        # Run sync handler in thread pool
         loop = asyncio.get_event_loop()
         func = partial(handler, *args)
         result = await loop.run_in_executor(io_pool, func)
@@ -249,7 +224,7 @@ async def _stream_generator(
         if hasattr(result, "__aiter__"):
             generator = result
         elif hasattr(result, "__iter__"):
-            # Sync generator returned from sync function
+
             async def async_wrapper() -> AsyncGenerator[Any, None]:
                 for value in result:
                     yield value
@@ -258,7 +233,6 @@ async def _stream_generator(
         else:
             raise create_error(ErrorCode.INTERNAL_ERROR, "Handler must return a generator for stream")
 
-    # Verify we have an async iterator
     if not hasattr(generator, "__aiter__"):
         raise create_error(ErrorCode.INTERNAL_ERROR, "Failed to create async generator from handler")
 
@@ -266,13 +240,6 @@ async def _stream_generator(
 
 
 class _StreamSession:
-    """One push stream on the responder side.
-
-    The cancel listener is up before the handler runs. A cancel or the
-    owner's teardown cancels the task at the producer's current await, and
-    nothing of the stream is published after it.
-    """
-
     def __init__(
         self,
         handler: Callable[..., Any],
@@ -299,7 +266,6 @@ class _StreamSession:
         self.task: asyncio.Task[None] = asyncio.get_running_loop().create_task(self._run())
 
     async def close(self) -> None:
-        """Owner teardown: stop the producer, a consumer still listening gets CONNECTION_CLOSED."""
         notify = not self._stopped and not self._ended
         self._stop()
         if notify and self._client.is_connected:
@@ -386,21 +352,12 @@ def start_stream_request(
     on_finished: Callable[[], Any] | None = None,
     probe: SessionProbe | None = None,
 ) -> tuple[Callable[[], Coroutine[Any, Any, None]], asyncio.Task[None]]:
-    """Start serving a push stream request.
-
-    The cancel listener is subscribed before the handler runs. Returns the
-    owner's teardown, which stops the producer and ends a listening consumer
-    with CONNECTION_CLOSED, and the task serving the stream. on_finished runs
-    once the stream is over. With ``probe`` a consumer that vanished without
-    a cancel ends the stream like a cancel.
-    """
     _check_control_subject(stream_subject, STREAM_SUBJECT_PREFIX)
     session = _StreamSession(handler, args, stream_subject, request_id, client, io_pool, on_finished, probe)
     return session.close, session.task
 
 
 async def refuse_stream(client: RPCClient, request_id: str, stream_subject: Any) -> None:
-    """End a stream request that never started like a torn-down stream, with CONNECTION_CLOSED."""
     _check_control_subject(stream_subject, STREAM_SUBJECT_PREFIX)
     message: StreamMessage = {"id": request_id, "type": "error", "error": _connection_closed()}
     await client.publish(stream_subject, message)
@@ -414,7 +371,6 @@ async def handle_stream_request(
     client: RPCClient,
     io_pool: ThreadPoolExecutor,
 ) -> None:
-    """Handle streaming request - common logic for client and service."""
     _, task = start_stream_request(handler, args, stream_subject, request_id, client, io_pool)
     await asyncio.wait((task,))
 
@@ -425,29 +381,18 @@ async def handle_normal_rpc(
     io_pool: ThreadPoolExecutor,
     handler_is_async: bool | None = None,
 ) -> Any:
-    """Handle normal RPC call - common logic for client and service.
-
-    ``handler_is_async`` lets callers on hot paths pass the async-ness
-    determined once at registration time instead of re-inspecting per call.
-    Sync handlers run inline on the event loop — the thread-pool hop costs
-    far more than the short callbacks used in this system, and inline
-    execution preserves per-subscription ordering.
-    """
-    # Ensure params is a list
     if not isinstance(params, list):
         params = [params] if params is not None else []
 
     if handler_is_async is None:
         handler_is_async = is_async_function(handler)
 
-    # Call the handler
     if handler_is_async:
         return await handler(*params)
     return handler(*params)
 
 
 def format_error_dict(e: Exception) -> RPCError:
-    """Format exception as error dictionary."""
     e = reported_error(e)
     if isinstance(e, RPCException):
         return e.to_dict()
@@ -459,16 +404,6 @@ def format_error_dict(e: Exception) -> RPCError:
 
 
 class _PullSession:
-    """Serves one pull iterator, plain or with callbacks.
-
-    Every next runs in a step task, so a cancel or the owner's teardown is
-    read while a step waits on the producer. Cancelling the step raises
-    CancelledError at the producer's current await. A pull-callback session
-    starts its first step right after subscribing, so the first batch goes
-    out while the consumer's first next is on its way; its answer waits for
-    that next.
-    """
-
     def __init__(
         self,
         iterator_id: str,
@@ -496,7 +431,6 @@ class _PullSession:
         self._failure: PullIteratorResponse | None = None
 
     def fail(self, error: Exception) -> None:
-        """A callback frame could not go out: the running or next step answers with ``error`` and ends the session."""
         if not self._active or self._failure is not None:
             return
         self._failure = {"id": self._id, "type": "error", "error": format_error_dict(error)}
@@ -504,13 +438,11 @@ class _PullSession:
             self._invoker.active = False
 
     async def listen(self) -> None:
-        """Subscribe to the requests before the handler runs, so a cancel during its setup counts."""
         self._unsub = await _subscribe_session(
             self._client, f"_rpc.iterator.{self._id}.request", self._on_request
         )
 
     async def abandon(self) -> None:
-        """The handler failed or was cancelled: drop the request subscription."""
         self._deactivate()
         unsub, self._unsub = self._unsub, None
         if unsub is not None:
@@ -518,7 +450,6 @@ class _PullSession:
                 await asyncio.shield(unsub())
 
     async def start(self, generator: AsyncGenerator[Any, None]) -> Callable[[], Coroutine[Any, Any, None]]:
-        """Serve the handler's generator and return the owner's teardown."""
         self._generator = generator
         if self._cancelled:
             # the caller tracks the session once this returns, an end before that would leave its entry behind
@@ -532,10 +463,6 @@ class _PullSession:
         return self.cleanup
 
     async def cleanup(self) -> None:
-        """Owner teardown: stop the producer, a consumer still listening gets CONNECTION_CLOSED.
-
-        Waits for the producer's cleanup only when it sat at a yield.
-        """
         notify = self._active
         self._deactivate()
         self._forget()
@@ -697,13 +624,6 @@ async def set_up_session(
     reply_subject: str,
     response: RPCResponse | dict[str, Any],
 ) -> Callable[[], Coroutine[Any, Any, None]]:
-    """Await the setup of a pull or callback session and return its teardown.
-
-    When the owner's teardown (unregister, service stop, suspend or
-    disconnect) cancels the handler while it still sets the session up, the
-    init call is answered with CONNECTION_CLOSED instead of being left to its
-    timeout.
-    """
     try:
         return await setup
     except asyncio.CancelledError:
@@ -735,11 +655,6 @@ async def handle_pull_iterator_request(
     on_finished: Callable[[], Any] | None = None,
     probe: SessionProbe | None = None,
 ) -> Callable[[], Coroutine[Any, Any, None]]:
-    """Handle pull-based iterator request.
-
-    The request subscription exists before the handler runs: a cancel during
-    its setup ends the session right after it.
-    """
     session = _PullSession(iterator_id, client, None, on_finished, probe)
     return await _serve_pull(session, partial(_open_pull_generator, handler, args, io_pool))
 
@@ -749,12 +664,9 @@ async def _open_pull_generator(
 ) -> AsyncGenerator[Any, None]:
     generator: AsyncGenerator[Any, None]
 
-    # Get generator
     if is_async_generator(handler):
-        # Handler is an async generator function
         generator = handler(*args)
     elif is_sync_generator(handler):
-        # Handler is a sync generator function - convert to async
         sync_gen = handler(*args)
 
         async def async_wrapper() -> AsyncGenerator[Any, None]:
@@ -763,12 +675,11 @@ async def _open_pull_generator(
 
         generator = async_wrapper()
     elif is_async_function(handler):
-        # Handler is async function that might return a generator
         result = await handler(*args)
         if hasattr(result, "__aiter__"):
             generator = result
         elif hasattr(result, "__iter__"):
-            # Sync generator returned from async function
+
             async def async_wrapper() -> AsyncGenerator[Any, None]:
                 for value in result:
                     yield value
@@ -777,7 +688,6 @@ async def _open_pull_generator(
         else:
             raise create_error(ErrorCode.INTERNAL_ERROR, "Handler must return a generator for pull iterator")
     else:
-        # Run sync handler in thread pool
         loop = asyncio.get_event_loop()
         func = partial(handler, *args)
         result = await loop.run_in_executor(io_pool, func)
@@ -785,7 +695,7 @@ async def _open_pull_generator(
         if hasattr(result, "__aiter__"):
             generator = result
         elif hasattr(result, "__iter__"):
-            # Sync generator returned from sync function
+
             async def async_wrapper() -> AsyncGenerator[Any, None]:
                 for value in result:
                     yield value
@@ -794,7 +704,6 @@ async def _open_pull_generator(
         else:
             raise create_error(ErrorCode.INTERNAL_ERROR, "Handler must return a generator for pull iterator")
 
-    # Verify we have an async iterator
     if not hasattr(generator, "__aiter__"):
         raise create_error(ErrorCode.INTERNAL_ERROR, "Failed to create async generator from handler")
 
@@ -802,17 +711,6 @@ async def _open_pull_generator(
 
 
 class CallbackInvoker:
-    """Passed to a pull-callback handler as its last argument.
-
-    Invoke() fires a oneway callback to the client. Only methods registered
-    as oneway by the client are dispatched; unknown methods are silently
-    dropped per protocol spec (at-most-once semantics).
-
-    Safe for concurrent use. Becomes inert after cancellation — handlers
-    can poll `active` to exit long-running loops early. A cancel also raises
-    CancelledError at the handler's current await.
-    """
-
     def __init__(
         self,
         subject: str,
@@ -830,14 +728,6 @@ class CallbackInvoker:
         self.active = True
 
     async def invoke(self, method: str, *args: Any) -> None:
-        """Fire a oneway callback. No-op if inactive, disconnected, or the
-        method is not registered as oneway by the client.
-
-        A frame that cannot go out while connected, one that does not encode
-        or is over a payload limit too small for chunking, raises here and
-        ends the session: later calls send nothing and the consumer's batch
-        fails with that error, also when the handler catches it.
-        """
         if not self.active:
             return
         if method not in self._oneway:
@@ -872,17 +762,6 @@ async def handle_pull_callback_request(
     on_finished: Callable[[], Any] | None = None,
     probe: SessionProbe | None = None,
 ) -> Callable[[], Coroutine[Any, Any, None]]:
-    """Handle a pull-iterator-with-callbacks request.
-
-    Builds a CallbackInvoker whose invoke() publishes oneway to the
-    callback subject, calls the handler with (*args, invoker), then drives
-    the returned async generator from iterator next/cancel requests.
-
-    The iterator response carries no value — it is purely a batch-boundary
-    signal. See packages/rpc/PULL_CALLBACK_PROTOCOL.md. The request
-    subscription exists before the handler runs: a cancel during its setup
-    ends the session right after it.
-    """
     _check_control_subject(callback_subject, PULL_CALLBACK_SUBJECT_PREFIX)
 
     def fail(error: Exception) -> None:
@@ -896,7 +775,6 @@ async def handle_pull_callback_request(
 async def _open_pull_callback_generator(
     handler: Callable[..., Any], args: list[Any], invoker: CallbackInvoker, io_pool: ThreadPoolExecutor
 ) -> AsyncGenerator[Any, None]:
-    # Invoke handler with invoker appended as last positional argument.
     generator: AsyncGenerator[Any, None]
 
     if is_async_generator(handler):
@@ -961,15 +839,9 @@ async def handle_callback_request(
     on_finished: Callable[[], Any] | None = None,
     probe: SessionProbe | None = None,
 ) -> Callable[[], Coroutine[Any, Any, None]]:
-    """Handle callback subscription request.
-
-    With ``probe`` a consumer that vanished without a cancel ends the
-    subscription like a cancel. Values after the end are dropped.
-    """
     _check_control_subject(callback_subject, CALLBACK_SUBJECT_PREFIX)
     ended = False
 
-    # Create wrapper callback that publishes to callback_subject
     async def wrapper_callback(value: Any) -> None:
         if ended or not client.is_connected:
             return
@@ -984,8 +856,7 @@ async def handle_callback_request(
             probe.sent = True
             await client.publish(callback_subject, msg, reply=probe.reply() if probe.due else None)
 
-    # a sync handler runs in the pool and may call back from any thread: values queue in call order and a task
-    # on the loop publishes them, woken once per burst
+    # a sync handler may call back from any pool thread: values queue in call order, one loop task publishes them per burst
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
     queued: deque[Any] = deque()
@@ -1023,7 +894,6 @@ async def handle_callback_request(
             # the loop is closed, nobody publishes anymore
             pass
 
-    # Call handler with args + wrapper callback
     handler_cleanup = None
     if is_async_function(handler):
         handler_cleanup = await handler(*args, wrapper_callback)
@@ -1032,7 +902,6 @@ async def handle_callback_request(
         func = partial(handler, *args, sync_wrapper_callback)
         handler_cleanup = await loop.run_in_executor(io_pool, func)
 
-    # Helper to invoke cleanup (sync or async)
     async def invoke_cleanup() -> None:
         if handler_cleanup and callable(handler_cleanup):
             if is_async_function(handler_cleanup):
@@ -1040,8 +909,7 @@ async def handle_callback_request(
             else:
                 handler_cleanup()
 
-    # Handler cleanup must run exactly once — the cancel message and a later
-    # register_handler/disconnect cleanup would otherwise both invoke it.
+    # the cancel message and a later register_handler/disconnect cleanup must not both run the handler cleanup
     cleaned_up = False
 
     async def run_handler_cleanup() -> None:
@@ -1060,15 +928,13 @@ async def handle_callback_request(
         if probe is not None:
             probe.stop()
 
-    # Subscribe to cancel subject
     async def on_cancel(_msg: Any) -> None:
         end()
         if on_finished is not None:
             with contextlib.suppress(Exception):
                 on_finished()
         await run_handler_cleanup()
-        # Unsubscribe outside this callback's own message task —
-        # Subscription.unsubscribe() cancels the task it is called from.
+        # outside this callback's own task, Subscription.unsubscribe() cancels the task it is called from
         asyncio.create_task(cancel_unsub())
 
     async def ping(reply: str) -> None:
@@ -1084,7 +950,6 @@ async def handle_callback_request(
     if probe is not None:
         probe.start(ping, orphaned)
 
-    # Return combined cleanup
     async def cleanup() -> None:
         end()
         await cancel_unsub()
@@ -1094,7 +959,6 @@ async def handle_callback_request(
 
 
 def session_params(params: Any, marker: str) -> dict[str, Any] | None:
-    """The session parameters of a request when ``marker`` is set, given directly or as the first argument."""
     if isinstance(params, list) and params:
         params = params[0]
     if isinstance(params, dict) and params.get(marker):
@@ -1102,7 +966,7 @@ def session_params(params: Any, marker: str) -> dict[str, Any] | None:
     return None
 
 
-# the caller names this subject and the handler publishes there with its own credentials
 def _check_control_subject(subject: Any, prefix: str) -> None:
+    # the caller names this subject and the handler publishes there with its own credentials
     if not isinstance(subject, str) or len(subject) <= len(prefix) or not subject.startswith(prefix):
         raise create_error(ErrorCode.INVALID_PARAMS, f"Control subject must start with '{prefix}'")

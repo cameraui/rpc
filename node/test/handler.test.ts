@@ -19,9 +19,7 @@ const SIGNALS = !('_propagate' in AsyncLocalStorage.prototype);
 
 function sessionClient() {
   const { client, nc } = createClient();
-  // messages published to `subject`, decoded
   const sent = (subject: string) => nc.published.filter((p) => p.subject === subject).map((p) => decode(p.data));
-  // hands a message to the live subscription of `subject`, through the client's dispatcher
   const deliver = (subject: string, message: unknown) => {
     nc.subs.find((sub) => sub.pattern === subject && !sub.closed)?.callback(null, { subject, data: encode(message) });
   };
@@ -235,7 +233,10 @@ describe('handleStreamRequest', () => {
     const publish = nc.publish.bind(nc);
     nc.publish = (subject, data, opts) => {
       publish(subject, data, opts);
-      if (subject === STREAM && (decode(data) as { type: string }).type === 'end') queueMicrotask(() => void Promise.all(owner.stop()));
+      if (subject === STREAM && (decode(data) as { type: string }).type === 'end')
+        queueMicrotask(() => {
+          Promise.all(owner.stop());
+        });
     };
     async function* handler() {
       yield 1;
@@ -541,8 +542,7 @@ describe('sessionSignal()', () => {
     expect(sent(STREAM)).toHaveLength(2);
   });
 
-  // the store check relies on this: a Node release that drops _propagate from the async_hooks
-  // implementation, or drops that implementation, must fail here
+  // the store check relies on this, a Node release that drops _propagate or that implementation must fail here
   it('tells the async_hooks AsyncLocalStorage from the AsyncContextFrame one by _propagate', () => {
     const major = Number(process.versions.node.split('.')[0]);
     const probe = "process.stdout.write(String('_propagate' in require('node:async_hooks').AsyncLocalStorage.prototype))";
@@ -651,7 +651,10 @@ describe('session teardown', () => {
       generateItems: () => settingUp(producer()),
       pullItems: () => settingUp(producer()),
       pullFrames: (_cb: unknown) => settingUp(producer()),
-      watch: (_cb: unknown) => settingUp(() => void cleanups.push('watch')),
+      watch: (_cb: unknown) =>
+        settingUp(() => {
+          cleanups.push('watch');
+        }),
     });
     deliver('rpc.ns.generateItems', { id: 's1', method: 'stream', params: { __stream: true, __streamSubject: STREAM, args: [] } });
     deliver('rpc.ns.pullItems', { id: 'p1', method: 'call', params: [{ __pullIterator: true, __iteratorId: 'p1', args: [] }] });
@@ -729,7 +732,7 @@ describe('session teardown', () => {
       },
     );
     const request = (subject: string, payload: unknown) =>
-      void live(subject)!.callback(null, { subject, data: encode(payload), headers: undefined, respond() {}, respondError() {} });
+      live(subject)!.callback(null, { subject, data: encode(payload), headers: undefined, respond() {}, respondError() {} });
     request('gen', { id: 's1', method: 'stream', params: { __stream: true, __streamSubject: 'stream.svc.gen.s1', args: [] } });
     request('pull', { id: 'p1', method: 'call', params: [{ __pullIterator: true, __iteratorId: 'p1', args: [] }] });
     request('pullSlow', { id: 'p2', method: 'call', params: [{ __pullIterator: true, __iteratorId: 'p2', args: [] }] });
@@ -900,7 +903,6 @@ describe('pull-callback batches', () => {
     expect(signal?.reason).toMatchObject({ code: 'INTERNAL_ERROR', message: 'Unknown type: symbol' });
   });
 
-  // a pull-callback iterator past its setup, with the subscriptions of its session
   async function openedIterator({ client, nc, sent }: ReturnType<typeof sessionClient>, iter: AsyncGenerator<void>) {
     const first = iter.next();
     await until(() => sent('rpc.ns.play').length === 1);

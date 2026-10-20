@@ -95,7 +95,7 @@ func privateChannelExample(ctx context.Context) {
 	})
 
 	charlieChannel.OnMessage(func(data any) {
-		fmt.Printf("[Charlie received]: %s\n", formatMsg(data)) // Should not receive anything
+		fmt.Printf("[Charlie received]: %s\n", formatMsg(data)) // should not receive anything
 	})
 
 	fmt.Println("--- Private Messages ---")
@@ -265,7 +265,7 @@ func directMessagingExample(ctx context.Context) {
 	}
 	bobDmTime := ms(time.Since(dmStart))
 
-	// Charlie sends to Alice (they don't have a channel setup, so Alice won't receive it)
+	// Charlie and Alice have no channel, so Alice won't receive it
 	dmStart = time.Now()
 	if err := charlie.sendDM("alice", "Alice, I need your help!"); err != nil {
 		fatal("charlie DM", err)
@@ -292,7 +292,7 @@ func directMessagingExample(ctx context.Context) {
 		fatal("alice file DM", err)
 	}
 
-	// send the large file directly (will be chunked automatically)
+	// chunked automatically
 	if ch, ok := alice.channels["bob"]; ok {
 		fileStart := time.Now()
 		if err := ch.Send(largeFile); err != nil {

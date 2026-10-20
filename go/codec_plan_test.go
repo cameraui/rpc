@@ -247,7 +247,6 @@ func TestEncodePlanSkipsTypesItDoesNotModel(t *testing.T) {
 	}
 }
 
-// one-key maps only: vmihailenco writes map entries in iteration order
 func fillRandom(rng *rand.Rand, v reflect.Value, depth int) {
 	if !v.CanSet() {
 		return
@@ -292,6 +291,7 @@ func fillRandom(rng *rand.Rand, v reflect.Value, depth int) {
 			fillRandom(rng, v.Index(i), depth)
 		}
 	case reflect.Map:
+		// one key only: vmihailenco writes map entries in iteration order
 		m := reflect.MakeMap(v.Type())
 		if depth > 0 && rng.IntN(2) == 0 {
 			key := reflect.New(v.Type().Key()).Elem()
@@ -389,8 +389,7 @@ func TestEncodePlanHonoursAPointerRegistration(t *testing.T) {
 
 type planMoney struct{ cents *int64 }
 
-// assumes a constructed value, as some marshalers do
-func (m planMoney) MarshalMsgpack() ([]byte, error) { return msgpack.Marshal(*m.cents) }
+func (m planMoney) MarshalMsgpack() ([]byte, error) { return msgpack.Marshal(*m.cents) } // assumes a constructed value, as some marshalers do
 
 type planOrder struct {
 	ID    string
@@ -405,8 +404,8 @@ func TestEncodePlanSurvivesAMarshalerThatPanicsOnZero(t *testing.T) {
 	}
 }
 
-// the generic encoder allocates per field, a plan only when the buffer grows
 func TestEncodePathsUseThePlans(t *testing.T) {
+	// the generic encoder allocates per field, a plan only when the buffer grows
 	events := RPCResponse{ID: "p.1", Result: benchEvents(500)}
 	if allocs := testing.AllocsPerRun(10, func() { _, _ = Encode(events) }); allocs > 30 {
 		t.Errorf("Encode: %v allocations for 500 events", allocs)

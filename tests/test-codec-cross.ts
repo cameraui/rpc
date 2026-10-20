@@ -124,7 +124,7 @@ function compareValues(expected: any, actual: any, testName: string): boolean {
     return false;
   }
 
-  // Default: deep comparison (JSON.stringify is key-order-sensitive, Go/Python may differ)
+  // JSON.stringify is key-order-sensitive, Go and Python may order keys differently
   return deepEqual(expected, actual);
 }
 

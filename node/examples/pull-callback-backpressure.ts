@@ -56,7 +56,6 @@ async function main() {
   const CHUNKS = 1000;
   const CLIENT_DELAY_MS = 500;
 
-  // Track first/last chunk timestamp per batch (server-side performance.now())
   const batchStats: { firstTs: number; lastTs: number; count: number }[] = [];
   for (let i = 0; i < BATCHES; i++) batchStats.push({ firstTs: -1, lastTs: -1, count: 0 });
 
@@ -97,7 +96,7 @@ async function main() {
   for (let i = 1; i < BATCHES; i++) {
     const gap = batchStats[i].firstTs - batchStats[i - 1].lastTs;
     const expected = CLIENT_DELAY_MS;
-    const withinRange = gap >= expected * 0.8; // allow 20% slack
+    const withinRange = gap >= expected * 0.8;
     if (!withinRange) bpOk = false;
     console.log(`  Gap between batch ${i - 1} and ${i}: ${gap.toFixed(1)}ms (expected >=${expected * 0.8}ms) ${withinRange ? 'OK' : 'FAIL'}`);
   }

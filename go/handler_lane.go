@@ -12,9 +12,6 @@ type laneItem struct {
 	arrived time.Time
 }
 
-// a method's requests in arrival order, served by a goroutine that runs only
-// while some are queued; the limits stand in for the nats.go pending limits
-// of the subscription the method would have on its own
 type methodLane struct {
 	subject  string
 	run      func(data []byte, arrived time.Time)
@@ -35,8 +32,7 @@ type laneSet struct {
 	client   *Client
 	maxMsgs  int
 	maxBytes int
-	// how a lane serves the requests of a method, nil for an unknown one
-	runner func(method string) func(data []byte, arrived time.Time)
+	runner   func(method string) func(data []byte, arrived time.Time)
 
 	mu     sync.Mutex
 	lanes  map[string]*methodLane
@@ -61,7 +57,6 @@ func newLaneSet(client *Client, prefix string, maxMsgs, maxBytes int, runner fun
 	}
 }
 
-// nil for a method the set does not serve; created on its first request
 func (s *laneSet) lane(method string) *methodLane {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -106,14 +101,12 @@ func (s *laneSet) idle() bool {
 	return true
 }
 
-// queued requests go as the pending messages of a removed subscription do
 func (s *laneSet) clear() {
 	for _, l := range s.all() {
 		l.clear()
 	}
 }
 
-// after unregistering nothing queued runs anymore
 func (s *laneSet) close() {
 	if s == nil {
 		return

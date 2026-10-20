@@ -25,21 +25,18 @@ class DataService:
 @RPCClass
 class DataServiceImpl:
     async def generate_numbers(self, count: int) -> AsyncGenerator[int, None]:
-        """Push-based: Server pushes all data as fast as possible."""
         print(f"Starting push-based number generation ({count} items)")
         for i in range(count):
             yield i
         print("Push-based generation complete")
 
     async def generate_large_data(self, chunks: int) -> AsyncGenerator[bytes, None]:
-        """Push-based: Server pushes large data chunks."""
         print(f"Starting push-based data generation ({chunks} x 1MB)")
         for _ in range(chunks):
             yield BUFFER_1MB
         print("Push-based data generation complete")
 
     async def pull_numbers(self, count: int) -> AsyncGenerator[int, None]:
-        """Pull-based: Server waits for client to request each item."""
         print(f"Starting pull-based number iteration ({count} items)")
         for i in range(count):
             print(f"Client pulled number {i}")
@@ -47,7 +44,6 @@ class DataServiceImpl:
         print("Pull-based iteration complete")
 
     async def pull_large_data(self, chunks: int) -> AsyncGenerator[bytes, None]:
-        """Pull-based: Server waits for client to request each chunk."""
         print(f"Starting pull-based data iteration ({chunks} x 1MB)")
         for i in range(chunks):
             print(f"Client pulled chunk {i}")
@@ -55,14 +51,12 @@ class DataServiceImpl:
         print("Pull-based data iteration complete")
 
     async def generate_slow_data(self, delay_ms: int) -> AsyncGenerator[str, None]:
-        """Simulate slow data generation - push based."""
         print(f"Starting slow push generation ({delay_ms}ms delay)")
         for i in range(10):
             await asyncio.sleep(delay_ms / 1000)
             yield f"Push data {i} at {time.strftime('%H:%M:%S.%f')[:-3]}"
 
     async def pull_slow_data(self, delay_ms: int) -> AsyncGenerator[str, None]:
-        """Simulate slow data generation - pull based."""
         print(f"Starting slow pull iteration ({delay_ms}ms delay)")
         for i in range(10):
             await asyncio.sleep(delay_ms / 1000)

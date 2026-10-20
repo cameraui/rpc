@@ -58,8 +58,8 @@ class OperationTimer {
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const smallData = 'This is a small test message';
-const mediumData = Buffer.alloc(5 * 1024 * 1024); // 5MB
-const largeData = Buffer.alloc(10 * 1024 * 1024); // 10MB
+const mediumData = Buffer.alloc(5 * 1024 * 1024);
+const largeData = Buffer.alloc(10 * 1024 * 1024);
 
 for (let i = 0; i < mediumData.length; i++) {
   mediumData[i] = i % 256;
@@ -140,11 +140,11 @@ async function testAllFeatures(): Promise<void> {
   clientOp.end();
 
   console.log('\n1. Native Request/Reply');
-  // Setup (handler registration + subscription settle) outside the measurement
+  // setup stays outside the measurement
   const unsub1 = await server.onRequest('echo.*', async (data: any) => {
     return { echo: data.msg, timestamp: Date.now() };
   });
-  await sleep(50); // Let subscription settle
+  await sleep(50); // let the subscription settle
 
   const test1Op = timer.startOperation('Request Handler Setup & 100 calls');
   test1Op.start();
@@ -234,7 +234,6 @@ async function testAllFeatures(): Promise<void> {
     await clientChannel.send({ index: i, data: `Message ${i}` });
   }
 
-  // Wait for the receive counter instead of a fixed sleep
   await waitFor(() => messagesReceived.length >= 1000);
   test4Op.end();
 
@@ -285,7 +284,7 @@ async function testAllFeatures(): Promise<void> {
 
   test6Op.end();
 
-  // Verification (settle sleep + discovery) outside the measurement
+  // verification stays outside the measurement
   await sleep(100);
 
   const services = server.service.getAllInfo();
@@ -320,14 +319,14 @@ async function testAllFeatures(): Promise<void> {
     streamSum += value;
   }
 
-  const expectedSum = (99 * 100) / 2; // sum of 0 to 99
+  const expectedSum = (99 * 100) / 2;
   if (streamSum !== expectedSum) {
     throw new Error(`Stream sum mismatch: ${streamSum} !== ${expectedSum}`);
   }
 
   test8Op.end();
 
-  // Services don't support chunking; use an RPC handler for large data
+  // services do not chunk, large data goes through an RPC handler
   console.log('\n8b. Large Data via RPC Handler');
   const largeDataHandlers = {
     getLargeData: async () => largeData,
@@ -368,7 +367,7 @@ async function testAllFeatures(): Promise<void> {
     throw new Error('Concurrent results count mismatch');
   }
 
-  // Keep the handler for mixed workload test
+  // the handler stays for the mixed workload test
   test9Op.end();
 
   console.log('\n10. Error Handling');
@@ -384,7 +383,7 @@ async function testAllFeatures(): Promise<void> {
     await calcService.errorMethod(true);
     throw new Error('Should have raised exception');
   } catch (e: any) {
-    // Services return HTTP-like error codes (500), not ERROR_CODES
+    // services return HTTP-like error codes (500), not ERROR_CODES
     if (!(e instanceof RPCException) || (e.code !== '500' && e.code !== ERROR_CODES.INTERNAL_ERROR)) {
       throw new Error(`Unexpected error: ${e}`);
     }
@@ -434,7 +433,7 @@ async function testAllFeatures(): Promise<void> {
       ops.push(testChannel.send({ event: 'mixed', data: 'test' }));
     }
 
-    // Service calls don't support auto-chunking; use echo to avoid "maximum payload exceeded"
+    // service calls do not chunk, echo stays under the payload limit
     ops.push(calcService.echo('test data'));
 
     await Promise.all(ops);
@@ -453,7 +452,7 @@ async function testAllFeatures(): Promise<void> {
   const cleanupOp = timer.startOperation('Cleanup');
   cleanupOp.start();
 
-  unsub9(); // Clean up the concurrent handler
+  unsub9();
   await service.stop();
   await client.disconnect();
   await server.disconnect();

@@ -7,7 +7,7 @@ import uvloop
 
 from camera_ui_rpc import create_rpc_client
 
-large_buffer = b"x" * (5 * 1024 * 1024)  # 5MB
+large_buffer = b"x" * (5 * 1024 * 1024)
 
 
 async def main():
@@ -99,7 +99,7 @@ async def main():
 
     print("Testing Concurrent Channel Requests\n")
 
-    # Unsubscribe the previous handler to avoid conflicts
+    # drop the previous handler to avoid conflicts
     if unsub_b:  # type: ignore
         await unsub_b()
         unsub_b = None
@@ -114,7 +114,7 @@ async def main():
 
         import random
 
-        delay = random.random() * 0.2  # 0-200ms
+        delay = random.random() * 0.2
         await asyncio.sleep(delay)
 
         return {
@@ -136,7 +136,7 @@ async def main():
 
     print("Testing Channel Request/Reply with Large Data\n")
 
-    # Unsubscribe the previous private handler to avoid conflicts
+    # drop the previous private handler to avoid conflicts
     if unsub_priv_b:  # type: ignore
         await unsub_priv_b()
         unsub_priv_b = None

@@ -2,8 +2,8 @@ import { RPCClass } from '../src/decorators.js';
 import { createRPCClient } from '../src/index.js';
 
 const smallData = 'This is a small response that fits in a single message';
-const mediumData = Buffer.alloc(5 * 1024 * 1024); // 5MB
-const largeData = Buffer.alloc(50 * 1024 * 1024); // 50MB
+const mediumData = Buffer.alloc(5 * 1024 * 1024);
+const largeData = Buffer.alloc(50 * 1024 * 1024);
 
 for (let i = 0; i < mediumData.length; i++) {
   mediumData[i] = i % 256;
@@ -188,9 +188,8 @@ async function main() {
 
   await clientSmall.connect();
 
-  // Override max payload size to test extreme chunking
   // @ts-ignore - accessing private property for testing
-  clientSmall._maxPayloadSize = 1024; // 1KB
+  clientSmall._maxPayloadSize = 1024;
 
   const serviceSmall = clientSmall.createProxy<TestService>('testSmall');
 

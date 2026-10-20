@@ -81,7 +81,7 @@ async def main() -> None:
             did_cancel = True
             break
 
-    # Allow teardown + any in-flight callback messages to settle.
+    # let the teardown and in-flight callback messages settle
     await asyncio.sleep(0.5)
 
     print("\nResults")

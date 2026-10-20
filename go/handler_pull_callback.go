@@ -8,12 +8,7 @@ import (
 	"sync/atomic"
 )
 
-// CallbackInvoker is provided to a pull-callback handler as its last
-// argument. Handlers invoke methods through Invoke() to fire oneway
-// callback messages to the client.
-//
-// Safe for concurrent use. Invoke() becomes a no-op after cancellation
-// or when the underlying client disconnects.
+// CallbackInvoker is passed to a pull-callback handler as its last argument to fire oneway callbacks.
 type CallbackInvoker struct {
 	subject string
 	client  *Client
@@ -22,18 +17,10 @@ type CallbackInvoker struct {
 	ctx     context.Context
 	probe   *orphanProbe
 	fail    func(err error)
-	// held by every Invoke across its publish, so stop waits for the ones in
-	// flight and none follows the session's terminal message
-	mu sync.RWMutex
+	mu      sync.RWMutex
 }
 
-// Invoke fires a oneway callback. Only methods registered as oneway by the
-// client are dispatched; unknown methods are silently dropped to match the
-// protocol's at-most-once semantics. A frame that cannot go out while
-// connected, one that does not encode or is larger than a payload limit too
-// small for chunking, ends the session: later calls send nothing and the
-// batch it belongs to fails with that error, INTERNAL_ERROR or
-// PAYLOAD_TOO_LARGE.
+// Invoke fires a oneway callback, a method the client did not register as oneway is dropped.
 func (ci *CallbackInvoker) Invoke(method string, args ...any) {
 	if !ci.active.Load() {
 		return
@@ -56,36 +43,18 @@ func (ci *CallbackInvoker) publish(method string, args []any) error {
 	return ci.client.publishInternal(ci.subject, CallbackInvocation{Method: method, Args: args}, ci.probe.replyFor())
 }
 
-// Supports reports whether the client registered method as a oneway
-// callback, so Invoke sends it. A producer checks it before it switches to a
-// form the client may not handle, for example batched frames.
-//
-// Example:
-//
-//	if inv.Supports("onBatch") {
-//		inv.Invoke("onBatch", frames)
-//	} else {
-//		for _, f := range frames {
-//			inv.Invoke("onFrame", f)
-//		}
-//	}
+// Supports reports whether the client registered method as a oneway callback, so Invoke sends it.
 func (ci *CallbackInvoker) Supports(method string) bool {
 	_, ok := ci.oneway[method]
 	return ok
 }
 
-// Active reports whether further Invoke() calls will be dispatched.
-// Handlers can poll this inside loops to exit early on cancel.
+// Active reports whether further Invoke calls will be dispatched.
 func (ci *CallbackInvoker) Active() bool {
 	return ci.active.Load()
 }
 
-// Context is cancelled when the session ends: the caller cancels it or is gone
-// for good, the producer closes its channel, the handler is unregistered, the
-// service stops, or the Client serving it disconnects, suspends or loses its
-// connection for good. A producer waiting for data selects on its Done channel
-// to stop at once instead of at its next Active check. It is the same context
-// a handler gets in a context.Context first parameter.
+// Context is cancelled when the session ends.
 func (ci *CallbackInvoker) Context() context.Context {
 	if ci.ctx == nil {
 		return context.Background()
@@ -99,15 +68,6 @@ func (ci *CallbackInvoker) stop() {
 	ci.mu.Unlock()
 }
 
-// handlePullCallbackRequestGo handles a pull-iterator-with-callbacks request.
-//
-// Builds a CallbackInvoker whose Invoke() publishes oneway to callbackSubject,
-// calls the handler with ([ctx], ...args, invoker), then drives the returned channel
-// from iterator `next`/`cancel` requests. The iterator response carries no
-// value — it is purely a batch-boundary signal.
-// onFinished is invoked once when the iterator ends naturally (done/cancel) so
-// the caller can drop its cleanup-map entry for this session. A nil teardown
-// with a nil error: the caller cancelled during the setup and the session is over.
 func handlePullCallbackRequestGo(
 	parent context.Context,
 	fn reflect.Value,
@@ -149,7 +109,6 @@ func handlePullCallbackRequestGo(
 		}
 	}()
 
-	// Build handler arguments: [ctx] + original args + invoker as last positional.
 	fnType := fn.Type()
 	numIn := fnType.NumIn()
 	first := contextParams(fnType)
@@ -159,7 +118,6 @@ func handlePullCallbackRequestGo(
 	}
 
 	invokerParamType := fnType.In(numIn - 1)
-	// Accept either *CallbackInvoker or a compatible interface.
 	invokerValue := reflect.ValueOf(invoker)
 	if !invokerValue.Type().AssignableTo(invokerParamType) {
 		return nil, NewRPCException(ErrCodeInternalError,
@@ -201,6 +159,7 @@ func handlePullCallbackRequestGo(
 
 	started = true
 	if !s.serve(rv) {
+		// the caller cancelled during the setup, the session is over
 		return nil, nil
 	}
 	return s.teardown, nil

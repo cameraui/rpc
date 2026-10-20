@@ -25,11 +25,10 @@ type Channel struct {
 	onError   func(err error)
 
 	isolatedClient *Client
-	// drops isolatedClient from its parent once it is disconnected
-	release func()
+	release        func()
 }
 
-// NewChannel creates a new broadcast channel. Call Init() before use.
+// NewChannel creates a broadcast channel that needs Init() before use.
 func NewChannel(client *Client, channelID string) *Channel {
 	return &Channel{
 		client:    client,
@@ -50,7 +49,7 @@ func (ch *Channel) IsClosed() bool {
 	return ch.closed
 }
 
-// Init subscribes to the channel subject. Must be called before Send/Close.
+// Init subscribes to the channel subject and must run before Send or Close.
 func (ch *Channel) Init() error {
 	unsub, err := ch.client.Subscribe(ch.subject, func(data []byte) {
 		var msg ChannelMessage
@@ -111,8 +110,7 @@ func (ch *Channel) Request(ctx context.Context, data any, timeout ...time.Durati
 	return ch.client.Request(ctx, ch.subject+".request", data, t)
 }
 
-// OnRequest registers a handler for request/reply on this channel.
-// The subscription is tracked so Close()/cleanup releases it.
+// OnRequest registers a request/reply handler on this channel.
 func (ch *Channel) OnRequest(handler func(data []byte) (any, error)) (func(), error) {
 	unsub, err := ch.client.OnRequest(ch.subject+".request", handler)
 	if err != nil {
@@ -149,7 +147,6 @@ func (ch *Channel) Close() error {
 	ch.closed = true
 	ch.mu.Unlock()
 
-	// Notify other side
 	msg := ChannelMessage{Type: "close"}
 	_ = ch.client.Publish(ch.subject, msg)
 
@@ -176,7 +173,6 @@ func (ch *Channel) cleanup() error {
 	ch.onClose = nil
 	ch.onError = nil
 
-	// Release request/reply subscriptions collected via OnRequest.
 	ch.mu.Lock()
 	requestUnsubs := ch.requestUnsubs
 	ch.requestUnsubs = nil
@@ -219,22 +215,18 @@ type PrivateChannel struct {
 	onError   func(err error)
 
 	isolatedClient *Client
-	// drops isolatedClient from its parent once it is disconnected
-	release func()
+	release        func()
 }
 
-// NewPrivateChannel creates a new private 1:1 channel. Call Init() before use.
+// NewPrivateChannel creates a private 1:1 channel that needs Init() before use.
 func NewPrivateChannel(client *Client, channelID, targetClientID string) *PrivateChannel {
-	// Derive clientID from client name, stripping any isolation suffixes
 	name := client.Options.Name
-	// Remove suffixes like "-channel-xxx" or "-private-xxx"
 	for _, suffix := range []string{"-channel-", "-private-"} {
 		if idx := strings.Index(name, suffix); idx != -1 {
 			name = name[:idx]
 		}
 	}
 
-	// Sort IDs to create a deterministic subject
 	ids := []string{name, targetClientID}
 	sort.Strings(ids)
 	subject := fmt.Sprintf("channel.private.%s.%s", channelID, strings.Join(ids, "."))
@@ -275,11 +267,9 @@ func (ch *PrivateChannel) Init() error {
 			return
 		}
 
-		// Filter: skip own messages
 		if msg.Sender == ch.clientID {
 			return
 		}
-		// Only accept from target
 		if msg.Sender != ch.targetClientID {
 			return
 		}
@@ -297,7 +287,6 @@ func (ch *PrivateChannel) Init() error {
 
 		switch msg.Type {
 		case "message":
-			// Filter handshake messages
 			if m, ok := msg.Data.(map[string]any); ok {
 				if _, isHandshake := m["__handshake"]; isHandshake {
 					return
@@ -323,7 +312,6 @@ func (ch *PrivateChannel) Init() error {
 	}
 	ch.unsub = unsub
 
-	// Send handshake
 	_ = ch.sendRaw(ChannelMessage{
 		Type:   "message",
 		Data:   HandshakeData{Handshake: true},
@@ -369,8 +357,7 @@ func (ch *PrivateChannel) Request(ctx context.Context, data any, timeout ...time
 	return ch.client.Request(ctx, subject, data, t)
 }
 
-// OnRequest registers a handler for request/reply on this private channel.
-// The subscription is tracked so Close()/cleanup releases it.
+// OnRequest registers a request/reply handler on this private channel.
 func (ch *PrivateChannel) OnRequest(handler func(data []byte) (any, error)) (func(), error) {
 	ids := []string{ch.clientID, ch.targetClientID}
 	sort.Strings(ids)
@@ -445,7 +432,6 @@ func (ch *PrivateChannel) cleanup() error {
 	ch.onClose = nil
 	ch.onError = nil
 
-	// Release request/reply subscriptions collected via OnRequest.
 	ch.mu.Lock()
 	requestUnsubs := ch.requestUnsubs
 	ch.requestUnsubs = nil

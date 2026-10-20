@@ -82,7 +82,7 @@ async function testTarget(clientName: string, target: string): Promise<boolean> 
       batchesConsumed++;
     }
 
-    // Allow trailing callback messages to land.
+    // let trailing callback messages land
     await new Promise((r) => setTimeout(r, 100));
 
     const orderOk = received.every((r, i) => {

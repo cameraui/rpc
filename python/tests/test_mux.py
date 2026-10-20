@@ -1,10 +1,3 @@
-"""Tests for the muxed reply inbox (behavioral spec: node/test/mux.test.ts).
-
-A minimal mock NATS connection captures subscriptions and published
-messages; replies are delivered manually by invoking the captured
-subscription callbacks — no server involved.
-"""
-
 import asyncio
 import re
 from types import SimpleNamespace
@@ -60,7 +53,7 @@ def make_client(**overrides: Any) -> tuple[RPCClient, MockNC]:
     options: dict[str, Any] = {
         "servers": ["nats://127.0.0.1:4222"],
         "name": "mux-test",
-        # Retries would re-publish and slow the 503 tests down — disable.
+        # retries would re-publish and slow the 503 tests down
         "no_responder_retry": {"max_retries": 0, "delays": [0.001]},
     }
     options.update(overrides)
@@ -70,7 +63,6 @@ def make_client(**overrides: Any) -> tuple[RPCClient, MockNC]:
 
 
 def mux_sub(client: RPCClient, nc: MockNC) -> MockSub:
-    """The single wildcard mux subscription of a client."""
     prefix = client._reply_prefix  # pyright: ignore[reportPrivateUsage]
     matches = [s for s in nc.subs if s.pattern == f"rpc.reply.{prefix}.>"]
     assert len(matches) == 1
@@ -114,7 +106,6 @@ def test_routes_response_to_pending_call_by_envelope_id() -> None:
         task = asyncio.create_task(client.call("rpc.test.echo", "hello"))
         await until(lambda: len(nc.published) == 1)
 
-        # Request went out with reply = the call's own muxed reply subject.
         request = decode(nc.published[0]["data"])
         assert request["id"].startswith(f"{prefix}.")
         assert nc.published[0]["reply"] == f"rpc.reply.{request['id']}"
@@ -125,7 +116,6 @@ def test_routes_response_to_pending_call_by_envelope_id() -> None:
         await sub.cb(make_msg(f"rpc.reply.{request['id']}", encode({"id": request["id"], "result": "world"})))
 
         assert await task == "world"
-        # Settled call leaves no pending entry behind.
         assert len(client.pending_requests) == 0
 
     asyncio.run(run())
@@ -149,7 +139,7 @@ def test_single_mux_subscription_across_many_calls() -> None:
                 make_msg(f"rpc.reply.{req['id']}", encode({"id": req["id"], "result": req["params"]}))
             )
         await asyncio.gather(*tasks)
-        # Only the wildcard mux — no per-call subscriptions.
+        # only the wildcard mux, no per-call subscriptions
         assert len(nc.subs) == 1
 
     asyncio.run(run())
@@ -166,7 +156,6 @@ def test_routes_out_of_order_responses_correctly() -> None:
         req1, req2 = (decode(p["data"]) for p in nc.published)
         sub = mux_sub(client, nc)
 
-        # Answer the second call first.
         await sub.cb(make_msg(f"rpc.reply.{req2['id']}", encode({"id": req2["id"], "result": 2})))
         await sub.cb(make_msg(f"rpc.reply.{req1['id']}", encode({"id": req1["id"], "result": 1})))
 
@@ -254,8 +243,7 @@ def test_rejects_pending_call_with_no_responders_on_503_status() -> None:
         await until(lambda: len(nc.published) == 1)
         req = decode(nc.published[0]["data"])
 
-        # NATS no-responder status: empty payload + status header 503 on the
-        # reply subject.
+        # no-responder status: empty payload and a 503 status header on the reply subject
         await mux_sub(client, nc).cb(make_msg(f"rpc.reply.{req['id']}", b"", headers=no_responder_headers()))
 
         with pytest.raises(errors.NoRespondersError):
@@ -269,7 +257,6 @@ def test_routes_503_to_registered_status_handler_one_shot() -> None:
     async def run() -> None:
         client, nc = make_client()
 
-        # Force mux creation without an RPC call.
         await client._ensure_mux_subscription()  # pyright: ignore[reportPrivateUsage]
         prefix = client._reply_prefix  # pyright: ignore[reportPrivateUsage]
         token = f"{prefix}.iter-token"
@@ -282,9 +269,9 @@ def test_routes_503_to_registered_status_handler_one_shot() -> None:
 
         assert len(received) == 1
         assert isinstance(received[0], errors.NoRespondersError)
-        # One-shot: the registration is consumed (max_msgs=1 semantics) …
+        # one-shot: the registration is consumed
         assert len(client.status_handlers) == 0
-        # … so a second status is dropped silently.
+        # so a second status is dropped silently
         await sub.cb(make_msg(f"rpc.reply.{token}", b"", headers=no_responder_headers()))
         assert len(received) == 1
 
@@ -301,7 +288,6 @@ def test_reassembles_chunked_responses_and_routes_by_envelope_id() -> None:
         reply_subject = f"rpc.reply.{req['id']}"
         sub = mux_sub(client, nc)
 
-        # Build a chunked response exactly like publish() would.
         big_result = "x" * 1000
         encoded = encode({"id": req["id"], "result": big_result})
         chunk_size = 100
@@ -351,7 +337,7 @@ def test_drops_responses_for_unknown_ids_silently() -> None:
         req = decode(nc.published[0]["data"])
         sub = mux_sub(client, nc)
 
-        # Foreign/late response — must not settle or throw.
+        # a foreign or late response must not settle or throw
         await sub.cb(make_msg("rpc.reply.someone.else", encode({"id": "someone.else", "result": "nope"})))
 
         await sub.cb(make_msg(f"rpc.reply.{req['id']}", encode({"id": req["id"], "result": "mine"})))
@@ -372,7 +358,7 @@ def test_times_out_and_ignores_late_response() -> None:
             await task
         assert len(client.pending_requests) == 0
 
-        # Late response after the timeout must be a no-op.
+        # a late response after the timeout is a no-op
         await mux_sub(client, nc).cb(
             make_msg(f"rpc.reply.{req['id']}", encode({"id": req["id"], "result": "late"}))
         )

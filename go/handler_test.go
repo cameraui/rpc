@@ -61,7 +61,6 @@ func TestExtractMethodsStruct(t *testing.T) {
 
 	methods := ExtractMethods(handler)
 
-	// Should have: getSnapshot, generateFrames, db.find, db.delete
 	expectedMethods := []string{"getSnapshot", "generateFrames", "db.find", "db.delete"}
 
 	for _, name := range expectedMethods {
@@ -265,7 +264,6 @@ func TestExtractCallbackParams(t *testing.T) {
 	}
 }
 
-// Test handler with func(T) parameter for callback
 type testCallbackHandler struct{}
 
 type testEvent struct {
@@ -273,9 +271,8 @@ type testEvent struct {
 }
 
 func (h *testCallbackHandler) OnEvents(prefix string, callback func(testEvent)) (func(), error) {
-	// Simulate: store callback, return cleanup
 	callback(testEvent{Value: prefix + ":initial"})
-	return func() { /* cleanup */ }, nil
+	return func() {}, nil
 }
 
 func TestExtractMethodsWithCallback(t *testing.T) {
@@ -292,7 +289,6 @@ func TestCallbackHandlerParamDetection(t *testing.T) {
 	methods := ExtractMethods(handler)
 	fn := methods["onEvents"]
 
-	// Verify the function has a func parameter
 	fnType := fn.Type()
 	hasFuncParam := false
 	for in := range fnType.Ins() {

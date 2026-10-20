@@ -240,8 +240,6 @@ class FakeWriter:
 
 
 class QueuedTransport(TcpTransport):
-    """Bytes leave only on drain, like nats-py's WebSocketTransport."""
-
     def __init__(self) -> None:
         super().__init__()
         self.queued: list[bytes] = []

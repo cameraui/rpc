@@ -1,5 +1,3 @@
-"""Utility functions for the RPC library."""
-
 import inspect
 import secrets
 import time
@@ -16,51 +14,25 @@ if TYPE_CHECKING:
 T = TypeVar("T")
 
 DIRECT_SUBJECT_METADATA = "cui.chunk.direct"
-"""Service metadata: each instance also takes requests on its own subject, see direct_subject()."""
 
 
 def direct_subject(instance_id: str, path: str) -> str:
-    """The subject of one service instance for an endpoint.
-
-    The header and chunks of a chunked request go there: a queue group would
-    hand them to different instances.
-    """
     return f"$CUI.SVC.{instance_id}.{path}"
 
 
 def service_subject(service_name: str, path: str) -> str:
-    """The endpoint subject only this service has, next to the bare one services with the same method share."""
     return f"svc.{service_name}.{path}"
 
 
-# Base36 alphabet, matching the Node implementation's
-# Math.random().toString(36) suffix.
 _ID_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
 
 def generate_id(reply_prefix: str | None = None) -> str:
-    """Generate a unique ID for requests.
-
-    Format: ``<ms-timestamp>-<9 random base36 chars>``. Nine random
-    characters (~46 bits) keep the collision risk negligible even for
-    bursts of IDs within the same millisecond.
-
-    With ``reply_prefix``, the prefix becomes the first dot-separated
-    segment of the id (``<prefix>.<id>``) so the reply subject derived from
-    the id falls under the client's muxed reply inbox wildcard
-    (``rpc.reply.<prefix>.>``).
-    """
     request_id = f"{int(time.time() * 1000)}-{''.join(choices(_ID_CHARS, k=9))}"
     return f"{reply_prefix}.{request_id}" if reply_prefix else request_id
 
 
 def generate_reply_prefix() -> str:
-    """Generate a client-local reply prefix: 10 base36 chars (48 random bits).
-
-    Used as the first dot-separated segment of every call id when no conn_id
-    is configured, so all reply subjects of a client share one
-    wildcard-subscribable prefix (``rpc.reply.<prefix>.>``).
-    """
     value = secrets.randbits(48)
     chars: list[str] = []
     while value:
@@ -70,37 +42,12 @@ def generate_reply_prefix() -> str:
 
 
 class RPCCallbacks:
-    """Explicit marker wrapping a dict of callback functions.
-
-    Pass an instance as the last argument to a pull-callback RPC method.
-    The proxy detects the marker and routes the call through
-    ``call_pull_iterator_with_callback``.
-
-    Example::
-
-        cbs = rpc_callbacks(
-            on_item=lambda data: queue.append(data),
-            on_end_of_batch=lambda: batch_end.set(),
-            oneway=["on_item", "on_end_of_batch"],
-        )
-
-        async for _ in service.pull_batches(count, chunks, cbs):
-            # batch boundary — apply backpressure here
-            pass
-    """
-
     def __init__(self, methods: dict[str, Any], oneway: list[str]) -> None:
         self.methods = methods
         self.oneway = oneway
 
 
 def rpc_callbacks(**kwargs: Any) -> RPCCallbacks:
-    """Build an RPCCallbacks bundle from keyword arguments.
-
-    Special keyword ``oneway`` is a list of method names that should be
-    dispatched as oneway (fire-and-forget) by the server. If omitted, all
-    methods are treated as oneway.
-    """
     oneway = kwargs.pop("oneway", None)
     methods: dict[str, Any] = {}
     for name, val in kwargs.items():
@@ -112,42 +59,33 @@ def rpc_callbacks(**kwargs: Any) -> RPCCallbacks:
 
 
 def is_rpc_callbacks(v: Any) -> bool:
-    """True if the value is an RPCCallbacks bundle (as produced by rpc_callbacks())."""
     return isinstance(v, RPCCallbacks)
 
 
 def is_generator(func: Any) -> bool:
-    """Check if a function returns a generator."""
     if not callable(func):
         return False
 
-    # Check if it's a generator function
     return is_sync_generator(func) or is_async_generator(func)
 
 
 def is_sync_generator(func: Any) -> bool:
-    """Check if a function returns a synchronous generator."""
     if not callable(func):
         return False
 
-    # Check if it's a generator function
     return inspect.isgeneratorfunction(func) or inspect.isgenerator(func)
 
 
 def is_async_generator(func: Any) -> bool:
-    """Check if a function returns an async generator."""
     if not callable(func):
         return False
 
-    # Check if it's a coroutine function that might return an async generator
     if inspect.isasyncgenfunction(func):
         return True
 
-    # Check return annotation
     if hasattr(func, "__annotations__"):
         return_annotation = func.__annotations__.get("return")
         if return_annotation:
-            # Check if it's AsyncGenerator type
             origin = getattr(return_annotation, "__origin__", None)
             if origin is AsyncGenerator:
                 return True
@@ -156,20 +94,13 @@ def is_async_generator(func: Any) -> bool:
 
 
 def is_async_function(func: Any) -> bool:
-    """Check if a function is an async function.
-
-    Callers on hot paths should evaluate this once at handler-registration
-    time and reuse the result instead of re-checking per message.
-    """
     if not callable(func):
         return False
 
-    # Check if it's a coroutine function
     return inspect.iscoroutinefunction(func) or inspect.iscoroutine(func) or inspect.isawaitable(func)
 
 
 def method_roots(methods: Collection[str]) -> set[str]:
-    """The first path segment of every method name, what a proxy's top-level attribute can be."""
     return {name.split(".", 1)[0] for name in methods if isinstance(name, str)}
 
 
@@ -195,7 +126,6 @@ def _route_call(
     namespace: str | None = None,
     method_cache: list[Collection[str] | None] | None = None,
 ) -> Any:
-    """Route a proxy call by its arguments and method name, _PLAIN_CALL for a plain call."""
     if args:
         for i, arg in enumerate(args):
             if is_rpc_callbacks(arg):
@@ -222,12 +152,6 @@ def _route_call(
 
 
 class CallableProxy:
-    """A remote method of an RPCProxy: call it, or await it to call it without arguments.
-
-    Attribute access goes one level deeper, ``proxy.db.find()`` calls the
-    method ``db.find``.
-    """
-
     __slots__ = (
         "_cache",
         "_children",
@@ -314,13 +238,6 @@ class CallableProxy:
 
 
 class RPCProxy:
-    """Proxy for a namespace: attribute access returns a CallableProxy for that remote method.
-
-    Once a response filled the method cache, unknown top-level names return
-    None. State lives in name-mangled attributes so it never hides a remote
-    method; there are no __slots__ because isolated proxies get attributes set.
-    """
-
     def __init__(
         self,
         client: "RPCClient",
@@ -334,7 +251,7 @@ class RPCProxy:
         self.__namespace = namespace
         self.__path = path
         self.__prefix = "".join(f"{part}." for part in path)
-        # [method names, their first segments], the second is derived on first use: a one-call proxy never needs it
+        # [method names, their first segments], the second is built on first use
         self.__cache: list[Collection[str] | None] = [method_cache, None]
         self.__callables: dict[str, CallableProxy] = {}
         self.__no_responder_retry = no_responder_retry
@@ -379,33 +296,10 @@ def create_proxy(
     no_responder_retry: "NoResponderRetryOptions | None" = None,
     timeout: int | None = None,
 ) -> Any:
-    """
-    Create a proxy for RPC calls with support for nested objects.
-
-    Args:
-        client: RPC client with call and call_stream methods
-        namespace: RPC namespace
-        path: Current path in proxy hierarchy
-        method_cache: Shared method cache for method discovery
-        no_responder_retry: Retry config passed to every call and stream of
-            this proxy
-        timeout: Call timeout in milliseconds passed to every call of this
-            proxy
-
-    Returns:
-        Proxy that intercepts attribute access and method calls
-    """
     return RPCProxy(client, namespace, list(path) if path else [], method_cache, no_responder_retry, timeout)
 
 
 class ServiceCallableProxy:
-    """An endpoint of a ServiceProxy.
-
-    A call too big for one message goes to ``direct``, the subject of the
-    discovered instance, when the service has one: a queue group would hand
-    its chunks to different instances.
-    """
-
     __slots__ = ("_client", "_direct", "_mode", "_subject")
 
     def __init__(self, client: "RPCClient", subject: str, name: str, direct: str | None = None) -> None:
@@ -424,12 +318,6 @@ class ServiceCallableProxy:
 
 
 class ServiceProxy:
-    """Proxy for a discovered service: attributes resolve to endpoints or nested groups.
-
-    The endpoint index is built once per service proxy tree and resolved
-    children are cached, both outside the instance dict.
-    """
-
     def __init__(
         self,
         client: "RPCClient",
@@ -494,18 +382,6 @@ def _endpoint_index(service_info: ServiceInfo) -> tuple[dict[str, Any], frozense
 def create_service_proxy(
     client: "RPCClient", service_info: ServiceInfo, timeout: int | None = None, path: list[str] | None = None
 ) -> Any:
-    """
-    Create a service proxy with proper streaming support.
-
-    Args:
-        client: RPC client instance
-        service_info: Service information from discovery
-        timeout: Optional timeout for requests
-        path: Current path in proxy hierarchy
-
-    Returns:
-        Proxy that intercepts attribute access and method calls
-    """
     return ServiceProxy(
         client, service_info, timeout, list(path) if path else [], _endpoint_index(service_info)
     )

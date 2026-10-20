@@ -183,8 +183,7 @@ func TestDecodeFallbackIntoPartiallyFilledStruct(t *testing.T) {
 		Timestamp int64 `msgpack:"timestamp"`
 	}
 
-	// the float timestamp forces the coercion fallback, and the first attempt
-	// has already put a bool behind the any field by then
+	// the float timestamp forces the coercion fallback after the first attempt put a bool behind the any field
 	encoded, err := Encode([]any{
 		map[string]any{"value": true, "timestamp": float64(1755800000000)},
 		map[string]any{"value": false, "timestamp": float64(1755800001000)},

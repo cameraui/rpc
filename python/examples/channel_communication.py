@@ -6,7 +6,7 @@ import uvloop
 
 from camera_ui_rpc import Channel, RPCClient, create_rpc_client
 
-large_buffer = b"x" * (2 * 1024 * 1024)  # 2MB
+large_buffer = b"x" * (2 * 1024 * 1024)
 
 
 class ChannelInfo(TypedDict):

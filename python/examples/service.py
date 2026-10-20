@@ -107,7 +107,7 @@ async def main():
             name="compute",
             version="1.0.0",
             description="High-performance compute service",
-            queue_group="compute-workers",  # Enable load balancing
+            queue_group="compute-workers",  # load balanced
             metadata={
                 "host": "server1",
                 "gpu": "true",
@@ -137,7 +137,7 @@ async def main():
             name="compute",
             version="1.0.0",
             description="High-performance compute service",
-            queue_group="compute-workers",  # Same queue for load balancing
+            queue_group="compute-workers",  # same queue, load balanced
             metadata={
                 "host": "server2",
                 "gpu": "false",

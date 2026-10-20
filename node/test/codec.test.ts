@@ -136,8 +136,7 @@ describe('codec', () => {
 
 describe('message codec (CUIB wire format)', () => {
   const bytes = (length: number, fill = 7): Uint8Array => new Uint8Array(length).fill(fill);
-  // Extractable sizes are expressed relative to the threshold so the tests
-  // survive threshold tuning.
+  // sizes relative to the threshold, so the tests survive tuning it
   const T = BINARY_EXTRACT_THRESHOLD;
 
   describe('framing', () => {
@@ -151,14 +150,14 @@ describe('message codec (CUIB wire format)', () => {
       const message = { id: 'abc', params: [bin] };
       const encoded = encodeMessage(message);
 
-      // Magic "CUIB"
+      // "CUIB"
       expect(Array.from(encoded.subarray(0, 4))).toEqual([0x43, 0x55, 0x49, 0x42]);
 
       const envLen = new DataView(encoded.buffer, encoded.byteOffset).getUint32(4, true);
       const envelope = decode(encoded.subarray(8, 8 + envLen));
       expect(envelope).toEqual({ id: 'abc', params: [{ __cui_bin__: 0, l: T + 1024 }] });
 
-      // Segment lies back-to-back after the envelope
+      // the segment follows the envelope directly
       expect(encoded.byteLength).toBe(8 + envLen + T + 1024);
       expect(Buffer.from(encoded.subarray(8 + envLen))).toEqual(Buffer.from(bin));
     });
@@ -266,7 +265,7 @@ describe('message codec (CUIB wire format)', () => {
       const result = decodeMessage<any>(encoded);
       const view: Uint8Array = result.params[0];
       expect(view.buffer).toBe(encoded.buffer);
-      // Mutating the receive buffer is visible through the view (no copy).
+      // the view shares the receive buffer, no copy
       encoded[encoded.byteLength - 1] = 0x99;
       expect(view[view.byteLength - 1]).toBe(0x99);
     });
@@ -292,8 +291,7 @@ describe('message codec (CUIB wire format)', () => {
     });
 
     it('leaves placeholder-shaped user maps untouched in binary-free messages', () => {
-      // Without extracted binaries there is no CUIB frame, hence no
-      // placeholder substitution at all.
+      // no extracted binaries, no CUIB frame, so no placeholder substitution
       const message = { params: [{ __cui_bin__: 0, l: 123 }] };
       const result = messageRoundtrip<any>(message);
       expect(result.params[0]).toEqual({ __cui_bin__: 0, l: 123 });
@@ -302,9 +300,7 @@ describe('message codec (CUIB wire format)', () => {
 
   describe('out-of-order placeholders', () => {
     it('restores segments whose placeholders appear out of traversal order', () => {
-      // A port whose map serialization order differs from its extraction
-      // order (e.g. Go map iteration) may emit placeholder 1 before 0 in
-      // the envelope. Segments still lie back-to-back in index order.
+      // another port may emit placeholder 1 before 0 (Go map order), segments stay in index order
       const seg0 = bytes(T, 0xaa);
       const seg1 = bytes(T + 2048, 0xbb);
       const envelope = encode({ b: { __cui_bin__: 1, l: T + 2048 }, a: { __cui_bin__: 0, l: T } });
@@ -389,7 +385,6 @@ describe('message codec (CUIB wire format)', () => {
 });
 
 describe('typed arrays other than Uint8Array', () => {
-  // the bytes a value holds, little-endian on every platform this runs on
   function bytesOf(value: ArrayBufferView): Buffer {
     return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
   }

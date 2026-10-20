@@ -45,7 +45,7 @@ run_phase() {
         TOTAL_PASSED=$((TOTAL_PASSED + 1))
     fi
 
-    return 0  # Don't fail the whole script on individual phase failure
+    return 0  # a failed phase must not stop the script
 }
 
 echo -e "${GREEN}Cross-Language MessagePack Codec Tests${NC}"

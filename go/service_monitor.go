@@ -109,9 +109,6 @@ func (m *ServiceMonitor) Stats(ctx context.Context, name string, timeout ...time
 	return collectResponses[ServiceStatsResponse](m.client, ctx, subject, t)
 }
 
-// collectResponses sends a broadcast request and collects responses. It waits
-// up to timeout for the first reply, then for more as long as each follows the
-// previous within 10ms. A no-responder status ends it at once.
 func collectResponses[T any](client *Client, ctx context.Context, subject string, timeout time.Duration) ([]T, error) {
 	client.mu.RLock()
 	nc := client.nc
@@ -131,7 +128,7 @@ func collectResponses[T any](client *Client, ctx context.Context, subject string
 		return nil, err
 	}
 
-	const stall = 10 * time.Millisecond
+	const stall = 10 * time.Millisecond // after the first reply, each next one must follow within this
 	results := make([]T, 0)
 	deadline := time.Now().Add(timeout)
 	wait := timeout

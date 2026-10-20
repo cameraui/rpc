@@ -19,7 +19,6 @@ type pullInitPeers struct {
 	stopped      atomic.Bool
 }
 
-// the handler's setup blocks until release, its producer runs until its session ends
 func newPullInitPeers(t *testing.T) *pullInitPeers {
 	t.Helper()
 	p := &pullInitPeers{s: startFakeNATS(t), entered: make(chan struct{}, 4), release: make(chan struct{})}
@@ -131,9 +130,8 @@ func testPullInitEnds(t *testing.T, kind, ending string) {
 	}
 }
 
-// the second init waits on the responder behind the first one's setup, it has
-// no session there yet that an early cancel could end
 func TestPullInitQueuedBehindASetupEndsItsSession(t *testing.T) {
+	// the second init waits behind the first one's setup and has no session yet that an early cancel could end
 	for _, ending := range []string{"cancel", "deadline"} {
 		t.Run(ending, func(t *testing.T) {
 			p := newPullInitPeers(t)

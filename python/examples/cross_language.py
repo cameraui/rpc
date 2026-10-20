@@ -79,7 +79,7 @@ async def run_python_server(targets: list[str]):
 
     async def get_large_data() -> dict[str, Any]:
         print("[Python] Creating 20MB test data...")
-        size = 20 * 1024 * 1024  # 20MB
+        size = 20 * 1024 * 1024
         data = bytearray(size)
 
         for i in range(size):
@@ -148,7 +148,7 @@ async def run_python_server(targets: list[str]):
     async def on_message(msg: dict[str, Any]) -> None:
         print(f"[Python Channel] Received: {msg}")
 
-        # Respond to initial messages from any other service, not responses
+        # answer initial messages from other services, not responses
         if msg.get("from") != "python" and msg.get("type") != "response":
             await channel.send(
                 {
@@ -162,7 +162,7 @@ async def run_python_server(targets: list[str]):
     channel.on("message", on_message)
     print("Python channel ready")
 
-    # Wait a bit for other services to set up
+    # let the other services set up
     await asyncio.sleep(3)
 
     print("\nPython calling target services...\n")
@@ -259,8 +259,7 @@ async def run_python_server(targets: list[str]):
             traceback.print_exc()
             failures += 1
 
-        # Error propagation: the peer handler raises; it must reach us as an
-        # exception carrying the same message, not a silent success.
+        # the peer handler raises, it must arrive as an exception with the same message
         err_token = f"boom python->{target}"
         try:
             await proxy.raiseError(err_token)

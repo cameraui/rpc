@@ -18,7 +18,6 @@ describe('muxed reply inbox', () => {
 
     const promise = client.call('rpc.test.echo', 'hello');
 
-    // Request went out with reply = the call's own muxed reply subject.
     expect(nc.published.length).toBe(1);
     const request = decode(nc.published[0].data) as RPCMessage;
     expect(request.id.startsWith(`${prefix}.`)).toBe(true);
@@ -34,7 +33,6 @@ describe('muxed reply inbox', () => {
     });
 
     await expect(promise).resolves.toBe('world');
-    // Settled call leaves no pending entry behind.
     expect(((client as any).pendingRequests as Map<string, any>).size).toBe(0);
   });
 
@@ -45,13 +43,12 @@ describe('muxed reply inbox', () => {
     const p2 = client.call('rpc.a.two');
     const p3 = client.call('rpc.a.three');
 
-    const sub = muxSub(client, nc); // asserts count === 1
+    const sub = muxSub(client, nc); // asserts a single mux subscription
     for (const pub of nc.published) {
       const req = decode(pub.data) as RPCMessage;
       sub.callback(null, { subject: `rpc.reply.${req.id}`, data: encode({ id: req.id, result: req.params }) });
     }
     await Promise.all([p1, p2, p3]);
-    // Only the wildcard mux — no per-call subscriptions.
     expect(nc.subs.length).toBe(1);
   });
 
@@ -64,7 +61,7 @@ describe('muxed reply inbox', () => {
     const [req1, req2] = nc.published.map((p) => decode(p.data) as RPCMessage);
     const sub = muxSub(client, nc);
 
-    // Answer the second call first.
+    // answer the second call first
     sub.callback(null, { subject: `rpc.reply.${req2.id}`, data: encode({ id: req2.id, result: 2 }) });
     sub.callback(null, { subject: `rpc.reply.${req1.id}`, data: encode({ id: req1.id, result: 1 }) });
 
@@ -109,7 +106,7 @@ describe('muxed reply inbox', () => {
     const promise = client.call('rpc.ghost.method');
     const req = decode(nc.published[0].data) as RPCMessage;
 
-    // NATS no-responder status: empty payload + code 503 on the reply subject.
+    // a no-responder status: empty payload, code 503
     muxSub(client, nc).callback(null, {
       subject: `rpc.reply.${req.id}`,
       data: new Uint8Array(0),
@@ -123,7 +120,6 @@ describe('muxed reply inbox', () => {
   it('routes a 503 status to a registered status handler (one-shot) instead of pendingRequests', async () => {
     const { client, nc } = createClient();
 
-    // Force mux creation without an RPC call.
     (client as any).ensureMuxSubscription();
     const prefix = (client as any).replyPrefix as string;
     const token = `${prefix}.iter-token`;
@@ -136,9 +132,8 @@ describe('muxed reply inbox', () => {
 
     expect(received.length).toBe(1);
     expect(received[0]).toBeInstanceOf(errors.NoRespondersError);
-    // One-shot: the registration is consumed (max:1 inbox semantics) …
+    // one-shot, a second status is dropped
     expect(((client as any).statusHandlers as Map<string, any>).size).toBe(0);
-    // … so a second status is dropped silently.
     sub.callback(null, { subject: `rpc.reply.${token}`, data: new Uint8Array(0), headers: emptyHeaders(503) });
     expect(received.length).toBe(1);
   });
@@ -151,7 +146,6 @@ describe('muxed reply inbox', () => {
     const replySubject = `rpc.reply.${req.id}`;
     const sub = muxSub(client, nc);
 
-    // Build a chunked response exactly like publish() would.
     const bigResult = 'x'.repeat(1000);
     const encoded = encode({ id: req.id, result: bigResult });
     const chunkSize = 100;
@@ -186,7 +180,7 @@ describe('muxed reply inbox', () => {
     const req = decode(nc.published[0].data) as RPCMessage;
     const sub = muxSub(client, nc);
 
-    // Foreign/late response — must not settle or throw.
+    // a foreign response must not settle or throw
     sub.callback(null, { subject: 'rpc.reply.someone.else', data: encode({ id: 'someone.else', result: 'nope' }) });
 
     sub.callback(null, { subject: `rpc.reply.${req.id}`, data: encode({ id: req.id, result: 'mine' }) });
@@ -202,7 +196,7 @@ describe('muxed reply inbox', () => {
     await expect(promise).rejects.toMatchObject({ code: 'TIMEOUT' });
     expect(((client as any).pendingRequests as Map<string, any>).size).toBe(0);
 
-    // Late response after the timeout must be a no-op.
+    // a late response after the timeout is a no-op
     muxSub(client, nc).callback(null, { subject: `rpc.reply.${req.id}`, data: encode({ id: req.id, result: 'late' }) });
   });
 
@@ -221,7 +215,6 @@ describe('muxed reply inbox', () => {
   });
 });
 
-// transfers open in the chunk managers of the handler subscriptions
 function openTransfers(client: ReturnType<typeof createClient>['client']): number {
   let open = 0;
   for (const scope of (client as any).chunkScopes.values()) open += scope.manager?.size ?? 0;
@@ -240,7 +233,6 @@ function withIndex<T extends { headers: ReturnType<typeof headersWith> }>(chunk:
   return { ...chunk, headers: headersWith({ 'x-chunked-transfer': 'chunk', 'x-chunk-id': chunk.headers.get('x-chunk-id')!, 'x-chunk-index': index }) };
 }
 
-// the chunk one byte shorter or longer
 function resized<T extends { data: Uint8Array }>(chunk: T, delta: -1 | 1): T {
   return { ...chunk, data: delta < 0 ? chunk.data.subarray(1) : Uint8Array.from([...chunk.data, 0]) };
 }

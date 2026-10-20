@@ -27,30 +27,16 @@ var (
 	legacyRetryDelays = []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second}
 )
 
-// subscriptionEntry represents one Subscribe/SubscribeQueue call. Entries are
-// stable across Suspend()/Connect() cycles so the unsubscribe closure a caller
-// holds keeps working after a restore. Multiple subscribers on the same
-// pattern coexist — each gets its own entry and its own NATS subscription.
 type subscriptionEntry struct {
-	pattern string
-	queue   string
-	handler func(data []byte)
-	// routed replaces handler for a wildcard pattern whose handler needs the subject
-	routed func(subject string, data []byte)
-	// rawHandler switches the entry to raw mode: it receives the undecoded
-	// *nats.Msg (with headers and subject) instead of decoded payload data.
-	// No chunk reassembly — used by the muxed reply inbox, which routes
-	// chunks itself. Mutually exclusive with handler.
+	pattern    string
+	queue      string
+	handler    func(data []byte)
+	routed     func(subject string, data []byte)
 	rawHandler func(msg *nats.Msg)
 	opts       []func(*nats.Subscription)
 	sub        *nats.Subscription
-	// two subscriptions matching one publish both see the same transfer id,
-	// so each assembles its own copy; queue members of one client share a
-	// scope, since the server spreads one transfer across them
-	chunks *chunkScope
-	// the method a subject of a namespace subscription goes to, "" for one its
-	// handler does not serve; each method gets transfers of its own, as with a
-	// subscription per method
+	// queue members of one client share a scope, the server spreads one transfer across them
+	chunks    *chunkScope
 	chunkLane func(subject string) string
 }
 
@@ -74,16 +60,10 @@ type Client struct {
 	maxPayloadSize  int
 	chunkingManager *ChunkingManager
 	chunkBudget     *transferBudget
-	// the payload limit is below minPayloadLimit: maxPayloadSize is that limit
-	// and a larger message fails instead of going out in chunks
-	unchunked bool
-	// the connection Suspend or Disconnect is closing, its closed handler is ignored
-	closingConn *nats.Conn
-	// nats.go closed the connection for good, the next Connect replaces it and
-	// runs the OnReconnect handlers
-	connLost bool
-	// when the current connection came up, it decides how soon the first reconnect runs
-	connectedAt atomic.Pointer[time.Time]
+	unchunked       bool
+	closingConn     *nats.Conn
+	connLost        bool
+	connectedAt     atomic.Pointer[time.Time]
 
 	subSeq         int
 	subEntries     map[int]*subscriptionEntry
@@ -93,32 +73,18 @@ type Client struct {
 	handlerRegs    map[*handlerRegistration]struct{}
 	subMu          sync.Mutex
 
-	// replyPrefix is the first dot-separated segment of every id this client
-	// generates. Equals Options.ConnID when configured (firewall allowlists
-	// `rpc.reply.<connId>.>` for such clients), otherwise a local random
-	// prefix. All reply subjects derived from those ids therefore fall under
-	// one wildcard: `rpc.reply.<replyPrefix>.>` — the muxed reply inbox.
+	// first segment of every generated id, so all replies match rpc.reply.<replyPrefix>.>
 	replyPrefix string
 
-	// muxEntry is the single persistent reply-mux subscription entry
-	// (wildcard `rpc.reply.<replyPrefix>.>`). Lives in subEntries so
-	// Suspend()/Connect() restore it like any other subscription.
-	// Guarded by subMu.
+	// the reply mux, kept in subEntries so a restore brings it back; guarded by subMu
 	muxEntry *subscriptionEntry
 
-	// statusHandlers holds 503/no-responder handlers keyed by reply-subject
-	// suffix (the part after `rpc.reply.`). Used by pull-iterator/stream
-	// paths whose per-message reply subject only ever carries no-responder
-	// statuses. One-shot: the mux dispatcher removes an entry when it fires
-	// (mirrors the previous per-iterator `AutoUnsubscribe(1)` inboxes).
+	// one-shot 503 handlers, keyed by the reply subject after rpc.reply.
 	statusHandlers sync.Map // map[string]func(error)
 
 	pendingRequests sync.Map // map[string]*pendingRequest
 	streamHandlers  sync.Map // map[string]*streamHandler
 
-	// Settle hooks for client-side pull iterators: a consumer parked in a
-	// next() wait must be force-settled when the connection tears down,
-	// otherwise it hangs forever (streamHandlers get the same treatment).
 	pullIteratorSettles sync.Map // map[string]func()
 
 	isolatedClients   []*Client
@@ -134,30 +100,19 @@ type Client struct {
 }
 
 type pendingRequest struct {
-	done chan struct{}
-	// cleanup tears down per-call subscriptions. Only the legacy service
-	// path (`<subject>.reply.<id>`) still holds any — mux-path calls leave
-	// it nil. Idempotent; invoked from the call's own exit path and from
-	// Disconnect()/Suspend() so a suspended in-flight call doesn't restore a
-	// dead reply subscription on the next Connect().
-	cleanup func()
-	// subject is the request subject — used for the no-responder error
-	// message when a 503 status arrives on the call's muxed reply subject.
-	subject string
-	result  any
-	err     error
-	// the mux routes by reply subject and hands the reply over undecoded, the
-	// caller decodes it
-	raw []byte
-	// set on the mux goroutine, read by the call when it gives up
+	done        chan struct{}
+	cleanup     func()
+	subject     string
+	result      any
+	err         error
+	raw         []byte
 	transferKey atomic.Pointer[string]
 }
 
 type streamHandler struct {
-	push  func(any)
-	end   func()
-	error func(error)
-	// the request subject of the stream start
+	push    func(any)
+	end     func()
+	error   func(error)
 	subject string
 }
 
@@ -178,8 +133,7 @@ func NewClient(opts ClientOptions) *Client { //nolint:gocritic // opts is copied
 	if opts.WriteBufferSize == 0 {
 		opts.WriteBufferSize = 1 << 20
 	}
-	// With a ConnID the prefix MUST be exactly the ConnID — a server-side
-	// firewall may allowlist `rpc.reply.<connId>.>` for such clients.
+	// with a ConnID the prefix must be exactly the ConnID, a firewall may allowlist rpc.reply.<connId>.>
 	replyPrefix := opts.ConnID
 	if replyPrefix == "" {
 		replyPrefix = GenerateReplyPrefix()
@@ -190,7 +144,7 @@ func NewClient(opts ClientOptions) *Client { //nolint:gocritic // opts is copied
 	replies.maxTransfers = 0
 	return &Client{
 		Options:         opts,
-		maxPayloadSize:  1024 * 1024, // 1MB default
+		maxPayloadSize:  1024 * 1024,
 		chunkingManager: replies,
 		chunkBudget:     budget,
 		subEntries:      make(map[int]*subscriptionEntry),
@@ -198,11 +152,6 @@ func NewClient(opts ClientOptions) *Client { //nolint:gocritic // opts is copied
 	}
 }
 
-// generateID returns a fresh call/iterator/stream id carrying the client's
-// replyPrefix as its first dot-separated segment. The reply subject derived
-// from such an id (`rpc.reply.<id>` — pure string concatenation, the wire
-// contract with every responder implementation) therefore falls under the
-// muxed reply inbox wildcard `rpc.reply.<replyPrefix>.>`.
 func (c *Client) generateID() string {
 	return c.replyPrefix + "." + GenerateID()
 }
@@ -227,9 +176,7 @@ func (c *Client) needsConnect() bool {
 	return !c.closed && (c.nc == nil || c.nc.IsClosed())
 }
 
-// MaxPayloadSize returns the effective maximum payload size: the largest
-// message sent whole. A larger one goes out in chunks of this size, or fails
-// with PAYLOAD_TOO_LARGE when the server's limit is below 16384.
+// MaxPayloadSize returns the largest message sent whole, a larger one goes out in chunks of this size.
 func (c *Client) MaxPayloadSize() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -244,9 +191,7 @@ func (c *Client) SetMaxPayloadSize(size int) {
 	c.unchunked = false
 }
 
-// Connect establishes a connection to the NATS server. It returns at once
-// while the current connection is up or nats.go is reconnecting it. It
-// refuses a ClientOptions.MaxPayloadSize below 16384.
+// Connect connects to the NATS server and returns at once while the connection is up or nats.go is reconnecting it.
 func (c *Client) Connect(ctx context.Context) error {
 	if opt := c.Options.MaxPayloadSize; opt != 0 && opt < minPayloadLimit {
 		return fmt.Errorf("MaxPayloadSize %d is below the minimum of %d", opt, minPayloadLimit)
@@ -262,9 +207,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.mu.Lock()
 
-	// a connection that nats.go is still reconnecting keeps its
-	// subscriptions and buffers publishes; dialing a second one would split
-	// the client and leak the first
+	// a connection nats.go is still reconnecting keeps its subscriptions, a second dial would split the client
 	if c.nc != nil && !c.nc.IsClosed() {
 		c.mu.Unlock()
 		return nil
@@ -299,8 +242,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		natsOpts = append(natsOpts, nats.Secure(tlsConfig))
 	}
 
-	// When WaitOnFirstConnect is explicitly false, return immediately and
-	// reconnect in the background (allows Disconnect() to abort in-flight connects).
+	// connects in the background, so Disconnect can abort it
 	if c.Options.WaitOnFirstConnect != nil && !*c.Options.WaitOnFirstConnect {
 		natsOpts = append(natsOpts, nats.RetryOnFailedConnect(true))
 	}
@@ -324,15 +266,12 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.markConnected()
 	}
 
-	// A client that was Disconnect()ed is revivable by an explicit Connect().
-	// Without this reset, auto-connect in callOnce and the no-responder retry
-	// loop stay permanently disabled.
+	// an explicit Connect revives a disconnected client
 	c.closed = false
 	replaced := c.connLost
 	c.connLost = false
 
-	// the option only lowers the server's limit: a larger message would be
-	// refused, a smaller cap keeps messages fit for a leaf link with a lower one
+	// the option only lowers the server's limit, a larger message would be refused
 	limit := 1 << 20
 	serverMax := int(nc.MaxPayload())
 	if serverMax > 0 {
@@ -349,14 +288,9 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.mu.Unlock()
 
-	// Register the muxed reply inbox (idempotent). Registered as a normal
-	// subscription entry so the restore loop below (re-)subscribes it on
-	// first connect and after every suspend cycle alike.
+	// a normal entry, so the restore below subscribes it too
 	c.ensureMuxSubscription(false)
 
-	// Restore subscriptions from previous session (e.g. after Suspend+Connect).
-	// Entries keep their identity so unsubscribe closures held by callers stay
-	// valid across the restore.
 	restored := 0
 	c.subMu.Lock()
 	for _, entry := range c.subEntries {
@@ -365,7 +299,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 		entry.sub = nil
 		entry.chunks.close()
-		// Ignore errors — partial restore is better than none
+		// a partial restore beats none
 		_ = c.natsSubscribe(nc, entry)
 		if entry != c.muxEntry {
 			restored++
@@ -373,14 +307,12 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	c.subMu.Unlock()
 
-	// once the PONG is back the server holds every restored subscription, so a
-	// caller on another connection reaches them as soon as Connect returns
+	// after the PONG the server holds every restored subscription, other connections reach them at once
 	if restored > 0 {
 		c.flushTimeout(registerFlushTimeout)
 	}
 
-	// Suspend took the isolated connections down with this one; a failed child
-	// stays down, the parent connection is up either way
+	// Suspend took the isolated connections down too, a failed child stays down
 	for _, child := range c.isolatedChildren() {
 		if !child.IsClosed() {
 			_ = child.Connect(ctx)
@@ -393,9 +325,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	return nil
 }
 
-// Disconnect closes the connection and cleans up all resources. Calls the
-// registered handlers already received get until ClientOptions.DrainTimeout to
-// finish first.
+// Disconnect closes the connection after letting received calls finish within ClientOptions.DrainTimeout.
 func (c *Client) Disconnect() error {
 	c.drainHandlers(c.handlerRegistrations())
 
@@ -408,7 +338,6 @@ func (c *Client) Disconnect() error {
 
 	c.endSession()
 
-	// Unsubscribe all
 	c.subMu.Lock()
 	for _, entry := range c.subEntries {
 		if entry.sub != nil {
@@ -422,7 +351,7 @@ func (c *Client) Disconnect() error {
 		r.lanes.close()
 	}
 	c.handlerRegs = nil
-	// Entries were dropped — a revive-Connect() must re-register the mux.
+	// a reviving Connect must register the mux again
 	c.muxEntry = nil
 	for _, sub := range c.requestSubs {
 		_ = sub.Unsubscribe()
@@ -431,7 +360,6 @@ func (c *Client) Disconnect() error {
 	c.closeEndpointChunksLocked()
 	c.subMu.Unlock()
 
-	// Disconnect isolated clients
 	c.isolatedClientsMu.Lock()
 	for _, ic := range c.isolatedClients {
 		_ = ic.Disconnect()
@@ -439,7 +367,6 @@ func (c *Client) Disconnect() error {
 	c.isolatedClients = nil
 	c.isolatedClientsMu.Unlock()
 
-	// Close NATS connection with timeout
 	if nc != nil {
 		timeout := c.Options.DisconnectTimeout
 		if timeout <= 0 {
@@ -466,8 +393,6 @@ func (c *Client) Disconnect() error {
 	return nil
 }
 
-// nats.go gave the connection up for good: entries and scopes stay and closed
-// stays false, so the next call or Connect dials again and restores them
 func (c *Client) onConnClosed(nc *nats.Conn) {
 	c.mu.Lock()
 	if c.nc != nc || c.closingConn == nc {
@@ -475,6 +400,7 @@ func (c *Client) onConnClosed(nc *nats.Conn) {
 		return
 	}
 	c.nc = nil
+	// entries stay and closed stays false, so the next call or Connect dials again
 	c.connLost = true
 	// under mu, so a concurrent Connect cannot restore an entry in between
 	c.subMu.Lock()
@@ -506,10 +432,10 @@ func (c *Client) endSession() {
 	c.chunkingManager.Close()
 }
 
-// LoadAndDelete, so an unregister at the same time cannot end a session twice
 func (c *Client) endHandlerSessions() {
 	for _, cleanups := range []*sync.Map{&c.streamCleanups, &c.pullIteratorCleanups, &c.callbackCleanups} {
 		cleanups.Range(func(key, _ any) bool {
+			// LoadAndDelete, so an unregister at the same time cannot end a session twice
 			if v, ok := cleanups.LoadAndDelete(key); ok {
 				if cleanup, ok := v.(func()); ok {
 					cleanup()
@@ -520,12 +446,9 @@ func (c *Client) endHandlerSessions() {
 	}
 }
 
-// rejectPendingRequests settles every in-flight call with a connection-closed
-// error and runs its cleanup (reply + inbox subscription teardown). Runs on
-// Disconnect()/Suspend(). LoadAndDelete guards against a concurrent settle by
-// the reply handler — only one side wins.
 func (c *Client) rejectPendingRequests() {
 	c.pendingRequests.Range(func(key, _ any) bool {
+		// LoadAndDelete, the reply handler may settle the call at the same time
 		if v, ok := c.pendingRequests.LoadAndDelete(key); ok {
 			pr := v.(*pendingRequest)
 			if pr.cleanup != nil {
@@ -538,9 +461,6 @@ func (c *Client) rejectPendingRequests() {
 	})
 }
 
-// clearStatusHandlers drops every registered 503/no-responder status handler.
-// Runs on Disconnect()/Suspend() — a torn-down connection can't deliver
-// statuses anymore, and the iterator/stream owners are settled separately.
 func (c *Client) clearStatusHandlers() {
 	c.statusHandlers.Range(func(key, _ any) bool {
 		c.statusHandlers.Delete(key)
@@ -548,9 +468,6 @@ func (c *Client) clearStatusHandlers() {
 	})
 }
 
-// settlePullIterators force-settles every client-side pull iterator parked in
-// a next() wait. Runs on Disconnect()/Suspend() so consumers terminate with a
-// connection error instead of hanging forever.
 func (c *Client) settlePullIterators() {
 	c.pullIteratorSettles.Range(func(key, value any) bool {
 		if settle, ok := value.(func()); ok {
@@ -581,22 +498,17 @@ func (c *Client) publishInternal(subject string, data any, reply string) error {
 	if err != nil {
 		return fmt.Errorf("encode: %w", err)
 	}
-	// nats.go copies every payload before the publish returns, see encodeBufPool
+	// nats.go copies every payload before the publish returns
 	defer frame.release()
 	return publishFrame(nc, subject, reply, &frame, maxPayload, unchunked)
 }
 
-// Subscribe subscribes to a subject pattern. The handler receives raw wire
-// bytes (chunked transfers arrive reassembled) — decode them with
-// DecodeMessageInto, NOT Decode: publishers extract large binaries into CUIB
-// frames, which plain Decode cannot parse. Returns an unsubscribe function.
+// Subscribe subscribes to a subject pattern; decode the reassembled wire bytes with DecodeMessageInto, not Decode.
 func (c *Client) Subscribe(pattern string, handler func(data []byte), opts ...func(*nats.Subscription)) (func(), error) {
 	return c.subscribeEntry(&subscriptionEntry{pattern: pattern, handler: handler, opts: opts})
 }
 
-// SubscribeQueue subscribes to a subject with a queue group. See Subscribe
-// for the handler's decode contract (DecodeMessageInto, not Decode). It
-// returns once the server holds the subscription.
+// SubscribeQueue subscribes with a queue group and returns once the server holds the subscription.
 func (c *Client) SubscribeQueue(pattern, queue string, handler func(data []byte)) (func(), error) {
 	unsub, err := c.subscribeEntry(&subscriptionEntry{pattern: pattern, queue: queue, handler: handler})
 	if err == nil {
@@ -605,10 +517,6 @@ func (c *Client) SubscribeQueue(pattern, queue string, handler func(data []byte)
 	return unsub, err
 }
 
-// subscribeEntry registers a subscription entry and creates its NATS
-// subscription. The entry survives Suspend()/Connect() cycles; the returned
-// unsubscribe closure removes exactly this entry (and only this entry), even
-// after the underlying NATS subscription was replaced by a restore.
 func (c *Client) subscribeEntry(entry *subscriptionEntry) (func(), error) {
 	c.mu.RLock()
 	nc := c.nc
@@ -657,23 +565,14 @@ func (c *Client) subscribeEntry(entry *subscriptionEntry) (func(), error) {
 	return unsub, nil
 }
 
-// natsSubscribe creates the NATS subscription for an entry. Called from
-// subscribeEntry and again from Connect() when restoring entries after a
-// Suspend cycle.
 func (c *Client) natsSubscribe(nc *nats.Conn, entry *subscriptionEntry) error {
-	// Raw mode (muxed reply inbox): hand the undecoded *nats.Msg to the
-	// handler — it needs headers (503 status, chunk markers) and the subject,
-	// and does its own chunk reassembly and routing.
+	// the mux needs headers and subject, it reassembles and routes chunks itself
 	if entry.rawHandler != nil {
 		sub, err := nc.Subscribe(entry.pattern, entry.rawHandler)
 		if err != nil {
 			return fmt.Errorf("subscribe: %w", err)
 		}
-		// Every RPC reply of the client shares this one subscription; a burst
-		// of large chunked responses would blow through nats.go's default
-		// pending limits (64MB) and get dropped as "slow consumer". Lift the
-		// limits — memory stays bounded by the client's in-flight calls
-		// (Node's mux subscription is unbounded, too).
+		// every reply shares this subscription, the nats.go limits would drop a burst of chunked replies as slow consumer
 		_ = sub.SetPendingLimits(-1, -1)
 		entry.sub = sub
 		return nil
@@ -760,14 +659,6 @@ func (c *Client) entryHandler(entry *subscriptionEntry) nats.MsgHandler {
 	}
 }
 
-// ensureMuxSubscription registers (and, with subscribeNow, subscribes) the
-// single persistent wildcard subscription `rpc.reply.<replyPrefix>.>` that
-// receives every RPC reply of this client — real responses, chunked responses
-// and 503/no-responder statuses. Idempotent.
-//
-// Connect() passes subscribeNow=false: it only registers the entry and lets
-// its restore loop create the actual subscription alongside all other entries
-// (also after suspend cycles).
 func (c *Client) ensureMuxSubscription(subscribeNow bool) {
 	c.mu.RLock()
 	nc := c.nc
@@ -785,28 +676,16 @@ func (c *Client) ensureMuxSubscription(subscribeNow bool) {
 		c.subEntries[c.subSeq] = c.muxEntry
 	}
 	if subscribeNow && nc != nil && (c.muxEntry.sub == nil || !c.muxEntry.sub.IsValid()) {
-		// Ignore errors — the call path will surface a timeout; consistent
-		// with the Connect() restore loop.
+		// a failure shows up as a call timeout
 		_ = c.natsSubscribe(nc, c.muxEntry)
 	}
 }
 
-// handleMuxMessage dispatches a message from the muxed reply inbox by kind:
-//   - 503/no-responder status (empty payload + Status header 503): the
-//     call/iterator is identified by the SUBJECT (`rpc.reply.<suffix>`) — the
-//     server echoes the request's reply subject, there is no payload to decode.
-//   - chunked transfer header/chunk: reassemble via chunkingManager while the
-//     call is pending, then route the assembled response by envelope id. A
-//     reply that cannot be assembled rejects the call at once.
-//   - regular response: decode and route by envelope id.
 func (c *Client) handleMuxMessage(msg *nats.Msg) {
-	// No-responder status. Wire detail: the reply subject of an RPC call is
-	// exactly `rpc.reply.<call id>`, so the suffix IS the call id. For
-	// iterator/stream status inboxes the suffix is the registered token.
+	// the suffix is the call id, or the token an iterator or stream registered
 	if len(msg.Data) == 0 && msg.Header != nil && msg.Header.Get("Status") == "503" {
 		suffix := strings.TrimPrefix(msg.Subject, "rpc.reply.")
 
-		// One-shot (mirrors the previous per-iterator AutoUnsubscribe(1) inboxes).
 		if v, ok := c.statusHandlers.LoadAndDelete(suffix); ok {
 			if fn, ok := v.(func(error)); ok {
 				fn(NewRPCException(ErrCodeNotFound, "No responders for "+suffix))
@@ -887,7 +766,6 @@ func (c *Client) failChunkedReply(callID string, err error) {
 	close(pr.done)
 }
 
-// replies come on rpc.reply.<call id>, so a reply nobody waits for is dropped undecoded
 func (c *Client) settleReply(callID string, data []byte) {
 	v, ok := c.pendingRequests.LoadAndDelete(callID)
 	if !ok {
@@ -912,8 +790,7 @@ func (c *Client) Request(ctx context.Context, subject string, data any, timeout 
 	return result, err
 }
 
-// RequestWithOptions is the same as Request but with per-call overrides for
-// timeout and no-responder retry. Pass nil to use client-wide defaults.
+// RequestWithOptions is Request with per-call timeout and no-responder retry overrides, nil keeps the client defaults.
 func (c *Client) RequestWithOptions(ctx context.Context, subject string, data any, opts *RequestOptions) ([]byte, error) {
 	var timeout []time.Duration
 	var override *NoResponderRetryOptions
@@ -949,8 +826,6 @@ func (c *Client) requestOnce(ctx context.Context, subject string, data any, time
 		t = time.Until(deadline)
 	}
 
-	// nc.Request copies the payload into the connection's flush buffer before
-	// returning, so releasing the pooled buffer afterwards is safe.
 	encoded, release, err := encodeMessagePooled(data)
 	if err != nil {
 		return nil, fmt.Errorf("encode: %w", err)
@@ -968,7 +843,6 @@ func (c *Client) requestOnce(ctx context.Context, subject string, data any, time
 		return nil, err
 	}
 
-	// Check for service error headers
 	if msg.Header != nil && msg.Header.Get("Nats-Service-Error-Code") != "" {
 		errCode := msg.Header.Get("Nats-Service-Error-Code")
 		errMsg := msg.Header.Get("Nats-Service-Error")
@@ -990,16 +864,7 @@ func (c *Client) flushTimeout(timeout time.Duration) {
 	}
 }
 
-// OnReconnect registers fn to run after the connection is re-established.
-// Subscriptions survive a reconnect, but messages published while the link was
-// down are lost, so a consumer that caches server state uses this to resync.
-// It also runs when a call or Connect dials a new connection because nats.go
-// gave the previous one up for good (reconnect attempts used up, reconnect
-// off), not after Suspend or Disconnect. Returns a function that unregisters
-// the handler.
-//
-// Handlers run on their own goroutine, so a slow one does not stall the NATS
-// reconnect path, and a panicking one does not take the process down.
+// OnReconnect registers fn to run on its own goroutine after the connection is re-established and returns its unregister function.
 func (c *Client) OnReconnect(fn func()) func() {
 	c.reconnectMu.Lock()
 	if c.reconnectHandlers == nil {
@@ -1047,9 +912,6 @@ func (c *Client) asyncError(_ *nats.Conn, sub *nats.Subscription, err error) {
 	c.reportAsyncError(e)
 }
 
-// nats-server refused a publish of this connection: the calls and stream
-// starts waiting on that subject would only run into their timeout, nothing
-// retries a refused subject
 func (c *Client) failRefusedPublish(subject string) {
 	c.pendingRequests.Range(func(key, v any) bool {
 		if pr := v.(*pendingRequest); pr.subject == subject {
@@ -1081,8 +943,6 @@ func (c *Client) reportAsyncError(e *AsyncError) {
 	fmt.Fprintln(os.Stderr, e.Error())
 }
 
-// a lane dropped a request, reported the way nats.go reports a subscription
-// over its pending limits
 func (c *Client) slowConsumer(subject string, dropped int) {
 	c.reportAsyncError(&AsyncError{Err: nats.ErrSlowConsumer, Subject: subject, Dropped: dropped})
 }
@@ -1099,11 +959,9 @@ func (c *Client) markConnected() {
 	c.connectedAt.Store(&now)
 }
 
-// replaces ReconnectWait and its jitter in nats.go: a connection that lived at
-// least ReconnectWait tries again at once, one that keeps dropping waits, so a
-// client kicked as a slow consumer does not loop
 func (c *Client) reconnectDelay(attempts int) time.Duration {
 	wait := c.Options.ReconnectWait
+	// at once only after a connection that lived ReconnectWait, so a client kicked as slow consumer does not loop
 	if at := c.connectedAt.Load(); attempts <= 1 && at != nil && time.Since(*at) >= wait {
 		return rand.N(10 * time.Millisecond)
 	}
@@ -1114,9 +972,7 @@ func (c *Client) reconnectDelay(attempts int) time.Duration {
 	return wait + rand.N(jitter)
 }
 
-// OnRequest registers a handler for native NATS request/reply on the given
-// pattern. The handler receives raw wire bytes — decode them with
-// DecodeMessageInto, NOT Decode (see Subscribe).
+// OnRequest registers a native NATS request/reply handler on pattern; decode its wire bytes with DecodeMessageInto.
 func (c *Client) OnRequest(pattern string, handler func(data []byte) (any, error)) (func(), error) {
 	c.mu.RLock()
 	nc := c.nc
@@ -1156,7 +1012,6 @@ func (c *Client) OnRequest(pattern string, handler func(data []byte) (any, error
 	if err != nil {
 		return nil, err
 	}
-	// Ensure subscription is registered on the server
 	_ = nc.Flush()
 
 	c.subMu.Lock()
@@ -1176,9 +1031,7 @@ func (c *Client) OnRequest(pattern string, handler func(data []byte) (any, error
 	}, nil
 }
 
-// Call makes an RPC call and waits for a response, with automatic retry on no-responder errors.
-// While nats.go reconnects, the request waits in its reconnect buffer and goes
-// out once the connection is back; the timeout still applies.
+// Call makes an RPC call and waits for its response, retrying no-responder errors.
 func (c *Client) Call(ctx context.Context, subject string, args ...any) (any, error) {
 	var result any
 	err := c.withNoResponderRetry(ctx, nil, methodProbe{}, func() error {
@@ -1189,13 +1042,11 @@ func (c *Client) Call(ctx context.Context, subject string, args ...any) (any, er
 	return result, err
 }
 
-// CallWithOptions is the same as Call but with per-call overrides for timeout
-// and no-responder retry. Pass nil to use client-wide defaults.
+// CallWithOptions is Call with per-call timeout and no-responder retry overrides, nil keeps the client defaults.
 func (c *Client) CallWithOptions(ctx context.Context, subject string, opts *RequestOptions, args ...any) (any, error) {
 	return c.callWithOptions(ctx, subject, opts, methodProbe{}, args...)
 }
 
-// a set probe asks the namespace for its methods after the first no-responder
 func (c *Client) callWithOptions(ctx context.Context, subject string, opts *RequestOptions, probe methodProbe, args ...any) (any, error) {
 	var override *NoResponderRetryOptions
 	var timeout time.Duration
@@ -1213,30 +1064,21 @@ func (c *Client) callWithOptions(ctx context.Context, subject string, opts *Requ
 	return result, err
 }
 
-// callDeadline resolves how long a call may take: an explicit per-call
-// timeout, else what is left of the caller's deadline, else the client
-// default. A caller that grants more time than the default (a plugin waiting
-// for a slow model) must not be cut short by the transport.
 func (c *Client) callDeadline(ctx context.Context, timeout time.Duration) time.Duration {
 	if timeout > 0 {
 		return timeout
 	}
+	// a caller deadline beyond the default holds, the transport must not cut a slow handler short
 	if deadline, ok := ctx.Deadline(); ok {
 		return time.Until(deadline)
 	}
 	return c.Options.Timeout
 }
 
-// callOnce performs a single RPC call attempt via the muxed reply inbox: the
-// reply subject is `rpc.reply.<id>` and falls under the client's persistent
-// wildcard subscription — no per-call subscriptions. Responses (plain or
-// chunked) and no-responder statuses all arrive on the mux, which settles the
-// pendingRequests entry; cleanup only has to drop the map entry.
 func (c *Client) callOnce(ctx context.Context, subject string, timeout time.Duration, args ...any) (any, error) {
 	return c.callOnceTo(ctx, subject, "", timeout, args...)
 }
 
-// direct is the per-instance subject of a service that takes a chunked request there
 func (c *Client) callOnceTo(ctx context.Context, subject, direct string, timeout time.Duration, args ...any) (any, error) {
 	if c.needsConnect() {
 		if err := c.Connect(ctx); err != nil {
@@ -1251,31 +1093,23 @@ func (c *Client) callOnceTo(ctx context.Context, subject, direct string, timeout
 		return nil, fmt.Errorf("not connected")
 	}
 
-	// Service calls (`<subject>.reply.<id>`) keep the legacy per-call
-	// subscription flow — separate refactor later.
+	// service subjects answer on <subject>.reply.<id>, not on the mux
 	if !strings.HasPrefix(subject, "rpc.") {
 		return c.callOnceService(ctx, nc, subject, direct, timeout, args...)
 	}
 
-	// Normally established by Connect(); covers clients whose connection was
-	// wired up out-of-band (tests). No-op when already subscribed.
+	// normally done by Connect, covers a connection wired up out of band
 	c.ensureMuxSubscription(true)
 
 	id := c.generateID()
 	timeout = c.callDeadline(ctx, timeout)
-	// The reply subject is derived from the id by pure string concatenation —
-	// this is the wire contract with every responder implementation (Node,
-	// Go, Python): they publish the response to `rpc.reply.<msg.ID>` and
-	// treat the id as opaque. Because the id starts with our replyPrefix,
-	// the muxed reply inbox (`rpc.reply.<replyPrefix>.>`) catches it.
+	// responders publish to rpc.reply.<id>, the replyPrefix in the id puts it under the mux
 	replySubject := "rpc.reply." + id
 
 	pr := &pendingRequest{done: make(chan struct{}), subject: subject}
 	c.pendingRequests.Store(id, pr)
 
-	// Send request. `reply` is set to the call's own reply subject so the
-	// NATS server delivers a no-responder 503 status to the SAME subject the
-	// real response would use — the mux catches both.
+	// the 503 of a missing responder comes on the same subject as the reply
 	message := RPCMessage{
 		ID:     id,
 		Method: "call",
@@ -1287,7 +1121,6 @@ func (c *Client) callOnceTo(ctx context.Context, subject, direct string, timeout
 		return nil, err
 	}
 
-	// Wait for response or timeout
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
@@ -1303,7 +1136,6 @@ func (c *Client) callOnceTo(ctx context.Context, subject, direct string, timeout
 	}
 }
 
-// a reply that does not decode, or names another call, fails the call at once
 func (pr *pendingRequest) outcome(id string) (any, error) {
 	if pr.err != nil {
 		return nil, pr.err
@@ -1329,9 +1161,6 @@ func (c *Client) abandonCall(id string, pr *pendingRequest) {
 	}
 }
 
-// callOnceService is the legacy single-attempt call for service subjects
-// (reply pattern `<subject>.reply.<id>`): per-call reply subscription plus a
-// one-shot no-responder inbox. The rpc.* path is muxed — see callOnce.
 func (c *Client) callOnceService(ctx context.Context, nc *nats.Conn, subject, direct string, timeout time.Duration, args ...any) (any, error) {
 	id := c.generateID()
 	timeout = c.callDeadline(ctx, timeout)
@@ -1340,22 +1169,20 @@ func (c *Client) callOnceService(ctx context.Context, nc *nats.Conn, subject, di
 	if err != nil {
 		return nil, fmt.Errorf("encode: %w", err)
 	}
-	// once the publish returned, or when the call ends before it
+	// after the publish returned, or when the call ends before it
 	release := sync.OnceFunc(frame.release)
 	defer release()
 	c.mu.RLock()
 	maxPayload := c.maxPayloadSize
 	unchunked := c.unchunked
 	c.mu.RUnlock()
-	// the queue of a service with several instances would spread the chunks of
-	// one request over them, the instance itself takes them on its own subject
+	// a queue would spread one request's chunks over the instances, the instance takes them on its own subject
 	target := subject
 	if direct != "" && frame.size > maxPayload {
 		target = direct
 	}
 	replySubject := target + ".reply." + id
 
-	// Subscribe to reply
 	unsub, err := c.Subscribe(replySubject, func(data []byte) {
 		var resp RPCResponse
 		if err := DecodeMessageInto(data, &resp); err != nil {
@@ -1395,10 +1222,7 @@ func (c *Client) callOnceService(ctx context.Context, nc *nats.Conn, subject, di
 	}
 	_ = noRespSub.AutoUnsubscribe(1)
 
-	// Tear down the reply + inbox subscriptions exactly once. Runs on every
-	// exit path of this call AND from Disconnect()/Suspend() via pr.cleanup —
-	// a timed-out or suspended call must not leak its subscriptions (or have
-	// a dead rpc.reply.* entry restored on the next Connect()).
+	// also run by Disconnect and Suspend, a dead call must not leak or restore its subscriptions
 	var cleanupOnce sync.Once
 	cleanup := func() {
 		cleanupOnce.Do(func() {
@@ -1418,7 +1242,6 @@ func (c *Client) callOnceService(ctx context.Context, nc *nats.Conn, subject, di
 		return nil, err
 	}
 
-	// Wait for response or timeout
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
@@ -1434,18 +1257,15 @@ func (c *Client) callOnceService(ctx context.Context, nc *nats.Conn, subject, di
 	}
 }
 
-// a per-call override replaces the client-wide retry config; a set probe starts
-// with the first delay and ends the retry in any wait once the method is missing
 func (c *Client) withNoResponderRetry(ctx context.Context, override *NoResponderRetryOptions, probe methodProbe, fn func() error) error {
 	err := fn()
 	if err == nil {
 		return nil
 	}
+	// split off, so the probe's defer costs a call that succeeds at once nothing
 	return c.retryNoResponders(ctx, override, probe, fn, err)
 }
 
-// apart from withNoResponderRetry, so the probe's defer costs a call that
-// succeeds at once nothing
 func (c *Client) retryNoResponders(ctx context.Context, override *NoResponderRetryOptions, probe methodProbe, fn func() error, err error) error {
 	maxRetries, delays := c.retryPlan(override)
 	var gone <-chan struct{}
@@ -1477,9 +1297,6 @@ func (c *Client) retryNoResponders(ctx context.Context, override *NoResponderRet
 	}
 }
 
-// the short first steps catch a responder that is just subscribing, the
-// budget until the error stays about 3.5 s; a caller that set either field
-// keeps the old plan for the other
 func (c *Client) retryPlan(override *NoResponderRetryOptions) (maxRetries int, delays []time.Duration) {
 	src := c.Options.NoResponderRetry
 	if override != nil {
@@ -1500,12 +1317,7 @@ func (c *Client) retryPlan(override *NoResponderRetryOptions) (maxRetries int, d
 	return maxRetries, delays
 }
 
-// Suspend closes the connection and cleans up resources but preserves subscription
-// metadata so that a subsequent Connect() restores them automatically.
-// Unlike Disconnect(), Suspend() does NOT mark the client as closed. Calls the
-// registered handlers already received are drained as in Disconnect. The
-// isolated connections of handlers, proxies and channels are suspended too and
-// come back with Connect.
+// Suspend closes the connection like Disconnect but keeps the subscriptions, so the next Connect restores them.
 func (c *Client) Suspend() error {
 	regs := c.handlerRegistrations()
 	c.drainHandlers(regs)
@@ -1518,8 +1330,6 @@ func (c *Client) Suspend() error {
 
 	c.endSession()
 
-	// Unsubscribe all subscriptions but keep the entries — Connect() restores
-	// them on the fresh transport.
 	c.subMu.Lock()
 	for _, entry := range c.subEntries {
 		if entry.sub != nil {
@@ -1540,7 +1350,6 @@ func (c *Client) Suspend() error {
 		_ = ic.Suspend()
 	}
 
-	// Close NATS connection with timeout
 	if nc != nil {
 		timeout := c.Options.DisconnectTimeout
 		if timeout <= 0 {
@@ -1573,16 +1382,13 @@ func (c *Client) Suspend() error {
 
 // ReconfigureOptions selectively overrides connection options for the next Connect().
 type ReconfigureOptions struct {
-	// Servers, when non-nil, replaces Options.Servers.
+	// nil keeps Options.Servers
 	Servers []string
-	// Auth, when non-nil, replaces Options.Auth. Pass &AuthOptions{} to clear.
+	// nil keeps Options.Auth, &AuthOptions{} clears it
 	Auth *AuthOptions
 }
 
-// Reconfigure updates connection options between Suspend() and Connect(). Used
-// for token rotation / endpoint switching: subscription metadata is preserved
-// by Suspend(), Reconfigure() points the next Connect() at the new server, and
-// Connect() re-subscribes everything on the fresh transport.
+// Reconfigure updates connection options between Suspend and Connect, for token rotation or a server switch.
 func (c *Client) Reconfigure(overrides ReconfigureOptions) error {
 	c.mu.Lock()
 	if c.nc != nil && !c.nc.IsClosed() {
@@ -1611,7 +1417,6 @@ func (c *Client) isolatedChildren() []*Client {
 	return slices.Clone(c.isolatedClients)
 }
 
-// createIsolatedClient creates a new client with the same options but a different name.
 func (c *Client) createIsolatedClient(suffix string) *Client {
 	opts := c.Options
 	opts.Name = c.Options.Name + "-" + suffix
@@ -1624,7 +1429,6 @@ func (c *Client) releaseIsolated(child *Client) error {
 	return err
 }
 
-// removeIsolatedClient removes a client from the tracked isolated clients list.
 func (c *Client) removeIsolatedClient(client *Client) {
 	c.isolatedClientsMu.Lock()
 	defer c.isolatedClientsMu.Unlock()
@@ -1671,7 +1475,6 @@ func (c *Client) leaveChunkScopeLocked(entry *subscriptionEntry) {
 	scope.close()
 }
 
-// an endpoint's transfers end with the connection its service was added to
 func (c *Client) addEndpointChunks(cm *ChunkingManager) {
 	c.subMu.Lock()
 	if c.endpointChunks == nil {
@@ -1703,7 +1506,6 @@ func (s *chunkScope) load(maxTransferSize int, budget *transferBudget) *Chunking
 	}
 }
 
-// "" is the scope's own manager
 func (s *chunkScope) loadLane(lane string, maxTransferSize int, budget *transferBudget) *ChunkingManager {
 	if lane == "" {
 		return s.load(maxTransferSize, budget)
@@ -1746,9 +1548,8 @@ func (s *chunkScope) close() {
 	}
 }
 
-// a set per-call timeout wins in callDeadline, yet the call still ends at the
-// ctx deadline when that comes first
 func callTTL(ctx context.Context, timeout time.Duration) Milliseconds {
+	// a per-call timeout wins in callDeadline, yet the call still ends at an earlier ctx deadline
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout = min(timeout, time.Until(deadline))
 	}
@@ -1779,11 +1580,11 @@ func forbiddenException(subject string) *RPCException {
 	return NewRPCException(ErrCodeForbidden, fmt.Sprintf("Permission denied for %q", subject), map[string]any{"subject": subject})
 }
 
-// nats.go reports a refused publish as ErrPermissionViolation with the server's text
 func refusedPublishSubject(err error) (string, bool) {
 	if !errors.Is(err, nats.ErrPermissionViolation) {
 		return "", false
 	}
+	// the subject is only in the server's error text
 	const marker = `Publish to "`
 	text := err.Error()
 	_, after, ok0 := strings.Cut(text, marker)

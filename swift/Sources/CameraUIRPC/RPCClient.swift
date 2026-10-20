@@ -10,21 +10,12 @@ public struct RPCClientOptions: Sendable {
   public var pinnedCertificate: URL?
   public var skipHostnameVerification: Bool
   public var skipCertificateVerification: Bool
-  /// DER certificates trusted when the system roots reject the server. The
-  /// chain must end at one of them, and the host name is not checked
-  /// against them. Empty trusts the system roots only.
-  public var additionalTrustRoots: [Data]
+  public var additionalTrustRoots: [Data]  // DER, tried when the system roots reject the server, host name not checked
   public var requestTimeout: TimeInterval
   public var noResponderRetries: Int
-  /// Seconds between keepalive PINGs. After two unanswered ones the next
-  /// tick drops the link. Nil keeps the nats.swift default of 60 s.
-  public var pingInterval: TimeInterval?
-  /// Seconds one dial may take, TLS and WebSocket upgrade included. Nil
-  /// keeps the nats.swift default of 10 s.
-  public var connectTimeout: TimeInterval?
-  /// Largest chunked transfer accepted, and the bytes all transfers in
-  /// progress may hold together.
-  public var maxTransferSize: Int
+  public var pingInterval: TimeInterval?  // seconds, nil keeps the nats.swift default of 60 s
+  public var connectTimeout: TimeInterval?  // seconds incl. TLS and upgrade, nil keeps the nats.swift default of 10 s
+  public var maxTransferSize: Int  // bytes, also the cap of all transfers in progress together
 
   public init(
     url: URL,
@@ -57,18 +48,10 @@ public struct RPCClientOptions: Sendable {
   }
 }
 
-/// Connection lifecycle events, mirroring the node client's `status()`
-/// iterator and the python client's `reconnected_cb`. A `connected` following
-/// a `disconnected` is a completed reconnect; nats.swift restores all
-/// subscriptions itself before emitting it.
 public enum RPCConnectionEvent: String, Sendable {
   case connected
   case disconnected
   case suspended
-  /// The server turned the token or the connection down (WebSocket close
-  /// 4400, 4401 or 4403). On a live link the client closes without
-  /// redialing and a final `closed` follows. A refused `connect()` throws
-  /// `RPCClientError.unauthorized` after this event and the streams stay open.
   case unauthorized
   case closed
 }
@@ -144,8 +127,7 @@ public actor RPCClient {
   public func connect() async throws {
     guard nats == nil else { return }
 
-    // no maxReconnects: nil means infinite auto-reconnect in nats.swift
-    // (-1 would disable reconnecting entirely, the loop checks attempts < max)
+    // no maxReconnects: nil reconnects forever in nats.swift, -1 would disable reconnecting
     var natsOptions = NatsClientOptions()
       .url(options.url)
       .reconnectWait(1)
@@ -200,7 +182,6 @@ public actor RPCClient {
       }
     }
 
-    // one muxed inbox for all replies, routed by envelope id
     let replies = try await client.subscribe(subject: "rpc.reply.\(options.connId).>")
     replyTask = Task { [weak self] in
       do {
@@ -213,14 +194,10 @@ public actor RPCClient {
     }
   }
 
-  /// Ends every open pull iterator, callback and stream on the server before
-  /// the connection closes, waiting at most half a second for the server to
-  /// take the cancels.
   public func close() async {
     await shutdown(refused: false)
   }
 
-  // a refused client is no longer heard by the server, nothing to announce
   private func shutdown(refused: Bool) async {
     let client = nats
     nats = nil
@@ -228,6 +205,7 @@ public actor RPCClient {
     linkEvents = nil
     linkTask?.cancel()
     linkTask = nil
+    // a refused client is no longer heard by the server
     if let client, linkUp, !refused, !openSessions.isEmpty {
       await announceClose(client)
     }
@@ -252,8 +230,6 @@ public actor RPCClient {
     }
   }
 
-  /// Streams connection lifecycle events until the client closes. Multiple
-  /// streams can be open at once; each terminates with a final `closed`.
   public func statusEvents() -> AsyncStream<RPCConnectionEvent> {
     let id = UUID()
     return AsyncStream { continuation in
@@ -274,10 +250,6 @@ public actor RPCClient {
     eventContinuations.removeValue(forKey: id)
   }
 
-  /// One PING/PONG round trip: returns once the server answered, throws
-  /// `timeout` when it did not within `timeout` seconds and `notConnected`
-  /// when the link is down or drops meanwhile. A link that silently died
-  /// answers nothing, so this tells it apart from a quiet one.
   public func flush(timeout: TimeInterval = 5) async throws {
     guard let nats, linkUp else { throw RPCClientError.notConnected }
     let answered: Bool
@@ -299,8 +271,6 @@ public actor RPCClient {
     try await callSubject("rpc.\(namespace).\(method)", args: args, timeout: timeout)
   }
 
-  /// While the link is down the publish waits for the reconnect, at most
-  /// `requestTimeout` seconds.
   public func publish(_ subject: String, _ value: Any? = nil, reply: String? = nil) async throws {
     guard nats != nil else { throw RPCClientError.notConnected }
     try await publishWhenLinked(
@@ -332,9 +302,6 @@ public actor RPCClient {
     }
   }
 
-  /// Callback subscription (`rpc.cb.<id>`): registers with the remote method
-  /// and yields every pushed value. Terminating the stream publishes the
-  /// cancel frame so the server drops the callback.
   public func callWithCallback(
     _ namespace: String,
     _ method: String,
@@ -352,7 +319,7 @@ public actor RPCClient {
         do {
           for try await message in messages {
             guard let map = message as? [String: Any?] else { continue }
-            // error frames keep the stream alive, matching the wire contract
+            // error frames keep the stream alive
             if map["type"] as? String == "data" {
               continuation.yield(map["data"] ?? nil)
             }
@@ -404,8 +371,7 @@ public actor RPCClient {
           do {
             guard let nats = self.natsClient() else { throw RPCClientError.notConnected }
             let subscription = try await nats.subscribe(subject: streamSubject)
-            // the reply inbox only ever carries a 503 for stream requests:
-            // wake the parked loop by completing the subscription
+            // the reply inbox only carries a 503 for stream requests, it wakes the parked loop
             self.registerStatusHandler(id) {
               noResponders.set()
               Task { try? await subscription.unsubscribe() }
@@ -569,7 +535,6 @@ public actor RPCClient {
     iteratorSettles.removeValue(forKey: id)
   }
 
-  // the server-side session ended on its own, nothing to cancel
   func endSession(_ id: String) {
     openSessions.removeValue(forKey: id)
   }
@@ -579,8 +544,8 @@ public actor RPCClient {
     await sendCancel(id, session)
   }
 
-  // pull requests do not wait for a reconnect, the iterator ends with the link
   func publishLinked(_ subject: String, _ value: Any?, reply: String?) async throws {
+    // no wait for a reconnect, the pull iterator ends with the link
     guard let nats, linkUp else { throw RPCClientError.notConnected }
     do {
       try await nats.publish(RPCCodec.encodeMessage(value), subject: subject, reply: reply)
@@ -589,11 +554,11 @@ public actor RPCClient {
     }
   }
 
-  // ids double as reply-subject suffixes: rpc.reply.<connId>.<unique>
   func nextId() -> String {
     counter += 1
     let millis = UInt64(Date().timeIntervalSince1970 * 1000)
     let random = UInt32.random(in: 0x1000...0xffff)
+    // also the reply-subject suffix, so it must start with connId to fall under the mux
     return "\(options.connId).\(millis)-\(String(random, radix: 36))\(String(counter, radix: 36))"
   }
 
@@ -609,9 +574,7 @@ public actor RPCClient {
     let iteratorId = nextId()
     let requestSubject = "_rpc.iterator.\(iteratorId).request"
     let responseSubject = "_rpc.iterator.\(iteratorId).response"
-    // 503 status inbox for `next` requests, served by the muxed reply inbox:
-    // iteratorId starts with connId, so this subject falls under the mux
-    // wildcard. Real responses keep arriving on responseSubject.
+    // 503 inbox for next requests, under the mux wildcard since iteratorId starts with connId
     let statusInbox = "rpc.reply.\(iteratorId)"
 
     var callbackSub: NatsSubscription?
@@ -707,8 +670,6 @@ public actor RPCClient {
     }
   }
 
-  // nats-server refused a publish of this connection: the calls and stream
-  // starts waiting on that subject would only time out, nothing retries them
   private func failRefusedPublish(_ subject: String) {
     for (id, entry) in pending where entry.subject == subject {
       settle(id: id, with: .failure(RPCRemoteError.forbidden(subject)))
@@ -747,9 +708,6 @@ public actor RPCClient {
     broadcast(event)
   }
 
-  // nothing in flight on the dropped link arrives anymore: chunked transfers
-  // are dropped and fail their calls, and parked pull iterators end with a
-  // retryable notConnected while their producers get a cancel once the link is back
   private func linkLost() {
     budget.reset()
     for (id, entry) in pending where entry.transferKey != nil {
@@ -767,8 +725,6 @@ public actor RPCClient {
     }
   }
 
-  // nats.swift refuses writes while the link is down, so publishes wait for
-  // the reconnect, bounded by `timeout`
   private func publishWhenLinked(
     _ payload: Data, subject: String, reply: String?, timeout: TimeInterval, callId: String? = nil
   ) async throws {
@@ -777,6 +733,7 @@ public actor RPCClient {
       guard let nats else { throw RPCClientError.notConnected }
       if let callId, pending[callId] == nil { return }
       let remaining = deadline - ProcessInfo.processInfo.systemUptime
+      // nats.swift refuses writes while the link is down
       guard linkUp else {
         guard remaining > 0 else { throw RPCClientError.timeout(subject) }
         await waitForLink(timeout: remaining)
@@ -796,7 +753,6 @@ public actor RPCClient {
     }
   }
 
-  // returns once the link is back, the client closed or `timeout` passed
   private func waitForLink(timeout: TimeInterval) async {
     guard !linkUp, nats != nil else { return }
     let id = UUID()
@@ -822,7 +778,6 @@ public actor RPCClient {
     }
   }
 
-  // a cancel made while the link is down goes out after the reconnect
   private func sendCancel(_ id: String, _ session: SessionCancel) async {
     guard let frame = try? RPCCodec.encodeMessage(session.frame) else { return }
     while linkUp, let nats {
@@ -851,20 +806,19 @@ public actor RPCClient {
     }
   }
 
-  // once the server answered the PING it has every cancel published before it
   private func announceClose(_ client: NatsClient) async {
     for session in openSessions.values {
       guard let frame = try? RPCCodec.encodeMessage(session.frame) else { continue }
       try? await client.publish(frame, subject: session.subject)
     }
+    // once the PING is answered the server has every cancel sent before it
     _ = try? await Self.within(Self.closeFlushTimeout) { _ = try await client.rtt() }
   }
 
-  // true when `operation` finished in time; the loser is not awaited, a PING
-  // on a dead link only completes when the connection closes
   private static func within(
     _ seconds: TimeInterval, _ operation: @escaping @Sendable () async throws -> Void
   ) async throws -> Bool {
+    // the loser is not awaited: a PING on a dead link only completes when the connection closes
     let settled = SignalFlag()
     return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
       let timer = Task {
@@ -919,8 +873,7 @@ public actor RPCClient {
       route(payloadData: payload)
       return
     }
-    // a chunked reply nobody waits for is dropped, one that cannot be
-    // assembled fails its call at once instead of at the timeout
+    // a chunked reply nobody waits for is dropped, a broken one fails its call at once
     guard var entry = pending[id], let chunkId = ChunkReceiver.header(message, ChunkReceiver.idHeader) else { return }
     let transferKey = "\(id)|\(chunkId)"
     do {
@@ -999,7 +952,6 @@ final class SignalFlag: @unchecked Sendable {
     value = true
   }
 
-  // false when it was set already
   func trySet() -> Bool {
     lock.lock()
     defer { lock.unlock() }

@@ -102,9 +102,7 @@ async def test_generators():
         service = GeneratorService()
         unsubscribe = await server.register_handler("generator", service)
 
-        # The proxy automatically converts generators to async generators at runtime
-        # This is because Python's type system can't express the transformation
-        # from Generator to AsyncGenerator like TypeScript can
+        # the proxy turns generators into async generators at runtime, Python typing cannot express that
         proxy: Any = client.create_proxy("generator", GeneratorService)
 
         await asyncio.sleep(0.1)

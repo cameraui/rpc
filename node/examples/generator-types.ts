@@ -100,7 +100,7 @@ async function testGenerators() {
 
     const proxy = client.createProxy<GeneratorService>('generator');
 
-    // Give services time to register
+    // let the services register
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     console.log('Testing different generator types:\n');

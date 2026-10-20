@@ -265,7 +265,6 @@ func TestPullCallbackFrameThatDoesNotEncodeFailsItsBatch(t *testing.T) {
 	}
 }
 
-// stopped turns true once the producer returned
 func playOverSmallLimit(
 	t *testing.T,
 	setup func(inv *CallbackInvoker),
@@ -316,8 +315,8 @@ func iteratorRequests(s *fakeNATS) int {
 	})
 }
 
-// a peer that sends a next before the init reply while a frame of the setup failed
 func TestPullCallbackSetupFailureWithAnEarlyNext(t *testing.T) {
+	// the peer sends a next before the init reply while a frame of the setup failed
 	s := startFakeNATS(t)
 	s.setMaxPayload(4096)
 	server := connectFake(t, s, nil)

@@ -1,5 +1,3 @@
-"""Type definitions for camera.ui RPC library."""
-
 from __future__ import annotations
 
 import ssl
@@ -25,13 +23,11 @@ if TYPE_CHECKING:
     from .channel import Channel, PrivateChannel
     from .service import RPCService
 
-# Type variables
 T = TypeVar("T")
 R = TypeVar("R")
 P = ParamSpec("P")
 
 
-# Create a covariant type variable for ProxyWithClose
 T_co_proxy = TypeVar("T_co_proxy", covariant=True)
 
 CloseHandler = Callable[[], Coroutine[Any, Any, None]]
@@ -207,260 +203,94 @@ class RPCClient(Protocol):
 
 
 class NoResponderRetryOptions(TypedDict):
-    """Retry configuration for 503/no-responder errors.
-
-    With neither field set, a call retries after 0.025, 0.05, 0.1, 0.325, 1
-    and 2 seconds, about 3.5 s in all. With only max_retries set the delays
-    are [0.5, 1.0, 2.0], with only delays set a call retries 3 times.
-    """
-
     max_retries: NotRequired[int]
-    """Maximum number of retry attempts."""
-
-    delays: NotRequired[list[float]]
-    """Delay in seconds before each retry attempt, the last one repeats."""
+    delays: NotRequired[list[float]]  # seconds, the last one repeats
 
 
 class OrphanProbeOptions(TypedDict):
-    """How a producer notices that the consumer of a session it serves vanished without a cancel.
-
-    Covers callback, push stream and pull sessions. At most once per
-    ``interval_ms`` a publish of the session carries a reply subject, an idle
-    session sends a ping instead. The server answers a message nobody
-    receives with a no-responder status; when that lasts for ``grace_ms``,
-    the session ends as if the consumer had cancelled it.
-    """
-
-    interval_ms: NotRequired[int]
-    """Least time between two probes of one session (default and 0: 30000)."""
-
-    grace_ms: NotRequired[int]
-    """How long the consumer must stay missing before the session ends (default and 0: 300000)."""
+    interval_ms: NotRequired[int]  # default and 0: 30000
+    grace_ms: NotRequired[int]  # default and 0: 300000
 
 
 class RPCAuthOptions(TypedDict):
-    """Authentication options for RPC client."""
-
     user: str
-    """Username for authentication"""
-
     password: str
-    """Password for authentication"""
 
 
 class RPCClientOptions(TypedDict):
-    """Configuration options for RPC client."""
-
     servers: list[str]
-    """NATS server URLs"""
-
     name: str
-    """Client name for identification"""
-
     conn_id: NotRequired[str]
-    """Connection id used as the reply prefix of every call id. When set, the
-    muxed reply inbox subscribes ``rpc.reply.<conn_id>.>`` (server-side
-    firewalls allowlist exactly that wildcard for browser clients). When
-    omitted, a random local prefix is generated instead."""
-
     auth: NotRequired[RPCAuthOptions]
-    """Authentication credentials with 'user' and 'pass' keys"""
-
-    timeout: NotRequired[int]
-    """Default RPC call timeout in milliseconds"""
-
+    timeout: NotRequired[int]  # ms
     reconnect: NotRequired[bool]
-    """Enable automatic reconnection"""
-
-    max_reconnect_attempts: NotRequired[int]
-    """Maximum reconnection attempts (-1 for infinite).
-
-    Defaults to -1, or to 1 without reconnect, so the first connect gives up.
-    """
-
-    reconnect_time_wait: NotRequired[int]
-    """Delay between reconnection attempts in milliseconds (default: 2000, at least 100)"""
-
-    connect_timeout: NotRequired[int]
-    """Timeout for a single connection attempt in milliseconds"""
-
-    tls: NotRequired[dict[str, str] | ssl.SSLContext]
-    """TLS configuration with 'cert', 'key', and 'ca' keys, or a ready SSLContext"""
-
+    max_reconnect_attempts: NotRequired[int]  # -1 is infinite, default -1, or 1 without reconnect
+    reconnect_time_wait: NotRequired[int]  # ms, default 2000, at least 100
+    connect_timeout: NotRequired[int]  # ms
+    tls: NotRequired[dict[str, str] | ssl.SSLContext]  # dict keys cert, key and ca
+    # bytes, only lowers the server limit, 8192 of it are kept for the envelope
     max_payload_size: NotRequired[int]
-    """Largest message this client sends in one piece, in bytes; larger ones go
-    out chunked. Only lowers the server's max_payload, for links with a lower
-    limit than the local server (leaf nodes). Default: the server's limit.
-
-    8192 bytes of it are kept for the envelope, so a chunk carries at most
-    the value minus 8192. The client refuses a value that is not an int or
-    is below 16384 with ValueError; 0 means the server's limit. With a server
-    limit below 16384, messages that fit it go out unchanged and a larger one
-    fails with PAYLOAD_TOO_LARGE.
-    """
-
+    # bytes, also caps all transfers in reassembly together, default and 0: 1 GiB
     max_transfer_size: NotRequired[int]
-    """Largest incoming chunked transfer in bytes; bigger ones are dropped before
-    anything is allocated (default and 0: 1 GiB). It also caps the bytes that all
-    transfers still being reassembled by this client hold together; a transfer
-    that would go over it is dropped with its first chunk."""
-
-    wait_on_first_connect: NotRequired[bool]
-    """Block connect() until the first connection succeeds (default: True).
-    Set to False for clients where disconnect() must be able to abort an
-    in-flight connection attempt immediately (e.g. browser URL switchover)."""
-
-    disconnect_timeout: NotRequired[int]
-    """Maximum time in ms to wait for the NATS connection to fully close
-    during disconnect(). Default: 2000"""
-
-    drain_timeout_ms: NotRequired[int]
-    """How long disconnect(), suspend() and the cleanup of register_handler()
-    let calls their handlers already received finish, in milliseconds
-    (default: 250). The handler subscriptions go first, so new calls find
-    another instance or a no-responder. A call still unanswered at the end
-    gets a CONNECTION_CLOSED error. 0 tears down at once and cancels running
-    handlers."""
-
+    wait_on_first_connect: NotRequired[bool]  # default True, False lets disconnect() abort a dial in flight
+    disconnect_timeout: NotRequired[int]  # ms, default 2000
+    drain_timeout_ms: NotRequired[int]  # default 250, 0 tears down at once and cancels running handlers
     no_responder_retry: NotRequired[NoResponderRetryOptions]
-    """Retry configuration for 503/no-responder errors."""
-
     orphan_probe: NotRequired[OrphanProbeOptions | Literal[False]]
-    """Default for the sessions this client serves, see OrphanProbeOptions
-    (default: on with its defaults). False turns it off. register_handler()
-    can set it per registration."""
-
-    error_cb: NotRequired[ErrorCallback]
-    """Async callback for NATS transport errors. When omitted, transport errors are
-    swallowed (reconnect logic recovers transient failures; shutdown errors are noise)."""
-
+    error_cb: NotRequired[ErrorCallback]  # without it transport errors are swallowed
     reconnected_cb: NotRequired[Callback]
-    """Async callback fired after the connection is re-established. Consumers use it
-    to refetch state that was published while the link was down."""
 
 
 class RPCMessage(TypedDict):
-    """RPC request message format."""
-
     id: str
-    """Unique request ID"""
-
     method: str
-    """Method name to call"""
-
     params: Any
-    """Method parameters"""
-
     error: NotRequired[RPCError | None]
-    """Optional error (unused in requests)"""
-
     __discover: NotRequired[bool]
-    """Method-discovery request (internal metadata for proxies). When True,
-    the responder attaches the namespace's ``__methods`` list to the response.
-    Proxies set this only while their method cache is empty. Lives on the
-    envelope (not in params) so it never leaks into handler arguments; old
-    responders ignore it."""
-
     __timing: NotRequired[bool]
-    """Timing request (internal metadata). When True, the responder stamps its
-    clock around the handler and returns both stamps in ``__timing``. Old
-    responders ignore it and the caller just sees no timing back."""
-
-    __ttl: NotRequired[int]
-    """The caller's timeout for this request in milliseconds (internal
-    metadata). A method registered with drop_expired skips a request that
-    waited longer for its handler. Old responders ignore it."""
+    __ttl: NotRequired[int]  # ms, the caller's timeout, old responders ignore it
 
 
 class RPCResponse(TypedDict):
-    """RPC response message format."""
-
     id: str
-    """Request ID this response belongs to"""
-
     result: NotRequired[Any | None]
-    """Result data (if successful)"""
-
     error: NotRequired[RPCError | None]
-    """Error information (if failed)"""
-
     __methods: NotRequired[list[str] | None]
-    """Available methods on namespace (internal metadata for proxy)"""
-
     __timing: NotRequired[RPCTiming | None]
-    """Responder-side clock around the handler, in epoch milliseconds, only
-    when the request asked for it. Both stamps come from the same clock, so
-    their difference carries no offset against the caller's clock."""
 
 
 class RPCTiming(TypedDict):
-    """Responder clock stamps around a handler invocation."""
-
     start: int
-    """Right before the handler is invoked"""
-
     end: int
-    """Right after the handler returned"""
 
 
 class RPCError(TypedDict):
-    """RPC error format."""
-
     code: str
-    """Error code (see ErrorCode)"""
-
     message: str
-    """Human-readable error message"""
-
     data: NotRequired[Any | None]
-    """Additional error data"""
 
 
 class StreamMessage(TypedDict):
-    """Message format for streaming data."""
-
     id: str
-    """Stream ID (same as request ID)"""
-
+    # ping is a producer's probe whether the consumer still listens
     type: Literal["data", "end", "error", "ping"]
-    """Message type; consumers ignore 'ping', a producer's probe for whether they still listen"""
-
     data: NotRequired[Any | None]
-    """Data payload (for 'data' type)"""
-
     error: NotRequired[RPCError | None]
-    """Error information (for 'error' type)"""
 
 
 class PullIteratorRequest(TypedDict):
-    """Request message for pull-based iterators."""
-
     id: str
-    """Iterator ID"""
-
     type: Literal["next", "cancel"]
-    """Request type"""
 
 
 class PullIteratorResponse(TypedDict):
-    """Response message for pull-based iterators."""
-
     id: str
-    """Iterator ID"""
-
     type: Literal["value", "done", "error"]
-    """Response type"""
-
     value: NotRequired[Any | None]
-    """Value (for 'value' type)"""
-
     error: NotRequired[RPCError | None]
-    """Error information (for 'error' type)"""
 
 
 class ErrorCode(StrEnum):
-    """Standard error codes."""
-
     METHOD_NOT_FOUND = "METHOD_NOT_FOUND"
     INVALID_PARAMS = "INVALID_PARAMS"
     INTERNAL_ERROR = "INTERNAL_ERROR"
@@ -473,8 +303,6 @@ class ErrorCode(StrEnum):
 
 
 class ChunkedTransferHeader(TypedDict):
-    """Chunked transfer header."""
-
     type: Literal["chunked"]
     transferId: str
     totalChunks: int
@@ -483,8 +311,6 @@ class ChunkedTransferHeader(TypedDict):
 
 
 class ChunkData(TypedDict):
-    """Individual chunk message."""
-
     transferId: str
     index: int
     data: bytes
@@ -527,16 +353,12 @@ class ConnectionOptions(TypedDict):
 
 
 class CallbackParams(TypedDict):
-    """Parameters for callback subscription request."""
-
     __callback: bool
     __callbackSubject: str
     args: list[Any]
 
 
 class CallbackMessage(TypedDict):
-    """Message format for callback data pushed to subscribers."""
-
     id: str
     type: Literal["data", "error", "ping"]
     data: NotRequired[Any | None]
@@ -544,12 +366,6 @@ class CallbackMessage(TypedDict):
 
 
 class PullCallbackParams(TypedDict):
-    """Parameters for a pull-iterator-with-callbacks request.
-
-    Combines pull-iterator flow control with oneway callbacks for low-latency
-    item-level data delivery. See packages/rpc/PULL_CALLBACK_PROTOCOL.md.
-    """
-
     __pullCallback: bool
     __iteratorId: str
     __callbackSubject: str
@@ -559,9 +375,5 @@ class PullCallbackParams(TypedDict):
 
 
 class CallbackInvocation(TypedDict):
-    """A single oneway callback invocation published from server to client on
-    the callback subject.
-    """
-
     method: str
     args: list[Any]

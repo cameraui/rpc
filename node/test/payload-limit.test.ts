@@ -23,7 +23,6 @@ async function connected(serverMaxPayload: number, maxPayloadSize?: number) {
   return { client, nc, sentTo };
 }
 
-// hands a message to the live subscription of `subject`
 function deliver(nc: ReturnType<typeof createMockNc>, subject: string, message: unknown): void {
   nc.subs.find((sub) => sub.pattern === subject && !sub.isClosed())!.callback(null, { subject, data: encode(message), respond() {}, respondError() {} });
 }
@@ -39,7 +38,6 @@ function pullCallbackParams(iteratorId: string) {
   };
 }
 
-// what the promise settles with within `ms`, 'pending' otherwise
 function within(promise: Promise<unknown>, ms: number): Promise<unknown> {
   return Promise.race([
     promise.then(

@@ -12,9 +12,7 @@ import (
 type DataService struct{}
 
 func (s *DataService) PullBatches(batchCount, chunksPerBatch int, invoker *rpc.CallbackInvoker) (<-chan struct{}, error) {
-	// Unbuffered: the `ch <- struct{}{}` is the yield statement — it must
-	// block until the framework Recv()s on client next() for backpressure
-	// to work.
+	// unbuffered: the send is the yield and must block until the client's next
 	ch := make(chan struct{})
 	go func() {
 		defer close(ch)
@@ -166,7 +164,6 @@ func main() {
 	fmt.Printf("\nTotal test time: %.1fms\n", float64(time.Since(totalStart).Microseconds())/1000.0)
 }
 
-// toInt coerces msgpack-decoded numeric values (int8/int16/int32/int64/uint*/float*) to int64.
 func toInt(v any) (int64, bool) {
 	switch n := v.(type) {
 	case int:

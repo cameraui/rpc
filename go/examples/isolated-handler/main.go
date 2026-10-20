@@ -187,7 +187,7 @@ func main() {
 	fmt.Println("Main server disconnected")
 
 	fmt.Println("Testing handlers after main disconnect...")
-	time.Sleep(100 * time.Millisecond) // Give time for disconnect to propagate
+	time.Sleep(100 * time.Millisecond) // let the disconnect propagate
 	_, err = proxy.Invoke(ctx, "echo", "Should fail")
 	if err != nil {
 		fmt.Printf("Call failed as expected: %v\n", err)

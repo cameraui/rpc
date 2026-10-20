@@ -124,8 +124,6 @@ final class PullCallbackDeliveryTests: XCTestCase {
     XCTAssertNotNil(ended, "next() hung after cancel")
   }
 
-  // serves test.play: every next request gets `frames` callback frames, one
-  // per `every` seconds, then the batch boundary
   private func servePacedPlay(frames: Int, every interval: TimeInterval, timeline: Timeline) {
     let callbackSubjects = Subjects()
     server.onPublish("rpc.test.play") { [server] message in

@@ -10,7 +10,7 @@ import (
 	rpc "github.com/cameraui/rpc/go"
 )
 
-var largeBuffer = []byte(strings.Repeat("x", 2*1024*1024)) // 2MB
+var largeBuffer = []byte(strings.Repeat("x", 2*1024*1024))
 
 func channelExample() error {
 	fmt.Println("Channel Communication Example")

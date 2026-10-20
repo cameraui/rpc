@@ -1,7 +1,5 @@
 package rpc
 
-// see node/src/codec.ts
-
 import (
 	"bytes"
 	"encoding"
@@ -18,9 +16,6 @@ import (
 	"github.com/vmihailenco/tagparser/v2"
 )
 
-// binaryExtractThreshold is the minimum length for a []byte value to be
-// extracted into an out-of-band segment. Must match the Node/Python ports
-// (BINARY_EXTRACT_THRESHOLD).
 const binaryExtractThreshold = 16384
 
 const (
@@ -31,10 +26,7 @@ const (
 
 var cuibMagic = [4]byte{0x43, 0x55, 0x49, 0x42} // "CUIB"
 
-// EncodeMessage encodes a message for the wire. Large binaries
-// (>= binaryExtractThreshold) are extracted into out-of-band segments after
-// the msgpack envelope; binary-free messages stay byte-identical to Encode().
-// The input is never mutated (copy-on-write transform).
+// EncodeMessage encodes a message for the wire, moving large binaries into out-of-band segments after the msgpack envelope.
 func EncodeMessage(v any) ([]byte, error) {
 	transformed, segments := extractBinaries(v)
 	if len(segments) == 0 {
@@ -47,10 +39,6 @@ func EncodeMessage(v any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// encodeMessagePooled is EncodeMessage into a pooled buffer (see
-// encodeBufPool for the release invariant). The extracted segments are copied
-// into the pooled buffer right after the envelope — NATS needs a single
-// contiguous payload slice, so this one copy is unavoidable.
 func encodeMessagePooled(v any) (encoded []byte, release func(), err error) {
 	transformed, segments := extractBinaries(v)
 	if len(segments) == 0 {
@@ -72,17 +60,12 @@ func encodeMessagePooled(v any) (encoded []byte, release func(), err error) {
 	return buf.Bytes(), release, nil
 }
 
-// a message ready for the wire except for the segments, which stay where the
-// caller keeps them until the publish joins or chunks them; head is a plain
-// msgpack message, or the CUIB header and envelope the segments follow
 type wireFrame struct {
 	head     *bytes.Buffer
 	segments [][]byte
 	size     int
 }
 
-// encodeFramePooled is encodeMessagePooled without copying the segments; call
-// release once no publish uses the frame anymore (see encodeBufPool)
 func encodeFramePooled(v any) (wireFrame, error) {
 	transformed, segments := extractBinaries(v)
 	if len(segments) == 0 {
@@ -106,7 +89,6 @@ func encodeFramePooled(v any) (wireFrame, error) {
 	return wireFrame{head: buf, segments: segments, size: size}, nil
 }
 
-// the whole message in one slice, the segments appended to head
 func (f *wireFrame) joined() []byte {
 	if len(f.segments) == 0 {
 		return f.head.Bytes()
@@ -133,8 +115,6 @@ func (f *wireFrame) release() {
 	releaseEncodeBuf(f.head)
 }
 
-// encodeFrame assembles a CUIB frame into buf: 8-byte header, msgpack
-// envelope, then the segments back-to-back in index order.
 func encodeFrame(buf *bytes.Buffer, transformed any, segments [][]byte) error {
 	if err := encodeFrameHead(buf, transformed); err != nil {
 		return err
@@ -150,7 +130,6 @@ func encodeFrame(buf *bytes.Buffer, transformed any, segments [][]byte) error {
 	return nil
 }
 
-// the 8-byte CUIB header and the msgpack envelope
 func encodeFrameHead(buf *bytes.Buffer, transformed any) error {
 	var header [cuibHeaderSize]byte
 	buf.Write(header[:])
@@ -173,9 +152,6 @@ func encodeFrameHead(buf *bytes.Buffer, transformed any) error {
 	return nil
 }
 
-// extractBinaries runs the copy-on-write extraction walk over v. Returns the
-// transformed value and the extracted segments (nil when there are none, in
-// which case the original v must be encoded as-is).
 func extractBinaries(v any) (transformed any, segments [][]byte) {
 	if !containsBinary(v) {
 		return v, nil
@@ -191,10 +167,6 @@ func newPlaceholder(index, length int) map[string]any {
 	return map[string]any{placeholderKey: index, placeholderLenKey: length}
 }
 
-// extractValue is the depth-first copy-on-write transform: extracted binaries
-// become placeholder maps, untouched subtrees keep their identity (no copy
-// for binary-free messages). The second return value reports whether the
-// returned value differs from v.
 func extractValue(v any, segs *[][]byte) (any, bool) {
 	switch t := v.(type) {
 	case nil, bool, string,
@@ -250,9 +222,6 @@ func extractValue(v any, segs *[][]byte) (any, bool) {
 	}
 }
 
-// extractReflect handles typed values (named types, typed slices/maps,
-// pointers and structs) via reflection. Early-out: subtrees whose static type
-// cannot contain a []byte are never walked.
 func extractReflect(rv reflect.Value, segs *[][]byte) (any, bool) {
 	switch rv.Kind() {
 	case reflect.Pointer, reflect.Interface:
@@ -267,7 +236,6 @@ func extractReflect(rv reflect.Value, segs *[][]byte) (any, bool) {
 
 	case reflect.Slice:
 		if rv.Type().Elem().Kind() == reflect.Uint8 {
-			// Named []byte type.
 			if rv.Len() >= binaryExtractThreshold {
 				index := len(*segs)
 				*segs = append(*segs, rv.Bytes())
@@ -340,8 +308,7 @@ func extractReflect(rv reflect.Value, segs *[][]byte) (any, bool) {
 		if changedFields == nil {
 			return rv.Interface(), false
 		}
-		// Re-emit the struct as a msgpack map with the same field names the
-		// struct encoder would have used.
+		// re-emit the struct as a map with the field names the struct encoder would use
 		out := make(map[string]any, len(meta.fields))
 		for i := range meta.fields {
 			f := &meta.fields[i]
@@ -368,8 +335,6 @@ func extractReflect(rv reflect.Value, segs *[][]byte) (any, bool) {
 	}
 }
 
-// extractSequence walks a typed slice/array of non-byte elements. On change
-// the sequence is re-emitted as []any (msgpack array either way).
 func extractSequence(rv reflect.Value, segs *[][]byte) (any, bool) {
 	if !typeCanContainBinary(rv.Type().Elem()) {
 		return rv.Interface(), false
@@ -394,7 +359,6 @@ func extractSequence(rv reflect.Value, segs *[][]byte) (any, bool) {
 	return rv.Interface(), false
 }
 
-// extractValue's paths without Interface(), which would copy each struct behind a pointer or in a slice
 func containsBinary(v any) bool {
 	switch t := v.(type) {
 	case nil, bool, string,
@@ -517,10 +481,7 @@ type structFieldMeta struct {
 }
 
 type structMeta struct {
-	// opaque: the type has a custom msgpack representation (or as_array) —
-	// never traverse or re-emit it.
-	opaque bool
-	// candidate: at least one field could contain an extractable []byte.
+	opaque       bool
 	candidate    bool
 	hasOmitEmpty bool
 	fields       []structFieldMeta
@@ -544,7 +505,7 @@ func buildStructMeta(t reflect.Type, visiting map[reflect.Type]bool) *structMeta
 		return meta
 	}
 	if visiting[t] {
-		// Recursive embedding — treat as opaque rather than looping forever.
+		// recursive embedding, opaque instead of looping forever
 		meta.opaque = true
 		return meta
 	}
@@ -583,9 +544,7 @@ func buildStructMeta(t reflect.Type, visiting map[reflect.Type]bool) *structMeta
 	for _, p := range pending {
 		f, tag := p.f, p.tag
 
-		// Anonymous embedded struct / *struct without custom encoding is
-		// inlined (mirrors vmihailenco's default). Shadowed names are kept on
-		// the outer struct.
+		// an embedded struct without custom encoding is inlined, shadowed names stay on the outer struct
 		if f.Anonymous && !tag.HasOption("noinline") {
 			et := f.Type
 			for et.Kind() == reflect.Pointer {
@@ -640,8 +599,6 @@ func buildStructMeta(t reflect.Type, visiting map[reflect.Type]bool) *structMeta
 	return meta
 }
 
-// fieldByIndexRO resolves a (possibly inlined) field index path, dereferencing
-// intermediate pointers. ok=false when a nil embedded pointer is on the path.
 func fieldByIndexRO(rv reflect.Value, index []int) (reflect.Value, bool) {
 	if len(index) == 1 {
 		return rv.Field(index[0]), true
@@ -675,8 +632,6 @@ func implementsMarshaler(t reflect.Type) bool {
 		t.Implements(textMarshalerIface)
 }
 
-// hasCustomMsgpackEncoding reports whether msgpack serializes t through a
-// custom representation instead of the generic struct/map/slice encoders.
 func hasCustomMsgpackEncoding(t reflect.Type) bool {
 	if t == timeType {
 		return true
@@ -692,9 +647,6 @@ func hasCustomMsgpackEncoding(t reflect.Type) bool {
 
 var binaryCandidateCache sync.Map // reflect.Type -> bool
 
-// typeCanContainBinary reports whether a value of static type t could contain
-// an extractable []byte anywhere in its subtree. Used as the encode-walk
-// early-out: subtrees of non-candidate types are skipped without reflection.
 func typeCanContainBinary(t reflect.Type) bool {
 	if v, ok := binaryCandidateCache.Load(t); ok {
 		return v.(bool)
@@ -731,7 +683,7 @@ func computeCanContainBinary(t reflect.Type, visiting map[reflect.Type]bool) boo
 		return computeCanContainBinary(t.Elem(), visiting)
 	case reflect.Struct:
 		if hasCustomMsgpackEncoding(t) {
-			return false // opaque — msgpack won't emit its fields
+			return false // opaque, msgpack does not emit its fields
 		}
 		visiting[t] = true
 		defer delete(visiting, t)
@@ -760,8 +712,6 @@ func nilableKind(k reflect.Kind) bool {
 	return false
 }
 
-// isEmptyValueLike mirrors vmihailenco/msgpack's isEmptyValue so omitempty
-// fields behave identically when a struct is re-emitted as a map.
 func isEmptyValueLike(v reflect.Value) bool {
 	kind := v.Kind()
 	for kind == reflect.Interface {
@@ -810,9 +760,7 @@ func isEmptyValueLike(v reflect.Value) bool {
 	}
 }
 
-// DecodeMessage decodes a wire message into a generic value. Payloads without
-// the CUIB magic are plain msgpack. For framed payloads the placeholder maps
-// are replaced by zero-copy subslice views into data.
+// DecodeMessage decodes a wire message into a generic value, framed binaries become zero-copy views into data.
 func DecodeMessage(data []byte) (any, error) {
 	var v any
 	if err := DecodeMessageInto(data, &v); err != nil {
@@ -821,18 +769,7 @@ func DecodeMessage(data []byte) (any, error) {
 	return v, nil
 }
 
-// DecodeMessageInto decodes a wire message into v (a non-nil pointer, same
-// contract as Decode). For CUIB frames the envelope is decoded into v first,
-// then every placeholder in v's decoded `any` positions (maps, slices,
-// interface-typed struct fields) is replaced by a zero-copy view into data.
-//
-// Typed targets whose placeholder positions are concrete fields (e.g. a
-// struct with a `Thumbnail []byte` field) cannot take the direct path — the
-// envelope decode chokes on the placeholder map before restoration can run.
-// Those fall back to a generic decode + restore + re-encode with the
-// binaries inlined + typed decode. Costs one extra codec round-trip and a
-// copy of the binaries; only paid for typed targets on frames that actually
-// extracted segments.
+// DecodeMessageInto decodes a wire message into v, a non-nil pointer, framed binaries become zero-copy views into data.
 func DecodeMessageInto(data []byte, v any) error {
 	if len(data) < cuibHeaderSize ||
 		data[0] != cuibMagic[0] || data[1] != cuibMagic[1] ||
@@ -851,6 +788,7 @@ func DecodeMessageInto(data []byte, v any) error {
 		return restoreBinaries(v, data, segmentBase)
 	}
 
+	// a typed []byte field cannot take the placeholder map: decode generic, restore, then convert
 	var generic any
 	if err := Decode(envelope, &generic); err != nil {
 		return err
@@ -858,25 +796,17 @@ func DecodeMessageInto(data []byte, v any) error {
 	if err := restoreBinaries(&generic, data, segmentBase); err != nil {
 		return err
 	}
-	// the failed typed decode left values in v, and msgpack decodes into a
-	// non-nil `any` through the value it holds, which panics when unaddressable
+	// the failed decode left values in v, msgpack panics decoding into a non-nil any field
 	resetValue(v)
 	return convertPooled(generic, v)
 }
 
-// placeholderRef records one placeholder found in the decoded envelope: its
-// segment index, its declared length and a setter that writes the restored
-// view into the placeholder's position.
 type placeholderRef struct {
 	index  int
 	length int
 	set    func([]byte)
 }
 
-// restoreBinaries walks the freshly decoded value graph, collects all
-// placeholders (order-independent — Go map iteration may visit them in any
-// order), validates the segment layout and swaps in the zero-copy views.
-// Segments always lie back-to-back in index order after the envelope.
 func restoreBinaries(target any, data []byte, segmentBase int) error {
 	var refs []placeholderRef
 	if err := collectTyped(reflect.ValueOf(target), &refs); err != nil {
@@ -885,8 +815,7 @@ func restoreBinaries(target any, data []byte, segmentBase int) error {
 
 	offsets, lengths, err := segmentLayout(refs, data, segmentBase)
 	if err != nil {
-		// a typed target may leave out a field that carries a segment, the
-		// envelope still names them all; a frame that does not add up fails here too
+		// a typed target may leave out a field that carries a segment, check the layout against the whole envelope
 		var all []placeholderRef
 		var generic any
 		if Decode(data[cuibHeaderSize:segmentBase], &generic) != nil || collectAny(generic, func([]byte) {}, &all) != nil {
@@ -910,8 +839,6 @@ func restoreBinaries(target any, data []byte, segmentBase int) error {
 	return nil
 }
 
-// the segments lie back-to-back in index order after the envelope and fill
-// the payload exactly
 func segmentLayout(refs []placeholderRef, data []byte, segmentBase int) (offsets, lengths []int, err error) {
 	maxIndex := -1
 	for i := range refs {
@@ -944,11 +871,6 @@ func segmentLayout(refs []placeholderRef, data []byte, segmentBase int) (offsets
 	return offsets, lengths, nil
 }
 
-// placeholderInfo is the strict placeholder check: a map is a placeholder
-// only with EXACTLY the two keys __cui_bin__ and l, both non-negative
-// integers (integral floats accepted, mirroring JS number semantics). User
-// maps with extra keys, missing keys or non-integer values pass through
-// untouched.
 func placeholderInfo(m map[string]any) (index, length int, ok bool) {
 	if len(m) != 2 {
 		return 0, 0, false
@@ -1021,8 +943,6 @@ func asNonNegativeInt(v any) (int, bool) {
 	return int(n), true
 }
 
-// mayHoldPlaceholder is the cheap decode-walk early-out: scalar leaves can
-// never contain a placeholder map.
 func mayHoldPlaceholder(v any) bool {
 	switch v.(type) {
 	case nil, bool, string, []byte,
@@ -1035,10 +955,6 @@ func mayHoldPlaceholder(v any) bool {
 	return true
 }
 
-// collectAny walks a decoded `any` graph (map[string]any / []any containers —
-// the only container types a generic msgpack decode produces). setSelf
-// replaces the value at its own position; nil when the position cannot hold a
-// []byte.
 func collectAny(v any, setSelf func([]byte), refs *[]placeholderRef) error {
 	switch t := v.(type) {
 	case map[string]any:
@@ -1076,9 +992,6 @@ func collectAny(v any, setSelf func([]byte), refs *[]placeholderRef) error {
 	}
 }
 
-// collectTyped walks typed values reachable from the decode target (structs
-// with `any` payload fields like RPCMessage/RPCResponse, typed slices/maps,
-// pointers). Placeholders are only replaceable in interface-typed positions.
 func collectTyped(rv reflect.Value, refs *[]placeholderRef) error {
 	switch rv.Kind() {
 	case reflect.Pointer:
@@ -1123,8 +1036,7 @@ func collectTyped(rv reflect.Value, refs *[]placeholderRef) error {
 
 	case reflect.Map:
 		if m, ok := rv.Interface().(map[string]any); ok {
-			// Typed map[string]any position: values are assignable in place,
-			// but the map itself cannot become a []byte (setSelf nil).
+			// values of a typed map[string]any are assignable in place, the map itself cannot become a []byte
 			return collectAny(m, nil, refs)
 		}
 		mapValue := rv

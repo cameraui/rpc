@@ -5,9 +5,7 @@ import (
 	"fmt"
 )
 
-// CallWithCallback makes an RPC call with a callback subscription.
-// The callback is invoked for each value pushed by the handler.
-// Returns an unsubscribe function.
+// CallWithCallback makes an RPC call with a callback subscription and returns its unsubscribe function.
 func CallWithCallback[T any](client *Client, subject string, args []any, callback func(T)) (func(), error) {
 	return callWithCallback(client, subject, nil, args, callback)
 }
@@ -22,7 +20,6 @@ func callWithCallback[T any](client *Client, subject string, opts *RequestOption
 		}
 	}
 
-	// Subscribe to callback messages
 	unsub, err := client.Subscribe(callbackSubject, func(data []byte) {
 		var msg CallbackMessage
 		if err := DecodeMessageInto(data, &msg); err != nil {
@@ -43,22 +40,19 @@ func callWithCallback[T any](client *Client, subject string, opts *RequestOption
 		return nil, err
 	}
 
-	// Send RPC request with callback marker
 	callbackParams := CallbackParams{
 		Callback:        true,
 		CallbackSubject: callbackSubject,
 		Args:            args,
 	}
 
-	// Use standard call to get initial response
 	resp, err := client.CallWithOptions(context.Background(), subject, opts, callbackParams)
 	if err != nil {
 		unsub()
 		return nil, err
 	}
-	_ = resp // {ok: true}
+	_ = resp
 
-	// Return unsubscribe function
 	unsubscribe := func() {
 		_ = client.Publish(callbackSubject+".cancel", map[string]any{"id": id})
 		unsub()

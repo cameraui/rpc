@@ -212,7 +212,6 @@ func typeCheck(_ name: String, _ actual: Any?) -> Bool {
   }
 }
 
-// mirrors compareValues in tests/test-codec-cross.ts
 func compare(_ name: String, expected: Any?, actual: Any?, typeChecks: Set<String>) -> Bool {
   if name == "float_nan" {
     return numeric(actual)?.isNaN == true

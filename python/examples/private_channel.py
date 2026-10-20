@@ -53,7 +53,7 @@ async def private_channel_example():
     bob_channel = await bob.private_channel("secret-chat", "alice")
     bob_channel_time = (time.perf_counter() - start) * 1000
 
-    # Charlie joins the same channel ID but won't receive anything
+    # the third client joins the same channel id but receives nothing
     start = time.perf_counter()
     charlie_channel = await charlie.private_channel("secret-chat", "alice")
     charlie_channel_time = (time.perf_counter() - start) * 1000
@@ -62,7 +62,7 @@ async def private_channel_example():
         f"Private channels created (Alice: {alice_channel_time:.1f}ms, Bob: {bob_channel_time:.1f}ms, Charlie: {charlie_channel_time:.1f}ms)\n"
     )
 
-    # Give time for handshakes
+    # give the handshakes time
     await asyncio.sleep(0.05)
 
     def alice_handler(data: Any) -> None:
@@ -99,7 +99,7 @@ async def private_channel_example():
     await bob_channel.send({"from": "Bob", "text": "Hi Alice, got your private message!"})
     bob_send_time = (time.perf_counter() - msg_start) * 1000
 
-    # Charlie's send should not be received by Alice or Bob
+    # the third client's send must not reach alice or bob
     msg_start = time.perf_counter()
     await charlie_channel.send({"from": "Charlie", "text": "Can anyone hear me?"})
     charlie_send_time = (time.perf_counter() - msg_start) * 1000
@@ -154,8 +154,7 @@ async def direct_messaging_example():
             await channel.send({"from": self.name, "message": message})
 
         async def listen_for_dms(self):
-            # In a real system, you'd have a discovery mechanism
-            # For this example, we'll just listen on expected channels
+            # a real system would use discovery, this example listens on the expected channels
             pass
 
         async def disconnect(self):
@@ -219,7 +218,7 @@ async def direct_messaging_example():
 
     charlie_from_bob.on("message", charlie_from_bob_handler)
 
-    # Give time for handshakes
+    # give the handshakes time
     await asyncio.sleep(0.05)
 
     print("--- Direct Messages ---")
@@ -232,7 +231,7 @@ async def direct_messaging_example():
     await bob.send_dm("charlie", "Charlie, did you finish the report?")
     bob_dm_time = (time.perf_counter() - dm_start) * 1000
 
-    # Alice and Charlie have no channel set up, so Alice won't receive this
+    # no channel between alice and charlie, so alice does not receive this
     dm_start = time.perf_counter()
     await charlie.send_dm("alice", "Alice, I need your help!")
     charlie_dm_time = (time.perf_counter() - dm_start) * 1000
@@ -248,12 +247,12 @@ async def direct_messaging_example():
         "from": "alice",
         "type": "file",
         "filename": "confidential.pdf",
-        "size": 1024 * 1024 * 3,  # 3MB
+        "size": 1024 * 1024 * 3,
         "data": buffer_3mb,
     }
 
     await alice.send_dm("bob", "Sending you the confidential file...")
-    # Large data is chunked automatically when sent over the channel
+    # large data is chunked automatically over the channel
     channel = alice.channels.get("bob")
     if channel:
         file_start = time.perf_counter()

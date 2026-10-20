@@ -77,7 +77,6 @@ func TestForwardedNoResponderReachesTheCallerAsUpstreamUnavailable(t *testing.T)
 	}
 }
 
-// starts pull iterators but serves no next, which then sees no responders
 func serveHalfIterators(t *testing.T, s *fakeNATS, subject string) {
 	t.Helper()
 	half := connectFake(t, s, nil)

@@ -335,7 +335,7 @@ func TestDefaultRetryReachesALateResponderEarly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 25 ms and 25+50 ms, the old plan needed 500 ms for the first retry
+	// retries at 25 ms and 25+50 ms
 	if at[1] < 20*time.Millisecond || at[1] > 200*time.Millisecond || at[2] > 300*time.Millisecond {
 		t.Errorf("attempts at %v, want the first retry after about 25 ms", at)
 	}

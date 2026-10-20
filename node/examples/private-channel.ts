@@ -39,7 +39,7 @@ async function privateChannelExample() {
   const bobChannel = await bob.privateChannel('secret-chat', 'alice');
   const bobChannelTime = performance.now() - start;
 
-  // Charlie joins the same channel ID but won't receive anything
+  // Charlie joins the same channel id and must receive nothing
   start = performance.now();
   const charlieChannel = await charlie.privateChannel('secret-chat', 'alice');
   const charlieChannelTime = performance.now() - start;
@@ -66,7 +66,7 @@ async function privateChannelExample() {
     if (data.file) {
       data.file = `<${data.file.length} bytes>`;
     }
-    console.log('[Charlie received]:', data); // Should not receive anything
+    console.log('[Charlie received]:', data);
   });
 
   console.log('--- Private Messages ---');
@@ -78,7 +78,7 @@ async function privateChannelExample() {
   await bobChannel.send({ from: 'Bob', text: 'Hi Alice, got your private message!' });
   const bobSendTime = performance.now() - msgStart;
 
-  // Charlie's send should not be received by Alice or Bob
+  // Alice and Bob must not receive what Charlie sends
   msgStart = performance.now();
   await charlieChannel.send({ from: 'Charlie', text: 'Can anyone hear me?' });
   const charlieSendTime = performance.now() - msgStart;
@@ -199,7 +199,7 @@ async function directMessagingExample() {
   await bob.sendDM('charlie', 'Charlie, did you finish the report?');
   const bobDmTime = performance.now() - dmStart;
 
-  // Charlie and Alice have no channel setup, so Alice won't receive it
+  // Charlie and Alice share no channel, so Alice does not receive it
   dmStart = performance.now();
   await charlie.sendDM('alice', 'Alice, I need your help!');
   const charlieDmTime = performance.now() - dmStart;

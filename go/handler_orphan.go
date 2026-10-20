@@ -11,7 +11,6 @@ const (
 	defaultOrphanGrace         = 5 * time.Minute
 )
 
-// every released consumer drops a reply-mux message without an id
 type orphanPing struct {
 	Type string `msgpack:"type"`
 }
@@ -21,8 +20,6 @@ type orphanConfig struct {
 	grace    time.Duration
 }
 
-// probes ride on the session's own publishes and draw a 503 to the producer's
-// reply mux once nobody receives them; an idle session sends ping instead
 type orphanProbe struct {
 	client   *Client
 	interval time.Duration
@@ -30,10 +27,8 @@ type orphanProbe struct {
 	token    string
 	reply    string
 	ping     func(reply string) error
-	// the next data publish carries the probe
-	due atomic.Bool
-	// data went out since the last tick
-	sent atomic.Bool
+	due      atomic.Bool
+	sent     atomic.Bool
 
 	mu      sync.Mutex
 	timer   *time.Timer
@@ -42,7 +37,6 @@ type orphanProbe struct {
 	stopped bool
 }
 
-// nil when the probe is off
 func (c *Client) orphanConfig(override *OrphanProbeOptions) *orphanConfig {
 	opts := c.Options.OrphanProbe
 	if override != nil {
@@ -64,7 +58,6 @@ func (c *Client) orphanConfig(override *OrphanProbeOptions) *orphanConfig {
 	return cfg
 }
 
-// nil without a config, every method of a nil probe is a no-op
 func (c *Client) newOrphanProbe(cfg *orphanConfig, ping func(reply string) error) *orphanProbe {
 	if cfg == nil {
 		return nil
@@ -80,7 +73,6 @@ func (c *Client) newOrphanProbe(cfg *orphanConfig, ping func(reply string) error
 	}
 }
 
-// reap ends the session the way a cancel from the consumer does
 func (p *orphanProbe) start(reap func()) {
 	if p == nil {
 		return
@@ -94,7 +86,6 @@ func (p *orphanProbe) start(reap func()) {
 	p.timer = time.AfterFunc(p.interval, p.tick)
 }
 
-// the reply subject for the next data publish, empty while no probe is due
 func (p *orphanProbe) replyFor() string {
 	if p == nil {
 		return ""
@@ -107,7 +98,6 @@ func (p *orphanProbe) replyFor() string {
 	return p.reply
 }
 
-// the consumer showed up, a request from it for example
 func (p *orphanProbe) alive() {
 	if p == nil {
 		return
@@ -145,9 +135,8 @@ func (p *orphanProbe) tick() {
 	p.mu.Unlock()
 }
 
-// a handler still waiting means the previous probe reached someone; the 503
-// of a probe comes back within a round trip, long before the next one
 func (p *orphanProbe) arm() {
+	// a handler still waiting means the previous probe reached someone, its 503 would be back by now
 	if _, unanswered := p.client.statusHandlers.LoadAndDelete(p.token); unanswered {
 		p.alive()
 	}

@@ -89,7 +89,7 @@ async function runNodeServer() {
 
     getLargeData: async () => {
       console.log('Creating 20MB test data...');
-      const size = 20 * 1024 * 1024; // 20MB
+      const size = 20 * 1024 * 1024;
       const buffer = Buffer.alloc(size);
 
       for (let i = 0; i < size; i++) {
@@ -136,7 +136,7 @@ async function runNodeServer() {
   channel.on('message', async (msg) => {
     console.log('Channel received:', msg);
 
-    // Respond to initial messages from any other service, not responses
+    // answer the first message of every other service, not its responses
     if (msg.from !== 'node' && msg.type !== 'response') {
       await channel.send({
         from: 'node',
@@ -149,7 +149,7 @@ async function runNodeServer() {
 
   console.log('Node.js channel ready');
 
-  // Wait for other services to set up
+  // let the other services set up
   await sleep(3000);
 
   console.log('\nNode.js calling target services...\n');
@@ -182,7 +182,6 @@ async function runNodeServer() {
       const sum = await proxy.calculate(10, 5, 'add');
       console.log(`${target} calculation (10 + 5):`, sum);
 
-      // Dynamic method name per target
       const infoMethod = infoMethodForTarget(target);
       const info = await (proxy as any)[infoMethod]();
       console.log(`${target} info:`, info);
@@ -246,8 +245,7 @@ async function runNodeServer() {
       failures++;
     }
 
-    // Timing metadata: the peer stamps its clock around the handler, so a
-    // reported timing proves the responder understands __timing at all
+    // a reported timing proves the peer understands __timing
     try {
       const seen: { method: string; totalMs: number; handlerMs: number; transportMs: number }[] = [];
       const timed = server.createProxy<{ getLargeData: () => Promise<any> }>(target, {
@@ -268,8 +266,7 @@ async function runNodeServer() {
       failures++;
     }
 
-    // Error propagation: the peer handler throws; it must reach us as a
-    // rejected call carrying the same message, not a silent success.
+    // the peer handler throws, its message must come back as a rejected call
     const errToken = `boom node->${target}`;
     try {
       await (proxy as any).raiseError(errToken);

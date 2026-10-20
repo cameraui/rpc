@@ -51,7 +51,7 @@ async def main():
 
     print(f"Private channels created (A: {channel_a_time:.1f}ms, B: {channel_b_time:.1f}ms)")
 
-    # Give time for handshakes
+    # give the handshakes time
     await asyncio.sleep(0.1)
 
     def client_a_handler(data: Any) -> None:

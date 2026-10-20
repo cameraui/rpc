@@ -29,8 +29,6 @@ func expectConnectionClosed(t *testing.T, what string, err error) {
 	}
 }
 
-// parks after the first item until ctx ends, a lib without the ctx parameter
-// hands it nil and the producer waits for the test to end
 func parkedProducer(ctx context.Context, release <-chan struct{}, done chan<- struct{}) <-chan int {
 	ch := make(chan int)
 	go func() {
@@ -49,7 +47,6 @@ func parkedProducer(ctx context.Context, release <-chan struct{}, done chan<- st
 	return ch
 }
 
-// ten sends, watching neither a context nor Active, so it blocks until someone receives
 func unawareProducer[T any](v T, done chan<- struct{}) <-chan T {
 	ch := make(chan T)
 	go func() {
@@ -393,8 +390,7 @@ func TestTeardownEndsOpenSessions(t *testing.T) {
 			case <-time.After(time.Second):
 				t.Fatal("the push stream consumer got nothing")
 			}
-			// an unaware session first hands over the values fetched before the stop, the next
-			// request after them may see no responders before the terminal message arrives
+			// an unaware session first hands over the values fetched before the stop, the next request may see no responders before the terminal message
 			for name, ch := range pulls {
 				deadline := time.After(time.Second)
 			read:
@@ -431,7 +427,6 @@ func TestTeardownEndsOpenSessions(t *testing.T) {
 	}
 }
 
-// holds the publish of the Invoke it is passed to until released
 type gatedArg struct {
 	once    sync.Once
 	entered chan struct{}

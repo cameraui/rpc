@@ -12,12 +12,11 @@ import (
 
 const deniedSubject = "rpc.sensors.rpc.getSensors"
 
-// nats.go hands a refused publish to the async error callback in this form
 func refusedPublish(subject string) error {
+	// nats.go hands a refused publish to the async error callback in this form
 	return fmt.Errorf("%w: %s", nats.ErrPermissionViolation, fmt.Sprintf("Permissions Violation for Publish to %q", subject))
 }
 
-// a responder that never answers, so only the refusal can end the call
 func silentResponder(t *testing.T, s *fakeNATS, subjects ...string) {
 	t.Helper()
 	silent := connectFake(t, s, nil)

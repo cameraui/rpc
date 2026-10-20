@@ -12,38 +12,16 @@ import type { ChunkingManager } from './chunking.js';
 import type { RPCClient } from './client.js';
 import type { RPCResponse } from './types.js';
 
-/**
- * Service metadata: each instance also takes requests on its own subject,
- * see directSubject().
- *
- * Internal: utils.ts uses it.
- */
 export const DIRECT_SUBJECT_METADATA = 'cui.chunk.direct';
 
-/**
- * The subject of one service instance for an endpoint. The header and chunks
- * of a chunked request go there: a queue group would hand them to different
- * instances.
- *
- * Internal: utils.ts uses it.
- */
 export function directSubject(instanceId: string, path: string): string {
   return `$CUI.SVC.${instanceId}.${path}`;
 }
 
-/**
- * The endpoint subject only this service has, next to the bare one that two
- * services with the same method name share.
- *
- * Internal: utils.ts uses it.
- */
 export function serviceSubject(serviceName: string, path: string): string {
   return `svc.${serviceName}.${path}`;
 }
 
-/**
- * RPC Service wrapper with automatic encoding/decoding and streaming support
- */
 export class RPCService {
   private svc?: Svcm;
   private services: NATSService[] = [];
@@ -51,13 +29,8 @@ export class RPCService {
 
   constructor(private client: RPCClient) {}
 
-  /**
-   * Initialize the service manager. Re-initializes when the underlying
-   * connection changed (suspend()+connect() creates a fresh NatsConnection) —
-   * a Svcm bound to the old, closed connection would break monitor() and
-   * service discovery after every reconnect cycle.
-   */
   public init(nc: NatsConnection): void {
+    // suspend() and connect() bring a new connection, a Svcm on the old one breaks monitor() and discovery
     if (this.nc === nc) {
       return;
     }
@@ -67,16 +40,6 @@ export class RPCService {
     this.services = [];
   }
 
-  /**
-   * Add a service with automatic RPC endpoint wrapping
-   * Supports objects, classes, nested structures, streaming, callbacks,
-   * pull iterators and chunking.
-   *
-   * Every method is served on its bare endpoint subject, on
-   * svc.<service name>.<path>, which no other service shares, and for
-   * chunked requests on a subject of this instance alone (announced in the
-   * service metadata). A request is answered on <its subject>.reply.<id>.
-   */
   public async registerHandler(config: ServiceConfig, handlers: object, options?: { isolatedConnection?: boolean }): Promise<Service> {
     if (!this.svc) {
       throw new Error('RPCService is not initialized. Call init() first.');
@@ -87,21 +50,17 @@ export class RPCService {
     const probe = probeSettings(this.client.options.orphanProbe);
     const endpointChunking: ChunkingManager[] = [];
 
-    // Use isolated connection if requested
     let serviceClient = this.client;
     let svc = this.svc;
 
     if (options?.isolatedConnection) {
-      // Create isolated connection for this service
       serviceClient = this.client.createIsolatedClient({
         ...this.client.options,
         name: `${this.client.options.name}-service-${config.name}`,
       });
 
-      // Initialize isolated client
       const nc = await serviceClient.connect();
 
-      // Create service manager for isolated connection
       svc = new Svcm(nc);
     }
 
@@ -110,15 +69,12 @@ export class RPCService {
     const instanceId = service.info().id;
     const directUnsubscribes: (() => void)[] = [];
 
-    // Store reference to isolated connection if used
     if (options?.isolatedConnection) {
       (service as any)._isolatedClient = serviceClient;
     }
 
-    // Extract all methods including nested ones
     const methods = extractNestedMethodsWithDecorators(handlers);
 
-    // Create groups for nested paths
     const groups = new Map<string, ServiceGroup>();
 
     for (const [path, handler] of Object.entries(methods)) {
@@ -127,7 +83,6 @@ export class RPCService {
 
       let target: NATSService | ServiceGroup = service;
 
-      // Create nested groups if needed
       if (parts.length > 0) {
         const groupPath = parts.join('.');
         if (!groups.has(groupPath)) {
@@ -154,7 +109,6 @@ export class RPCService {
           const chunkType = msg.headers?.get('x-chunked-transfer');
 
           if (chunkType === 'header') {
-            // Chunked transfer header
             const data = decode(msg.data);
             const chunkId = msg.headers?.get('x-chunk-id');
 
@@ -163,22 +117,19 @@ export class RPCService {
               return;
             }
 
-            // Setup chunk assembly, the buffer is allocated with the first chunk
             chunking.startReceiving(
               data.transferId,
               data.totalChunks,
               async (assembledData) => {
-                // Process the assembled RPC message
                 await processRPCMessage(assembledData, msg);
               },
               (error) => {
                 console.error(`Error assembling chunks for ${methodName}:`, error);
               },
-              data.totalSize, // Pass totalSize for the single assembly buffer
-              data.chunkSize, // Pass chunkSize for correct offset calculation
+              data.totalSize,
+              data.chunkSize,
             );
           } else if (chunkType === 'chunk') {
-            // Chunk data
             const chunkId = msg.headers?.get('x-chunk-id');
             const chunkIndex = parseChunkIndex(msg.headers?.get('x-chunk-index'));
 
@@ -187,15 +138,13 @@ export class RPCService {
               return;
             }
 
-            // Process raw chunk data
             chunking.processChunk({
               id: chunkId,
               chunkIndex,
               data: msg.data,
-              isLast: false, // Determined by total chunks from header
+              isLast: false, // the header's totalChunks decides
             });
           } else {
-            // Regular message - decode wire message (zero-copy binary views)
             const rpcMsg = decodeMessage(msg.data);
             await processRPCMessage(rpcMsg, msg);
           }
@@ -203,8 +152,6 @@ export class RPCService {
           console.error(`Error processing message for ${methodName}:`, error);
         }
 
-        // Define the RPC message processor function. The reply goes to the
-        // subject the request came on, also for the svc. and direct subjects.
         async function processRPCMessage(rpcMsg: any, originalMsg: ServiceMsg) {
           const response: RPCResponse = { id: rpcMsg.id };
 
@@ -233,7 +180,7 @@ export class RPCService {
               await serviceClient.publish(replySubject, response);
             } catch (publishError) {
               if (serviceClient.isClosed) {
-                return; // Ignore if client is closed
+                return;
               }
 
               console.error('Failed to send error response:', publishError);
@@ -242,19 +189,25 @@ export class RPCService {
         }
       };
 
-      // Add endpoint with auto-encoding/decoding
       target.addEndpoint(methodName, endpointHandler);
       service.addEndpoint(methodName, { handler: endpointHandler, subject: serviceSubject(config.name, path) });
-      directUnsubscribes.push(serviceClient.subscribeMessages(directSubject(instanceId, path), (msg: Msg) => void endpointHandler(null, msg as ServiceMsg), false));
+      directUnsubscribes.push(
+        serviceClient.subscribeMessages(
+          directSubject(instanceId, path),
+          (msg: Msg) => {
+            endpointHandler(null, msg as ServiceMsg);
+          },
+          false,
+        ),
+      );
     }
 
-    // Override stop method to end the open stream and pull sessions
+    // stop() also ends the open sessions and the direct subscriptions
     const originalStop = service.stop.bind(service);
     service.stop = async (err?: Error) => {
       for (const unsubscribe of directUnsubscribes.splice(0)) unsubscribe();
       await Promise.allSettled(owner.stop());
 
-      // Call original stop
       try {
         return await originalStop(err);
       } finally {
@@ -265,9 +218,6 @@ export class RPCService {
     return new Service(service);
   }
 
-  /**
-   * Get service monitoring client
-   */
   public monitor(): ServiceClient {
     if (!this.svc) {
       throw new Error('RPCService is not initialized. Call init() first.');
@@ -276,14 +226,10 @@ export class RPCService {
     return this.svc.client({ strategy: 'stall', stall: 10, maxWait: 2000 });
   }
 
-  /**
-   * Stop all services and cleanup isolated connections
-   */
   public async stopAll(): Promise<void> {
     await Promise.allSettled(
       this.services.map(async (s) => {
         await s.stop();
-        // Disconnect isolated connection if present
         const isolatedClient: RPCClient | undefined = (s as any)._isolatedClient;
         if (isolatedClient) {
           await isolatedClient.disconnect();
@@ -293,51 +239,35 @@ export class RPCService {
     this.services = [];
   }
 
-  /**
-   * Stop a specific service by name
-   */
   public async stop(serviceName: string): Promise<void> {
     const service = this.services.find((s) => s.info().name === serviceName);
     if (service) {
       try {
         await service.stop();
-        // Disconnect isolated connection if present
         const isolatedClient: RPCClient | undefined = (service as any)._isolatedClient;
         if (isolatedClient) {
           await isolatedClient.disconnect();
         }
         this.services = this.services.filter((s) => s !== service);
       } catch {
-        // Ignore errors during stop
+        // ignore
       }
     }
   }
 
-  /**
-   * Get all services info
-   */
   public getAllInfo(): ServiceInfo[] {
     return this.services.map((s) => s.info());
   }
 
-  /**
-   * Get info for a specific service
-   */
   public getInfo(serviceName: string): ServiceInfo | undefined {
     const service = this.services.find((s) => s.info().name === serviceName);
     return service?.info();
   }
 
-  /**
-   * Get all services stats
-   */
   public async getAllStats(): Promise<ServiceStats[]> {
     return Promise.all(this.services.map((s) => s.stats()));
   }
 
-  /**
-   * Get stats for a specific service
-   */
   public async getStats(serviceName: string): Promise<ServiceStats | undefined> {
     const service = this.services.find((s) => s.info().name === serviceName);
     return service?.stats();
@@ -363,7 +293,7 @@ export class Service {
     try {
       await this.natsService.stop(err);
     } catch {
-      // Ignore errors during stop
+      // ignore
     }
   }
 }

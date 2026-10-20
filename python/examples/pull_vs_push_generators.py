@@ -159,7 +159,7 @@ async def test_memory_pressure(service: Any):
     max_memory_pull = initial_memory
 
     pull_gen = service.pull_large_data(20)
-    # Delay has no effect - nothing is generated yet
+    # the delay has no effect, nothing is generated yet
     await asyncio.sleep(1)
 
     async for _ in pull_gen:

@@ -7,7 +7,6 @@ import uvloop
 
 from camera_ui_rpc import RPCClass, create_rpc_client
 
-# Pre-allocate buffers for consistent performance testing
 buffer_10mb = b"x" * (10 * 1024 * 1024)
 buffer_20mb = b"x" * (20 * 1024 * 1024)
 
@@ -15,7 +14,7 @@ buffer_20mb = b"x" * (20 * 1024 * 1024)
 @RPCClass
 class DataService:
     async def generate_large_data(self, size_mb: int) -> AsyncGenerator[bytes, None]:
-        chunk_size = 1024 * 1024  # 1MB chunks
+        chunk_size = 1024 * 1024
         total_size = size_mb * 1024 * 1024
         sent = 0
 
@@ -126,7 +125,7 @@ async def main():
 
     print("Sending 5MB through channel in chunks...")
     start = time.perf_counter()
-    chunk_size = 512 * 1024  # 512KB chunks
+    chunk_size = 512 * 1024
     total_size = 5 * 1024 * 1024
     sent = 0
 

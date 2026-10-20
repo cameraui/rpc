@@ -161,7 +161,7 @@ async function testMemoryPressure(service: DataService) {
   let maxMemoryPull = initialMemory.heapUsed;
 
   const pullIterator = service.pullLargeData(20);
-  // Delay has no effect - nothing is generated yet
+  // nothing is generated yet, so the delay changes nothing
   await new Promise((resolve) => setTimeout(resolve, 1000));
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars

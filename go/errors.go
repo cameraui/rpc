@@ -27,7 +27,7 @@ type RPCException struct {
 	Msg     string
 	Details any
 
-	// the subject nobody served, set only on a no-responder error this client saw itself
+	// subject nobody served, set only on a no-responder error this client saw itself
 	upstream string
 }
 
@@ -65,10 +65,7 @@ func RPCExceptionFromError(e *RPCError) *RPCException {
 	}
 }
 
-// FormatErrorObject converts any error into an RPCError for the wire. A
-// no-responder error this client saw itself, also wrapped with %w, goes out as
-// INTERNAL_ERROR "upstream unavailable" with the subject in Data, so the caller
-// does not take it for a no-responder of its own call and retry it.
+// FormatErrorObject converts any error into a wire RPCError; a no-responder error this client saw itself goes out as INTERNAL_ERROR so the caller does not retry it.
 func FormatErrorObject(err error) *RPCError {
 	var local *RPCException
 	if errors.As(err, &local) && local.upstream != "" {
@@ -91,8 +88,6 @@ func FormatErrorObject(err error) *RPCError {
 	}
 }
 
-// a no-responder failure this client saw itself (503 status or
-// nats.ErrNoResponders); only these are retried, a remote NOT_FOUND is not
 type localNoResponders struct {
 	err *RPCException
 }

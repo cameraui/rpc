@@ -15,8 +15,8 @@ import (
 )
 
 var (
-	mediumData = make([]byte, 5*1024*1024)  // 5MB
-	largeData  = make([]byte, 10*1024*1024) // 10MB
+	mediumData = make([]byte, 5*1024*1024)
+	largeData  = make([]byte, 10*1024*1024)
 )
 
 func init() {
@@ -168,7 +168,7 @@ func testAllFeatures() error {
 	end()
 
 	fmt.Println("\n1. Native Request/Reply")
-	// Setup (handler registration + subscription settle) outside the measurement
+	// setup stays outside the measurement
 	unsub1, err := server.OnRequest("echo.*", func(data []byte) (any, error) {
 		var payload map[string]any
 		if err := rpc.Decode(data, &payload); err != nil {
@@ -316,7 +316,6 @@ func testAllFeatures() error {
 		}
 	}
 
-	// Wait for the receive counter instead of a fixed sleep
 	if err := waitFor(func() bool { return messagesReceived.Load() >= 1000 }, 10*time.Second); err != nil {
 		return fmt.Errorf("channel messages: %w (got %d)", err, messagesReceived.Load())
 	}
@@ -389,7 +388,7 @@ func testAllFeatures() error {
 
 	end()
 
-	// Verification (settle sleep + discovery) outside the measurement
+	// verification stays outside the measurement
 	sleep(100)
 
 	info := service.Info()
@@ -525,7 +524,6 @@ func testAllFeatures() error {
 		return fmt.Errorf("concurrent count mismatch: got %d, want 500", concurrentCount)
 	}
 
-	// Keep handler for mixed workload test
 	end()
 
 	fmt.Println("\n10. Error Handling")

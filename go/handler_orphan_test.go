@@ -32,7 +32,6 @@ func staysOpen(t *testing.T, ch <-chan struct{}, d time.Duration, what string) {
 	}
 }
 
-// a handler whose callback session reports its end
 func callbackHandler(ended chan struct{}, publish func(cb func(int))) map[string]any {
 	return map[string]any{
 		"watch": func(cb func(int)) func() {

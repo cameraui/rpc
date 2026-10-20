@@ -317,7 +317,7 @@ func crossCompare(expected, actual any, testName string) bool {
 		return false
 	}
 
-	// Binary — DecodeRaw with UseLooseInterfaceDecoding decodes msgpack bin as string
+	// DecodeRaw with UseLooseInterfaceDecoding decodes msgpack bin as string
 	if eb, ok := expected.([]byte); ok {
 		if ab, ok := actual.([]byte); ok {
 			if len(eb) == 0 && len(ab) == 0 {

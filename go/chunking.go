@@ -23,18 +23,12 @@ const (
 	minPayloadLimit = 16384
 )
 
-// what publishFrame needs of a *nats.Conn, nats.go copies data before each returns
 type framePublisher interface {
 	Publish(subject string, data []byte) error
 	PublishRequest(subject, reply string, data []byte) error
 	PublishMsg(msg *nats.Msg) error
 }
 
-// a frame over maxPayload goes out as a chunked transfer cut straight from
-// head and segments: a chunk inside one of them is sent as a view, one that
-// spans several is joined in a scratch buffer reused for every chunk, so no
-// buffer of the whole message exists. With unchunked, maxPayload is a payload
-// limit below minPayloadLimit and a frame over it fails without being sent.
 func publishFrame(nc framePublisher, subject, reply string, f *wireFrame, maxPayload int, unchunked bool) error {
 	if f.size <= maxPayload {
 		if reply != "" {
@@ -112,6 +106,7 @@ func publishFrame(nc framePublisher, subject, reply string, f *wireFrame, maxPay
 				if err := send(fill); err != nil {
 					return err
 				}
+				// nats.go copied the data before PublishMsg returned
 				fill = fill[:0]
 			}
 		}
@@ -159,8 +154,7 @@ type ChunkAssembler struct {
 	reserved    int
 }
 
-// NewChunkAssembler creates an assembler for totalSize bytes sent in totalChunks
-// chunks of chunkSize bytes. The buffer is allocated with the first valid chunk.
+// NewChunkAssembler creates an assembler for totalSize bytes sent in totalChunks chunks of chunkSize bytes.
 func NewChunkAssembler(id string, totalSize, totalChunks, chunkSize int) *ChunkAssembler {
 	return &ChunkAssembler{
 		id:          id,
@@ -170,9 +164,7 @@ func NewChunkAssembler(id string, totalSize, totalChunks, chunkSize int) *ChunkA
 	}
 }
 
-// AddChunk writes a chunk into the buffer. A chunk whose index or length does
-// not fit the transfer is rejected with an error, a repeated index is ignored.
-// Returns true if all chunks are received.
+// AddChunk writes a chunk into the buffer and reports whether all chunks are received.
 func (a *ChunkAssembler) AddChunk(chunk ChunkData) (bool, error) {
 	if chunk.ID != a.id {
 		return false, fmt.Errorf("chunk ID mismatch: expected %s, got %s", a.id, chunk.ID)
@@ -213,7 +205,7 @@ func (a *ChunkAssembler) IsComplete() bool {
 	return a.count == a.totalChunks
 }
 
-// GetData returns the reassembled raw data. It must be decoded by the caller.
+// GetData returns the reassembled raw data, which the caller still has to decode.
 func (a *ChunkAssembler) GetData() ([]byte, error) {
 	if !a.IsComplete() {
 		return nil, fmt.Errorf("not all chunks received")
@@ -234,9 +226,7 @@ func (a *ChunkAssembler) release() {
 	a.reserved = 0
 }
 
-// ChunkingManager manages multiple concurrent chunk transfers. A transfer
-// that receives no chunk for 30 seconds is dropped and its error callback
-// runs on a timer goroutine.
+// ChunkingManager manages concurrent chunk transfers and drops one that gets no chunk for 30 seconds.
 type ChunkingManager struct {
 	mu              sync.Mutex
 	assemblers      map[string]*ChunkAssembler
@@ -251,8 +241,7 @@ type ChunkingManager struct {
 	timerGen        int
 }
 
-// NewChunkingManager creates a new ChunkingManager that accepts transfers up
-// to 1 GiB, and up to 1 GiB held by all transfers in progress together.
+// NewChunkingManager creates a ChunkingManager with 1 GiB per transfer and 1 GiB for all transfers in progress.
 func NewChunkingManager() *ChunkingManager {
 	return newChunkingManager(0, nil)
 }
@@ -276,11 +265,7 @@ func newChunkingManager(maxTransferSize int, budget *transferBudget) *ChunkingMa
 	}
 }
 
-// StartReceiving begins receiving chunks for a transfer. A header whose sizes
-// are inconsistent or over the limit, or one beyond 32 concurrent transfers,
-// is dropped before any buffer is allocated and reported through onError. A
-// transfer whose buffer would exceed the bytes left for transfers in progress
-// is dropped with its first chunk.
+// StartReceiving begins receiving chunks for a transfer and drops a header that is inconsistent, too large or over the concurrency limit.
 func (m *ChunkingManager) StartReceiving(id string, totalChunks int, onComplete func([]byte), onError func(error), totalSize, chunkSize int) {
 	m.mu.Lock()
 	err := validateChunkHeader(totalChunks, totalSize, chunkSize, m.maxTransferSize)
@@ -307,8 +292,7 @@ func (m *ChunkingManager) StartReceiving(id string, totalChunks int, onComplete 
 	}
 }
 
-// ProcessChunk processes an incoming chunk. A chunk for an unknown transfer is
-// ignored; an invalid chunk drops its transfer and calls the error callback.
+// ProcessChunk processes an incoming chunk; an invalid chunk drops its transfer and calls the error callback.
 func (m *ChunkingManager) ProcessChunk(chunk ChunkData) {
 	m.mu.Lock()
 	assembler, ok := m.assemblers[chunk.ID]
@@ -354,8 +338,7 @@ func (m *ChunkingManager) Cancel(id string) {
 	m.fail(id, errors.New("transfer cancelled"))
 }
 
-// Close drops every transfer in progress without calling its callbacks and
-// stops the stale-transfer timer. The manager can be used again afterwards.
+// Close drops every transfer in progress without calling its callbacks; the manager stays usable.
 func (m *ChunkingManager) Close() {
 	m.mu.Lock()
 	if m.timer != nil {
@@ -445,8 +428,6 @@ func (m *ChunkingManager) sweepStale(gen int) {
 	}
 }
 
-// one budget is shared by every manager of a client, so per-subscription
-// managers cannot multiply the memory a sender can make it reserve
 type transferBudget struct {
 	limit int
 	used  atomic.Int64
@@ -514,9 +495,8 @@ func decodeChunk(hdrs nats.Header, data []byte) (ChunkData, error) {
 	return ChunkData{ID: id, ChunkIndex: index, Data: data}, nil
 }
 
-// senders write the index with toString, str or strconv.Itoa, so a sign, a
-// blank or more than 15 digits (beyond an exact float64) is never a real index
 func parseChunkIndex(raw string) (int, bool) {
+	// more than 15 digits is beyond an exact float64, never a real index
 	if raw == "" || len(raw) > 15 {
 		return 0, false
 	}

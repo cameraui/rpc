@@ -495,7 +495,6 @@ final class RPCClientTransportTests: XCTestCase {
     }
   }
 
-  // next requests stay unanswered, like a producer waiting at the live edge
   private func servePullInit(_ method: String) {
     server.onPublish("rpc.test.\(method)") { [server] message in
       let envelope = FakeNatsServer.decode(message)
@@ -551,7 +550,6 @@ final class OnceFlag: @unchecked Sendable {
   }
 }
 
-// the value of `task`, or nil when it is still running after `seconds`
 func result<T: Sendable>(of task: Task<T, Never>, within seconds: TimeInterval) async -> T? {
   let settled = OnceFlag()
   return await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in

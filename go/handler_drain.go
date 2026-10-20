@@ -13,8 +13,7 @@ const (
 	defaultDrainTimeout = 250 * time.Millisecond
 	// requests queued behind a call the deadline gave up on are answered within this
 	drainGrace = 50 * time.Millisecond
-	// a shorter call ends within the grace, its delivery goroutine then answers the
-	// queue; a handoff costs CPU on every call, so only longer calls take one
+	// a handoff costs CPU on every call, so only calls longer than this take one
 	handoffAfter = drainGrace / 2
 )
 
@@ -24,21 +23,17 @@ const (
 	replyDone
 )
 
-// a call running on its own goroutine, the drain deadline answers it when it is still running
 type handlerCall struct {
 	id     string
 	state  *atomic.Int32
 	cancel context.CancelFunc
 }
 
-// closed at the drain deadline: a request handled after it gets CONNECTION_CLOSED
 type drainSignal struct {
 	expired chan struct{}
 }
 
-// a method served one call at a time; the drain deadline answers its running call
 type serialMethod struct {
-	// the last call returned within handoffAfter, a new method starts slow
 	fast    atomic.Bool
 	current atomic.Pointer[handlerCall]
 }
@@ -49,10 +44,8 @@ type handlerRegistration struct {
 	entries   []*subscriptionEntry
 	discovery *subscriptionEntry
 	methods   []*serialMethod
-	// methods served off the delivery goroutine: namespace subscription or WithDropExpired
-	lanes *laneSet
+	lanes     *laneSet
 
-	// calls end with the drain, sessions with the owner when the handler is unregistered
 	callCtx     context.Context
 	cancelCalls context.CancelFunc
 	signal      atomic.Pointer[drainSignal]
@@ -61,7 +54,6 @@ type handlerRegistration struct {
 	inflight sync.WaitGroup
 	stopped  bool
 	calls    map[*handlerCall]struct{}
-	// closed when the running drain ends, a second drain waits for it
 	draining chan struct{}
 }
 
@@ -84,15 +76,14 @@ func (r *handlerRegistration) addMethod() *serialMethod {
 	return m
 }
 
-// nil when the registration does not drain, a nil channel never fires in a select
 func (r *handlerRegistration) expiry() <-chan struct{} {
 	if !r.drains {
+		// a nil channel never fires in a select
 		return nil
 	}
 	return r.signal.Load().expired
 }
 
-// a request that was answered already stays as it is
 func (r *handlerRegistration) closeCall(state *atomic.Int32, id string) {
 	if id == "" || !state.CompareAndSwap(replyOpen, replyDone) {
 		return
@@ -100,7 +91,6 @@ func (r *handlerRegistration) closeCall(state *atomic.Int32, id string) {
 	_ = r.client.Publish("rpc.reply."+id, RPCResponse{ID: id, Error: connectionClosedError()})
 }
 
-// a stream caller reads only its stream subject
 func (r *handlerRegistration) closeStream(id string, params any) {
 	subject, _ := extractStreamParams(params)
 	if !isControlSubject(subject, streamSubjectPrefix) {
@@ -109,7 +99,6 @@ func (r *handlerRegistration) closeStream(id string, params any) {
 	_ = r.client.Publish(subject, StreamMessage{ID: id, Type: "error", Error: connectionClosedError()})
 }
 
-// false once the registration stopped, the call then runs on the delivery goroutine as before
 func (r *handlerRegistration) track(call *handlerCall) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -130,15 +119,14 @@ func (r *handlerRegistration) untrack(call *handlerCall) {
 	r.inflight.Done()
 }
 
-// a late delivery is no longer counted, so the wait ends
 func (r *handlerRegistration) stop() {
 	r.mu.Lock()
+	// a late delivery is no longer counted, so the wait ends
 	r.stopped = true
 	r.mu.Unlock()
 	r.inflight.Wait()
 }
 
-// nil and false when another drain of this registration runs, done then ends with it
 func (r *handlerRegistration) beginDrain() (done <-chan struct{}, started bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -156,8 +144,6 @@ func (r *handlerRegistration) endDrain() {
 	r.mu.Unlock()
 }
 
-// the server stops routing to the subscriptions, what reached the client is
-// still delivered; the method list goes first
 func (r *handlerRegistration) drainSubscriptions() []*nats.Subscription {
 	r.client.subMu.Lock()
 	defer r.client.subMu.Unlock()
@@ -180,8 +166,6 @@ func (r *handlerRegistration) idle() bool {
 	return calls == 0 && r.lanes.idle()
 }
 
-// closeCall answers once, whether the sweep or the delivery goroutine of a
-// slow serial call, which waits on the signal, comes first
 func (r *handlerRegistration) expire() {
 	r.mu.Lock()
 	sig := r.signal.Load()
@@ -201,13 +185,13 @@ func (r *handlerRegistration) expire() {
 		}
 	}
 
+	// closeCall answers once, whichever of this sweep and a slow serial call's delivery goroutine comes first
 	for _, call := range calls {
 		r.closeCall(call.state, call.id)
 		call.cancel()
 	}
 }
 
-// Suspend keeps the registration, the restored subscriptions serve again
 func (r *handlerRegistration) resume() {
 	r.lanes.clear()
 	r.signal.Store(&drainSignal{expired: make(chan struct{})})
@@ -245,8 +229,6 @@ func (c *Client) handlerRegistrations() []*handlerRegistration {
 	return regs
 }
 
-// requests the handlers of regs already received finish or get CONNECTION_CLOSED
-// before their subscriptions go; a no-op without a connection
 func (c *Client) drainHandlers(regs []*handlerRegistration) {
 	timeout := c.drainTimeout()
 	c.mu.RLock()
@@ -315,9 +297,9 @@ func (c *Client) drainHandlers(regs []*handlerRegistration) {
 	}
 }
 
-// a removed subscription counts as idle
 func subscriptionsIdle(subs []*nats.Subscription) bool {
 	for _, sub := range subs {
+		// a removed subscription errors here and counts as idle
 		if n, _, err := sub.Pending(); err == nil && n > 0 {
 			return false
 		}

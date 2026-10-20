@@ -1,5 +1,3 @@
-"""RPC Service wrapper with automatic encoding/decoding and streaming support."""
-
 import asyncio
 import contextlib
 import json
@@ -49,10 +47,7 @@ _Teardown = Callable[[], Coroutine[Any, Any, None]]
 _Info = TypeVar("_Info")
 
 DISCOVERY_TIMEOUT = 2.0
-"""Seconds discovery waits for the first service to answer."""
-
-DISCOVERY_STALL = 0.01
-"""Seconds discovery waits for further services after the last answer."""
+DISCOVERY_STALL = 0.01  # seconds of quiet after the last answer before discovery ends
 
 
 def _forget_session(own: dict[str, _Teardown], tracked: dict[str, _Teardown], session_id: str) -> None:
@@ -75,8 +70,6 @@ def _take_sessions(own: dict[str, _Teardown], tracked: dict[str, _Teardown]) -> 
 
 
 class RPCService:
-    """RPC Service wrapper with automatic encoding/decoding and streaming support."""
-
     def __init__(self, client: "RPCClient"):
         self.__client: RPCClient = client
         self.__svc: Svcm | None = None
@@ -84,13 +77,6 @@ class RPCService:
         self.__nc: NATSClient | None = None
 
     def init(self, nc: NATSClient) -> None:
-        """Initialize the service manager.
-
-        Re-initializes when the underlying connection changed (suspend() +
-        connect() creates a fresh NATS connection) — a Svcm bound to the old,
-        closed connection would break service registration after every
-        reconnect cycle.
-        """
         if self.__nc is nc:
             return
 
@@ -101,11 +87,9 @@ class RPCService:
     async def register_handler(
         self, config: ServiceConfig, handlers: object, isolated_connection: bool = False
     ) -> "Service":
-        """Add a service with automatic RPC endpoint wrapping."""
         if not self.__svc:
             raise RuntimeError("RPCService is not initialized. Call init() first.")
 
-        # Use isolated connection if requested
         service_client = self.__client
         svc = self.__svc
 
@@ -116,13 +100,10 @@ class RPCService:
                 "name": f"{self.__client.options['name']}-service-{config.name}",
             }
 
-            # Create isolated connection for this service
             service_client = self.__client.create_isolated_client(opts)
 
-            # Initialize isolated client
             nc = await service_client.connect()
 
-            # Create service manager for isolated connection
             svc = Svcm(nc)
 
         service = await svc.add(
@@ -132,7 +113,6 @@ class RPCService:
         instance_id = service.info().id
         direct_subscriptions: list[Any] = []
 
-        # Store reference to isolated connection if used
         if isolated_connection:
             setattr(service, "_isolated_client", service_client)  # noqa: B010
 
@@ -144,10 +124,8 @@ class RPCService:
 
         probe_settings = service_client._orphan_probe_settings()  # pyright: ignore[reportPrivateUsage]
 
-        # Extract all methods including nested ones
         methods = extract_nested_methods_with_decorators(handlers)
 
-        # Create groups for nested paths
         groups: dict[str, Group] = {}
 
         for path, handler in methods.items():
@@ -156,7 +134,6 @@ class RPCService:
 
             target: NATSService | Group = service
 
-            # Create nested groups if needed
             if parts:
                 group_path = ".".join(parts)
                 if group_path not in groups:
@@ -166,19 +143,16 @@ class RPCService:
                     groups[group_path] = cast(Group, current)
                 target = groups[group_path]
 
-            # Add endpoint with auto-encoding/decoding
             def make_endpoint_handler(h: Callable[..., Any]) -> Callable[[Request], Awaitable[None]]:
-                # Determined once per endpoint instead of per message.
+                # once per endpoint instead of per message
                 h_is_async = is_async_function(h)
                 chunks = service_client._open_endpoint_chunking()  # pyright: ignore[reportPrivateUsage]
                 endpoint_chunks.append(chunks)
 
                 async def handle_rpc_message(rpc_msg: dict[str, Any], original_msg: Request) -> None:
-                    """Handle RPC protocol message."""
                     response = {"id": rpc_msg["id"]}
 
                     try:
-                        # Handle stream request
                         params = rpc_msg.get("params", {})
                         if (
                             isinstance(params, dict)
@@ -211,8 +185,7 @@ class RPCService:
                             # one stream at a time per endpoint, the endpoint task waits for it
                             await asyncio.wait((stream_task,))
                         elif (
-                            # Check if it's a pull iterator request
-                            # Could be direct object or wrapped in array from call()
+                            # a direct object, or wrapped in an array by call()
                             (isinstance(params, dict) and params.get("__pullIterator"))
                             or (
                                 isinstance(params, list)
@@ -221,7 +194,6 @@ class RPCService:
                                 and params[0].get("__pullIterator")
                             )
                         ):
-                            # Extract pull iterator params
                             pull_params = cast(
                                 dict[str, Any],
                                 params
@@ -250,14 +222,12 @@ class RPCService:
                                 response,
                             )
 
-                            # Store cleanup function for later
                             pull_iterator_cleanups[iterator_id] = cleanup
                             service_client._track_session(  # pyright: ignore[reportPrivateUsage]
                                 service_client.pull_iterator_cleanups, iterator_id, cleanup
                             )
                             response["result"] = {"iteratorId": iterator_id}
 
-                            # Send response with iterator ID
                             reply_subject = f"{original_msg.subject}.reply.{rpc_msg['id']}"
                             await service_client.publish(reply_subject, response)
                         elif (pc_params := session_params(params, "__pullCallback")) is not None:
@@ -320,7 +290,6 @@ class RPCService:
                             response["result"] = {"ok": True}
                             await service_client.publish(reply_subject, response)
                         else:
-                            # Normal RPC call
                             result = await handle_normal_rpc(
                                 h,
                                 rpc_msg.get("params", []),
@@ -329,7 +298,6 @@ class RPCService:
                             )
                             response["result"] = result
 
-                            # Send response
                             reply_subject = f"{original_msg.subject}.reply.{rpc_msg['id']}"
                             await service_client.publish(reply_subject, response)
 
@@ -343,21 +311,18 @@ class RPCService:
                             await service_client.publish(reply_subject, response)
                         except Exception as publish_error:
                             if service_client.is_closed:
-                                return  # Ignore publish errors if client is closed
+                                return
 
                             print(f"Failed to send error response: {publish_error}")
 
                 async def handle_assembled_data(assembled_data: Any, original_msg: Request) -> None:
-                    """Handle assembled data from chunks."""
                     await handle_rpc_message(assembled_data, original_msg)
 
                 async def endpoint_handler(msg: Request) -> None:
                     try:
-                        # Check for chunked transfer
                         chunk_type = msg.headers.get("x-chunked-transfer") if msg.headers else None
 
                         if chunk_type == "header":
-                            # Chunked transfer header
                             data = decode(msg.data)
                             chunk_id = msg.headers.get("x-chunk-id") if msg.headers else None
 
@@ -379,11 +344,10 @@ class RPCService:
                                 data.get("totalChunks"),
                                 on_complete,
                                 on_error,
-                                data.get("totalSize"),  # Pass totalSize for pre-allocation
-                                data.get("chunkSize"),  # Pass chunkSize for correct offset calculation
+                                data.get("totalSize"),
+                                data.get("chunkSize"),
                             )
                         elif chunk_type == "chunk":
-                            # Chunk data
                             chunk_id = msg.headers.get("x-chunk-id") if msg.headers else None
                             chunk_index = parse_chunk_index(
                                 msg.headers.get("x-chunk-index") if msg.headers else None
@@ -401,12 +365,10 @@ class RPCService:
                                 }
                             )
                         else:
-                            # Regular message - decode wire message (zero-copy
-                            # binary views into msg.data)
+                            # zero-copy binary views into msg.data
                             decoded = decode_message(msg.data)
                             await handle_rpc_message(decoded, msg)
                     except Exception as e:
-                        # Send error response
                         import traceback
 
                         reported = reported_error(e)
@@ -442,10 +404,8 @@ class RPCService:
                 )
             )
 
-        # Extend service with cleanup management
         setattr(service, "_pull_iterator_cleanups", pull_iterator_cleanups)  # noqa: B010
 
-        # Override stop method to clean up pull iterators
         original_stop = service.stop
 
         async def stop_with_cleanup() -> None:
@@ -464,7 +424,6 @@ class RPCService:
             for chunks in endpoint_chunks:
                 service_client._close_endpoint_chunking(chunks)  # pyright: ignore[reportPrivateUsage]
 
-            # Call original stop
             await original_stop()
 
         setattr(service, "stop", stop_with_cleanup)  # noqa: B010
@@ -472,16 +431,13 @@ class RPCService:
         return Service(service)
 
     def monitor(self) -> "ServiceMonitor":
-        """Get service monitor for discovery."""
         return ServiceMonitor(self.__client)
 
     async def stop_all(self) -> None:
-        """Stop all services and cleanup isolated connections."""
 
         async def stop_service(s: NATSService) -> None:
             try:
                 await s.stop()
-                # Disconnect isolated connection if present
                 isolated_client: RPCClient | None = getattr(s, "_isolated_client", None)
                 if isolated_client:
                     await isolated_client.disconnect()
@@ -492,94 +448,47 @@ class RPCService:
         self.__services = []
 
     async def stop(self, service_name: str) -> None:
-        """Stop a specific service by name."""
         service = next((s for s in self.__services if s.info().name == service_name), None)
         if service:
             with contextlib.suppress(Exception):
                 await service.stop()
-                # Disconnect isolated connection if present
                 isolated_client = getattr(service, "_isolated_client", None)
                 if isolated_client:
                     await isolated_client.disconnect()
                 self.__services = [s for s in self.__services if s != service]
 
     def get_all_info(self) -> list[ServiceInfo]:
-        """Get all services info."""
         return [s.info() for s in self.__services]
 
     def get_info(self, service_name: str) -> ServiceInfo | None:
-        """Get info for a specific service."""
         service = next((s for s in self.__services if s.info().name == service_name), None)
         return service.info() if service else None
 
     async def get_all_stats(self) -> list[ServiceStats]:
-        """Get all services stats."""
         return [s.stats() for s in self.__services]
 
     async def get_stats(self, service_name: str) -> ServiceStats | None:
-        """Get stats for a specific service."""
         service = next((s for s in self.__services if s.info().name == service_name), None)
         return service.stats() if service else None
 
 
 class ServiceMonitor:
-    """Service discovery monitor using NATS micro services."""
-
     def __init__(self, client: "RPCClient"):  # type: ignore
-        """
-        Initialize service monitor.
-
-        Args:
-            client: RPC client instance
-        """
         self.__client: RPCClient = client
 
     async def ping(self, service_name: str | None = None) -> list[ServicePing]:
-        """
-        Ping services to check availability.
-
-        Args:
-            service_name: Optional specific service name
-
-        Returns:
-            list of ping responses
-        """
         subject = f"$SRV.PING.{service_name}" if service_name else "$SRV.PING"
         return await self._collect(subject, ServicePing.from_dict)
 
     async def info(self, service_name: str | None = None) -> list[ServiceInfo]:
-        """
-        Get service information.
-
-        Args:
-            service_name: Optional specific service name
-
-        Returns:
-            list of service information
-        """
         subject = f"$SRV.INFO.{service_name}" if service_name else "$SRV.INFO"
         return await self._collect(subject, ServiceInfo.from_dict)
 
     async def stats(self, service_name: str | None = None) -> list[ServiceStats]:
-        """
-        Get service statistics.
-
-        Args:
-            service_name: Optional specific service name
-
-        Returns:
-            list of service statistics
-        """
         subject = f"$SRV.STATS.{service_name}" if service_name else "$SRV.STATS"
         return await self._collect(subject, ServiceStats.from_dict)
 
     async def _collect(self, subject: str, parse: Callable[[dict[str, Any]], _Info]) -> list[_Info]:
-        """Ask every service on ``subject`` and gather the answers.
-
-        Waits up to DISCOVERY_TIMEOUT for the first valid one, then until no
-        further one comes within DISCOVERY_STALL. A no-responder status ends at
-        once, a malformed answer is skipped.
-        """
         nc = self.__client.nc
         if not nc:
             raise RuntimeError("NATS client is not connected")
@@ -626,11 +535,9 @@ class Service:
         return bool(self.__service.stopped.is_set())
 
     def info(self) -> ServiceInfo:
-        """Get service info."""
         return self.__service.info()
 
     def stats(self) -> ServiceStats:
-        """Get service stats."""
         return self.__service.stats()
 
     async def stop(self) -> None:

@@ -4,19 +4,12 @@ import { createChunks } from '../src/chunking.js';
 import { RPCClient } from '../src/client.js';
 import { encode } from '../src/codec.js';
 
-/**
- * Minimal NATS connection mock. Captures subscriptions and published
- * messages; messages are delivered manually by invoking the captured
- * subscription callbacks.
- */
 export interface MockSub {
   pattern: string;
   callback: (err: Error | null, msg: any) => void;
   closed: boolean;
-  /** How the subscription ended: 'unsubscribe' or 'drain' */
   ended?: string;
   unsubscribe(): void;
-  /** Like nats.js: delivery goes on until the server answered the PING behind the UNSUB. */
   drain(): Promise<void>;
   isClosed(): boolean;
 }
@@ -42,7 +35,6 @@ export function createMockNc() {
     for (const feed of statusFeeds) feed.push(null);
   });
   const mock = {
-    /** Hands a status event to every status() iterator. */
     emitStatus(status: { type: string }): void {
       for (const feed of statusFeeds) feed.push(status);
     },
@@ -79,9 +71,7 @@ export function createMockNc() {
     subs,
     published,
     requests,
-    /** Order of flush/close calls */
     calls,
-    /** Answers nc.flush(); resolves at once by default. */
     onFlush: (): Promise<void> => Promise.resolve(),
     flush(): Promise<void> {
       calls.push('flush');
@@ -93,21 +83,17 @@ export function createMockNc() {
       settleClosed();
       return Promise.resolve();
     },
-    /** Settles once close() ran or the connection was lost. */
     closed: (): Promise<void> => closed,
-    /** Closes the connection for good without close(), as nats.js does once it gives up reconnecting. */
     lose(): void {
       isClosed = true;
       for (const sub of subs) sub.closed = true;
       settleClosed();
     },
-    /** Answers nc.request(); the default never settles. */
     onRequest: (_subject: string, _data: Uint8Array): Promise<any> => new Promise(() => {}),
     request(subject: string, data: Uint8Array, opts?: { headers?: any }): Promise<any> {
       requests.push({ subject, data, opts });
       return mock.onRequest(subject, data);
     },
-    /** Answers the PING of a subscription drain; resolves at once by default. */
     onDrain: (_sub: MockSub): Promise<void> => Promise.resolve(),
     subscribe(pattern: string, opts: { callback: (err: Error | null, msg: any) => void }): MockSub {
       const sub: MockSub = {
@@ -153,7 +139,6 @@ export function createClient(options?: Partial<ConstructorParameters<typeof RPCC
   return { client, nc };
 }
 
-/** Lets the mock host a nats.js service, which awaits sub.closed as a promise. */
 export function hostServices(nc: ReturnType<typeof createMockNc>): void {
   Object.assign(nc, { addCloseListener() {}, removeCloseListener() {} });
   nc.subscribe = ((pattern: string, opts: { callback: (err: Error | null, msg: any) => void; queue?: string }) => {
@@ -175,7 +160,6 @@ export function hostServices(nc: ReturnType<typeof createMockNc>): void {
   }) as any;
 }
 
-/** The single wildcard mux subscription of a client. */
 export function muxSub(client: RPCClient, nc: ReturnType<typeof createMockNc>): MockSub {
   const prefix = (client as any).replyPrefix as string;
   const matches = nc.subs.filter((s) => s.pattern === `rpc.reply.${prefix}.>`);
@@ -191,7 +175,6 @@ export function headersWith(entries: Record<string, string>) {
   return { code: 0, get: (k: string) => entries[k] };
 }
 
-/** The header and chunk messages of a chunked transfer of `payload` to `subject`. */
 export function chunkedMessages(subject: string, payload: unknown, transferId: string, chunkSize: number) {
   const encoded = encode(payload);
   const totalChunks = Math.ceil(encoded.length / chunkSize);

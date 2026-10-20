@@ -84,10 +84,9 @@ func TestStreamPanicIsReported(t *testing.T) {
 	}
 }
 
-// the default re-raises the panic after answering, which ends the process,
-// so the responder runs as a child process of this test binary
 func startPanicResponder(t *testing.T, handlers map[string]any) (proxy *Proxy, exited <-chan error) {
 	t.Helper()
+	// the default re-raises the panic and ends the process, so the responder runs as a child of this test binary
 	if url := os.Getenv("RPC_TEST_PANIC_RESPONDER"); url != "" {
 		c := NewClient(ClientOptions{Servers: []string{url}})
 		if err := c.Connect(context.Background()); err != nil {

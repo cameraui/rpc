@@ -141,7 +141,7 @@ func TestChunkAssemblerGetDataBeforeComplete(t *testing.T) {
 
 func TestChunkingManagerUnknownChunk(t *testing.T) {
 	mgr := NewChunkingManager()
-	// ProcessChunk for an unregistered transfer must not panic.
+	// ProcessChunk for an unregistered transfer must not panic
 	mgr.ProcessChunk(ChunkData{ID: "missing", ChunkIndex: 0, Data: []byte("data")})
 }
 
@@ -154,7 +154,7 @@ func TestChunkingManagerIDMismatchTriggersError(t *testing.T) {
 		10, 300,
 	)
 
-	// Inject a chunk routed to real-id but carrying a mismatched inner ID.
+	// a chunk routed to real-id but carrying a mismatched inner id
 	mgr.assemblers["real-id"].id = "other"
 	mgr.ProcessChunk(ChunkData{ID: "real-id", ChunkIndex: 0, Data: []byte("data")})
 

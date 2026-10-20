@@ -31,7 +31,6 @@ var (
 	float32Type  = reflect.TypeFor[float32]()
 )
 
-// an encoder for one type that writes the bytes vmihailenco writes for it
 type encodeFunc func(enc *msgpack.Encoder, v reflect.Value) error
 
 type planEntry struct {
@@ -43,18 +42,14 @@ type planField struct {
 	index     int
 	omitEmpty bool
 	encode    encodeFunc
-	// false when vmihailenco's answer is unknown, the struct then goes to it whole
-	empty func(v reflect.Value) (empty, known bool)
+	empty     func(v reflect.Value) (empty, known bool)
 }
 
-// a struct whose msgpack layout is plain: no embedding, no _msgpack options,
-// no intern or alias tags and no custom encoding
 type structPlan struct {
 	fields       []planField
 	hasOmitEmpty bool
 }
 
-// mirrors vmihailenco's getFields for the structs it accepts
 func newStructPlan(t reflect.Type, building map[reflect.Type]*planEntry) *structPlan {
 	if hasCustomMsgpackEncoding(t) {
 		return nil
@@ -107,8 +102,8 @@ func newStructPlan(t reflect.Type, building map[reflect.Type]*planEntry) *struct
 	return p
 }
 
-// addressable, as fields in a slice or behind a pointer are: some ext encoders need it
 func (p *structPlan) matchesZero(t reflect.Type) bool {
+	// addressable like a field in a slice or behind a pointer, some ext encoders need that
 	return sameAsGeneric(p.encode, reflect.New(t).Elem())
 }
 
@@ -156,7 +151,6 @@ func (p *structPlan) encode(enc *msgpack.Encoder, v reflect.Value) error {
 	return nil
 }
 
-// vmihailenco: a struct is empty when OmitEmpty leaves no field
 func (p *structPlan) empty(v reflect.Value) (empty, known bool) {
 	if !p.hasOmitEmpty {
 		return len(p.fields) == 0, true
@@ -189,17 +183,14 @@ func encodeFast(enc *msgpack.Encoder, v any) error {
 	return enc.EncodeValue(rv)
 }
 
-// nil when the type has no plan; enc.EncodeValue is then what vmihailenco does.
-// Two goroutines may build the same plan at once, both results are equal.
 func planFor(t reflect.Type) encodeFunc {
 	if e, ok := encodePlans.Load(t); ok {
 		return e.(*planEntry).fn
 	}
+	// two goroutines may build the same plan at once, both results are equal
 	return buildPlan(t, map[reflect.Type]*planEntry{})
 }
 
-// building holds the types on the current path, a recursive type calls its
-// entry through a trampoline that reads the finished plan at encode time
 func buildPlan(t reflect.Type, building map[reflect.Type]*planEntry) encodeFunc {
 	if e, ok := encodePlans.Load(t); ok {
 		return e.(*planEntry).fn
@@ -260,8 +251,6 @@ func buildPlan(t reflect.Type, building map[reflect.Type]*planEntry) encodeFunc 
 	return entry.fn
 }
 
-// the encoder vmihailenco's getEncoder picks for t, written directly where the
-// rule is plain and handed to enc.EncodeValue otherwise
 func fieldEncoder(t reflect.Type, building map[reflect.Type]*planEntry) encodeFunc {
 	switch t {
 	case boolType:
@@ -317,7 +306,6 @@ func buildStructPlan(t reflect.Type, building map[reflect.Type]*planEntry) *stru
 	return p
 }
 
-// the omitempty rule of vmihailenco's isEmptyValue for a field of type t
 func emptyCheck(t reflect.Type, building map[reflect.Type]*planEntry) func(reflect.Value) (bool, bool) {
 	if t.Kind() == reflect.Interface || t.Implements(isZeroerType) {
 		return emptyValue
@@ -352,7 +340,6 @@ func emptyCheck(t reflect.Type, building map[reflect.Type]*planEntry) func(refle
 	}
 }
 
-// vmihailenco's isEmptyValue for a value whose type is known only now
 func emptyValue(v reflect.Value) (empty, known bool) {
 	kind := v.Kind()
 	for kind == reflect.Interface {
@@ -414,7 +401,6 @@ func encodeAnyValue(enc *msgpack.Encoder, v reflect.Value) error {
 	return enc.EncodeValue(elem)
 }
 
-// vmihailenco's EncodeMap: each value goes through Encode, not EncodeValue
 func encodeAnyMap(enc *msgpack.Encoder, v reflect.Value) error {
 	if v.IsNil() {
 		return enc.EncodeNil()
@@ -453,10 +439,8 @@ func encodeStrings(enc *msgpack.Encoder, v reflect.Value) error {
 	return nil
 }
 
-// a registration with msgpack.Register for the type, or a rule a plan does not
-// model, already shows on a zero value; a marshaler that panics on one leaves
-// the type to vmihailenco
 func sameAsGeneric(fn encodeFunc, v reflect.Value) (same bool) {
+	// a marshaler that panics on a zero value leaves the type to vmihailenco
 	defer func() {
 		if recover() != nil {
 			same = false

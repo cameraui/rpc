@@ -16,7 +16,6 @@ function deliver({ nc }: Ctx, method: string, id: string, params: unknown = []) 
   nc.subs.find((s) => s.pattern === `rpc.ns.${method}`)!.callback(null, { subject: `rpc.ns.${method}`, data: encode({ id, method: 'call', params }) });
 }
 
-// answers the last request to `subject` with a no-responder status
 async function noResponders({ client, nc }: Ctx, subject: string) {
   await vi.waitFor(() => expect(nc.published.some((p) => p.subject === subject)).toBe(true));
   const req = decode(nc.published.findLast((p) => p.subject === subject)!.data) as RPCMessage;

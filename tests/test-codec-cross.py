@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Cross-language codec test — Python decodes Node.js and Go encoded data."""
-
 import math
 import os
 import sys

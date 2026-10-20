@@ -185,7 +185,6 @@ describe('registerHandler readiness', () => {
     vi.mocked(connect).mockReset();
   });
 
-  // a promise whose settle functions the test holds
   function deferred() {
     let resolve!: () => void;
     let reject!: (error: Error) => void;
@@ -454,17 +453,17 @@ describe('expired requests', () => {
     const { client, nc } = createClient({ timeout: 5000 });
     const sentTo = (subject: string) => nc.published.filter((p) => p.subject === subject).map((p) => decode(p.data) as { __ttl?: number });
 
-    void client.call('rpc.ns.read').catch(() => {});
+    client.call('rpc.ns.read').catch(() => {});
     expect(sentTo('rpc.ns.read')[0].__ttl).toBeGreaterThan(4990);
     expect(sentTo('rpc.ns.read')[0].__ttl).toBeLessThanOrEqual(5000);
 
     (client as any).linkWaiters = [];
-    void client.call('rpc.ns.held').catch(() => {});
+    client.call('rpc.ns.held').catch(() => {});
     await sleep(60);
     (client as any).releaseLinkWaiters();
     expect(sentTo('rpc.ns.held')[0].__ttl).toBeLessThanOrEqual(4945);
 
-    void client.call('svc.read').catch(() => {});
+    client.call('svc.read').catch(() => {});
     await vi.waitFor(() => expect(sentTo('svc.read').length).toBe(1));
     expect(sentTo('svc.read')[0].__ttl).toBeUndefined();
     await client.abortClose();

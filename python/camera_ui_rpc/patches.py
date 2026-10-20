@@ -15,12 +15,9 @@ from nats.aio.transport import TcpTransport
 from nats.protocol import parser as nats_parser
 from nats.protocol.parser import Parser
 
+# nats-py releases the parser and flush patches were checked against
 TESTED_NATS_VERSIONS = frozenset({(2, 15), (2, 16)})
-"""nats-py releases whose private parser and flush internals the patches below were checked against."""
-
-LARGE_PAYLOAD = 32 * 1024
-"""Payloads from this size on are copied once on receive instead of three times."""
-
+LARGE_PAYLOAD = 32 * 1024  # copied once on receive from this size on instead of three times
 _AWAITING_CONTROL_LINE: int = getattr(nats_parser, "AWAITING_CONTROL_LINE", 1)
 _AWAITING_MSG_PAYLOAD: int = getattr(nats_parser, "AWAITING_MSG_PAYLOAD", 2)
 _CRLF_SIZE: int = getattr(nats_parser, "CRLF_SIZE", 2)
@@ -33,7 +30,6 @@ def _nats_version() -> tuple[int, int] | None:
 
 
 def _parser_supported() -> bool:
-    """Whether nats-py's parser has the state PayloadParser builds on."""
     try:
         parser = Parser(None)
         message_params = list(inspect.signature(NATSClient._process_msg).parameters)  # pyright: ignore[reportPrivateUsage]
@@ -53,7 +49,6 @@ def _parser_supported() -> bool:
 
 
 def _direct_write_supported() -> bool:
-    """Whether nats-py keeps pending commands and its flusher where NatsConnection expects them."""
     try:
         nc = NATSClient()
         transport = TcpTransport()  # type: ignore[no-untyped-call]
@@ -75,14 +70,10 @@ def _direct_write_supported() -> bool:
 _TESTED = _nats_version() in TESTED_NATS_VERSIONS
 
 PAYLOAD_PARSER = _TESTED and _parser_supported()
-"""True when connections parse with PayloadParser."""
-
 DIRECT_WRITES = _TESTED and _direct_write_supported()
-"""True when connections may write pending commands without waiting for nats-py's flusher task."""
 
 
 def _take(parts: list[Any], start: int, stop: int) -> bytes:
-    """Bytes ``start:stop`` of the concatenated parts, copied once."""
     views: list[memoryview] = []
     offset = 0
     for part in parts:
@@ -98,16 +89,6 @@ def _take(parts: list[Any], start: int, stop: int) -> bytes:
 
 
 class PayloadParser(Parser):
-    """nats-py's parser, but frame-sized payloads are copied once.
-
-    The stock parser copies every payload into its buffer, slices it out and
-    converts the slice to bytes. Here a payload that continues past the read
-    it started in is kept as the list of incoming reads and joined once, and
-    one that starts at the beginning of a read is sliced from it directly.
-    Everything else, small messages and control lines, runs through the
-    stock parser. Message data stays bytes.
-    """
-
     def reset(self) -> None:
         super().reset()
         self._parts: list[Any] | None = None
@@ -183,17 +164,6 @@ class PayloadParser(Parser):
 
 
 class NatsConnection(NATSClient):
-    """nats-py client that can write a reply to the socket without waiting for its flusher task.
-
-    nats-py queues every publish for its flusher task, which writes one loop
-    iteration later. While ``write_through`` is set, a publish that would
-    start a new flush is written in place instead, as long as the socket
-    buffer is empty. The client sets it only for the reply to a call when
-    no further call waits in the subscription; publishes in bursts keep
-    being batched by the flusher. Plain TCP only: nats-py's WebSocket
-    transport sends nothing before drain().
-    """
-
     def __init__(self) -> None:
         super().__init__()
         if PAYLOAD_PARSER and type(self._ps) is Parser:  # pyright: ignore[reportPrivateUsage]
@@ -225,7 +195,6 @@ class NatsConnection(NATSClient):
 
 
 async def connect(**options: Any) -> NATSClient:
-    """``nats.connect`` with NatsConnection where the installed nats-py was tested."""
     nc = NatsConnection() if PAYLOAD_PARSER or DIRECT_WRITES else NATSClient()
     await nc.connect(**options)
     return nc
@@ -233,13 +202,10 @@ async def connect(**options: Any) -> NATSClient:
 
 @dataclass
 class ArrivalMsg(Msg):
-    """A nats-py message that knows when nats-py read it, for the queue wait of a request."""
-
     arrived: float = field(default_factory=time.monotonic)
 
 
 def _arrival_stamps_supported() -> bool:
-    """Whether nats-py builds every message through its ``msg_class`` with keyword arguments."""
     try:
         return (
             getattr(NATSClient, "msg_class", None) is Msg
@@ -252,4 +218,3 @@ def _arrival_stamps_supported() -> bool:
 
 
 ARRIVAL_STAMPS = _arrival_stamps_supported()
-"""True when a connection can stamp messages with their arrival, see ArrivalMsg."""

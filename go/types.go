@@ -8,29 +8,16 @@ import (
 )
 
 // RPCMessage is the wire-format for an RPC request.
-//
-// Discover is the method-discovery request marker (internal metadata for
-// proxies): when true, the responder attaches the namespace's method list
-// (__methods) to the response. Client proxies set it only while their method
-// cache is empty. It lives on the envelope (not in params) so it never leaks
-// into handler arguments; old responders ignore it.
 type RPCMessage struct {
-	ID       string `msgpack:"id"`
-	Method   string `msgpack:"method"`
-	Params   any    `msgpack:"params"`
-	Discover bool   `msgpack:"__discover,omitempty"`
-	// Timing asks the responder to stamp its clock around the handler and
-	// return both stamps in the response. Old responders ignore it.
-	Timing bool `msgpack:"__timing,omitempty"`
-	// TTL is how many milliseconds the caller waits for the reply. A method
-	// registered with WithDropExpired skips a call that waited longer than
-	// that before it could start. Old responders ignore it.
-	TTL Milliseconds `msgpack:"__ttl,omitempty"`
+	ID       string       `msgpack:"id"`
+	Method   string       `msgpack:"method"`
+	Params   any          `msgpack:"params"`
+	Discover bool         `msgpack:"__discover,omitempty"`
+	Timing   bool         `msgpack:"__timing,omitempty"`
+	TTL      Milliseconds `msgpack:"__ttl,omitempty"`
 }
 
-// Milliseconds is a count of milliseconds on the wire. It decodes from any
-// msgpack number, a fraction rounded up, and reads any other value as 0, so a
-// peer that sends a float or a stray value never fails the whole message.
+// Milliseconds is a count of milliseconds on the wire.
 type Milliseconds int64
 
 // RPCResponse is the wire-format for an RPC response.
@@ -42,9 +29,7 @@ type RPCResponse struct {
 	Timing  *RPCTiming `msgpack:"__timing,omitempty"`
 }
 
-// RPCTiming carries the responder's clock around a handler invocation, in
-// epoch milliseconds. Both stamps come from the same clock, so their
-// difference is free of any offset against the caller's clock.
+// RPCTiming carries the responder's clock around a handler invocation, in epoch milliseconds.
 type RPCTiming struct {
 	Start int64 `msgpack:"start"`
 	End   int64 `msgpack:"end"`
@@ -138,10 +123,7 @@ type CallbackMessage struct {
 	Error *RPCError `msgpack:"error,omitempty"`
 }
 
-// PullCallbackParams are the special parameters sent when initiating a
-// pull-iterator-with-callbacks request. Combines pull-iterator flow control
-// with oneway callbacks for low-latency item-level data delivery.
-// See packages/rpc/PULL_CALLBACK_PROTOCOL.md.
+// PullCallbackParams are the special parameters sent when initiating a pull iterator with callbacks.
 type PullCallbackParams struct {
 	PullCallback    bool     `msgpack:"__pullCallback"`
 	IteratorID      string   `msgpack:"__iteratorId"`
@@ -151,8 +133,7 @@ type PullCallbackParams struct {
 	Args            []any    `msgpack:"args"`
 }
 
-// CallbackInvocation is a single oneway callback invocation pushed from
-// server to client on the callback subject.
+// CallbackInvocation is a single oneway callback invocation pushed to the client on the callback subject.
 type CallbackInvocation struct {
 	Method string `msgpack:"method"`
 	Args   []any  `msgpack:"args"`

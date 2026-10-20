@@ -8,8 +8,8 @@ import uvloop
 from camera_ui_rpc import RPCClass, create_rpc_client
 
 small_data = "This is a small response that fits in a single message"
-medium_data = bytearray(5 * 1024 * 1024)  # 5MB
-large_data = bytearray(50 * 1024 * 1024)  # 50MB
+medium_data = bytearray(5 * 1024 * 1024)
+large_data = bytearray(50 * 1024 * 1024)
 
 for i in range(len(medium_data)):
     medium_data[i] = i % 256

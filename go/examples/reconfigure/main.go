@@ -50,7 +50,7 @@ func run() error {
 	}); err != nil {
 		return fmt.Errorf("subscribe: %w", err)
 	}
-	// Let NATS register the subscription on the server before publishing.
+	// let NATS register the subscription on the server before publishing
 	time.Sleep(100 * time.Millisecond)
 
 	if err := server.Publish("reconfigure.test", map[string]int{"n": 1}); err != nil {

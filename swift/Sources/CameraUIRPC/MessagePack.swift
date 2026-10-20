@@ -14,7 +14,6 @@ public enum MessagePackError: Error, CustomStringConvertible {
   }
 }
 
-/// An extension value of a type this codec does not interpret itself.
 public struct MessagePackExtension: Equatable, Sendable {
   public let type: Int8
   public let data: Data
@@ -25,10 +24,6 @@ public struct MessagePackExtension: Equatable, Sendable {
   }
 }
 
-/// MessagePack codec wire-compatible with the node (msgpackr), python
-/// (ormsgpack) and go (vmihailenco/msgpack) implementations: plain maps and
-/// arrays only, timestamp extension (-1) for dates, ext 0 (msgpackr's
-/// JS undefined) decodes to nil.
 public enum MessagePack {
   public static func encode(_ value: Any?) throws -> Data {
     var writer = Writer()

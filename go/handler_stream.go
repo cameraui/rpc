@@ -17,12 +17,10 @@ type pushSession struct {
 	stopped chan struct{}
 	unsub   func()
 	probe   *orphanProbe
-	// orders every publish against the stop, so nothing follows the terminal message
-	mu    sync.Mutex
-	ended bool
+	mu      sync.Mutex
+	ended   bool
 }
 
-// closed: a channel result was read to its end, so nothing is left to drain
 func (s *pushSession) forward(rv reflect.Value) (closed bool, err error) {
 	switch rv.Kind() {
 	case reflect.Chan:
@@ -70,13 +68,13 @@ func (s *pushSession) publish(msg StreamMessage) error {
 	return s.client.publishInternal(s.subject, msg, s.probe.replyFor())
 }
 
-// every consumer skips a stream message of an unknown type
 func (s *pushSession) ping(reply string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ended {
 		return nil
 	}
+	// every consumer skips a stream message of an unknown type
 	return s.client.publishInternal(s.subject, StreamMessage{ID: s.id, Type: "ping"}, reply)
 }
 
@@ -95,7 +93,6 @@ func (s *pushSession) end(terminal *StreamMessage) {
 	}
 }
 
-// the owner or the connection went away, the consumer would wait forever
 func (s *pushSession) teardown() {
 	s.end(&StreamMessage{ID: s.id, Type: "error", Error: connectionClosedError()})
 	s.unsub()
@@ -112,17 +109,13 @@ type pullSession struct {
 	invoker         *CallbackInvoker
 	probe           *orphanProbe
 	onFinished      func()
-	// the callback flavour only marks batch boundaries
-	values bool
-	// orders every response against the terminal one, so no value follows it
-	mu    sync.Mutex
-	ended bool
-	unsub func()
-	// false while the handler sets the session up, a cancel then only marks cancelled
-	serving   bool
-	cancelled bool
-	// a callback frame that could not go out, it answers the step
-	failure *PullIteratorResponse
+	values          bool
+	mu              sync.Mutex
+	ended           bool
+	unsub           func()
+	serving         bool
+	cancelled       bool
+	failure         *PullIteratorResponse
 }
 
 func newPullSession(id string, client *Client, cancel context.CancelFunc, probe *orphanProbe, onFinished func()) *pullSession {
@@ -138,7 +131,6 @@ func newPullSession(id string, client *Client, cancel context.CancelFunc, probe 
 	}
 }
 
-// subscribed before the handler runs, so a cancel during its setup counts
 func (s *pullSession) listen() error {
 	unsub, err := s.client.Subscribe(s.requestSubject, s.handleRequest)
 	if err != nil {
@@ -150,7 +142,6 @@ func (s *pullSession) listen() error {
 	return nil
 }
 
-// the handler failed, nothing was served
 func (s *pullSession) abandon() {
 	s.mu.Lock()
 	unsub := s.unsub
@@ -161,7 +152,6 @@ func (s *pullSession) abandon() {
 	}
 }
 
-// false when the caller cancelled while the handler set up, the session is over then
 func (s *pullSession) serve(rv reflect.Value) bool {
 	s.rv = rv
 	s.pump.rv = rv
@@ -175,6 +165,7 @@ func (s *pullSession) serve(rv reflect.Value) bool {
 	}
 	s.probe.start(func() { s.end(&PullIteratorResponse{ID: s.id, Type: "done"}, false, true) })
 
+	// off the subscription goroutine, so a cancel is not queued behind a producer that has not yielded yet
 	go s.pump.run(func(val reflect.Value, ok bool) {
 		if !ok {
 			s.end(&PullIteratorResponse{ID: s.id, Type: "done"}, true, true)
@@ -211,9 +202,8 @@ func (s *pullSession) handleRequest(data []byte) {
 	}
 }
 
-// under the lock, so fail sees a next that came in first; before the session
-// is served a next only counts
 func (s *pullSession) next() *PullIteratorResponse {
+	// under the lock, so fail sees a next that came in first
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.failure != nil && s.serving {
@@ -223,8 +213,6 @@ func (s *pullSession) next() *PullIteratorResponse {
 	return nil
 }
 
-// later frames are dropped at once, the error answers the step only once the
-// consumer asked for it, so it never goes out before the consumer subscribed
 func (s *pullSession) fail(err error) {
 	s.mu.Lock()
 	if s.ended || s.failure != nil {
@@ -236,12 +224,12 @@ func (s *pullSession) fail(err error) {
 	asked := s.serving && s.pump.pending.Load() > 0
 	s.mu.Unlock()
 	s.invoker.stop()
+	// the error answers only a step the consumer asked for, so it never goes out before the consumer subscribed
 	if asked {
 		s.end(failure, false, true)
 	}
 }
 
-// a value that cannot go out ends the session, the consumer's next waits for an answer
 func (s *pullSession) respond(resp PullIteratorResponse) {
 	s.mu.Lock()
 	var err error
@@ -254,20 +242,16 @@ func (s *pullSession) respond(resp PullIteratorResponse) {
 	}
 }
 
-// a pull consumer reads its response subject in order, the probe goes to its
-// reply mux instead, which drops a message without an id
 func (s *pullSession) ping(reply string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.ended {
 		return nil
 	}
+	// not the response subject, the consumer reads that in order; a reply mux drops a message without an id
 	return s.client.publishInternal("rpc.reply."+s.id, orphanPing{Type: "ping"}, reply)
 }
 
-// closed: the producer closed its channel, otherwise it is drained so a send it
-// blocks on returns; finished drops the caller's map entry, a teardown leaves
-// that to the caller sweeping its map
 func (s *pullSession) end(terminal *PullIteratorResponse, closed, finished bool) {
 	s.mu.Lock()
 	if s.ended {
@@ -293,6 +277,7 @@ func (s *pullSession) end(terminal *PullIteratorResponse, closed, finished bool)
 	if !closed {
 		go drainChannel(s.rv)
 	}
+	// a teardown leaves the map entry to the caller sweeping its map
 	if finished && s.onFinished != nil {
 		s.onFinished()
 	}
@@ -302,8 +287,6 @@ func (s *pullSession) teardown() {
 	s.end(&PullIteratorResponse{ID: s.id, Type: "error", Error: connectionClosedError()}, false, false)
 }
 
-// one receive per next, in request order, off the subscription goroutine so a
-// cancel is not queued behind a producer that has not yielded yet
 type pullPump struct {
 	rv      reflect.Value
 	wake    chan struct{}
@@ -311,7 +294,6 @@ type pullPump struct {
 	pending atomic.Int64
 }
 
-// rv is set once the handler returned, a next before that only counts
 func newPullPump() *pullPump {
 	return &pullPump{wake: make(chan struct{}, 1), done: make(chan struct{})}
 }
@@ -324,8 +306,8 @@ func (p *pullPump) request() {
 	}
 }
 
-// stop must run once, pullSession.end guards it
 func (p *pullPump) stop() {
+	// runs once, pullSession.end guards it
 	close(p.done)
 }
 
@@ -350,9 +332,6 @@ func (p *pullPump) run(respond func(val reflect.Value, ok bool)) {
 	}
 }
 
-// handleStreamRequestGo handles a push-based streaming request.
-// It calls the handler, iterates over the returned channel, and publishes
-// data/end/error messages to the stream subject.
 func handleStreamRequestGo(owner *sessionOwner, fn reflect.Value, args []any, streamSubject, requestID string, client *Client, orphan *orphanConfig, recoverPanics bool) {
 	if !isControlSubject(streamSubject, streamSubjectPrefix) {
 		return
@@ -426,11 +405,6 @@ func handleStreamRequestGo(owner *sessionOwner, fn reflect.Value, args []any, st
 	s.end(&StreamMessage{ID: requestID, Type: "end"})
 }
 
-// handlePullIteratorRequestGo handles a pull-based iterator request.
-// It calls the handler and sets up the request/response protocol for iteration.
-// onFinished is invoked once when the iterator ends naturally (done/cancel) so
-// the caller can drop its cleanup-map entry for this session.
-// A nil teardown with a nil error: the caller cancelled during the setup and the session is over.
 func handlePullIteratorRequestGo(parent context.Context, fn reflect.Value, args []any, iteratorID string, client *Client, orphan *orphanConfig, onFinished func()) (func(), error) {
 	ctx, cancel := context.WithCancel(parent)
 	var s *pullSession
@@ -445,6 +419,7 @@ func handlePullIteratorRequestGo(parent context.Context, fn reflect.Value, args 
 			cancel()
 		}
 	}()
+	// before the handler runs, so a cancel during its setup counts
 	if err := s.listen(); err != nil {
 		return nil, err
 	}
@@ -460,14 +435,14 @@ func handlePullIteratorRequestGo(parent context.Context, fn reflect.Value, args 
 
 	started = true
 	if !s.serve(rv) {
+		// the caller cancelled during the setup, the session is over
 		return nil, nil
 	}
 	return s.teardown, nil
 }
 
-// select only when no value is ready, a reflect.Select per value costs streams
-// of small items about 5 % throughput; a value that raced done is dropped
 func recvUnlessDone(rv reflect.Value, done <-chan struct{}) (val reflect.Value, ok, stopped bool) {
+	// TryRecv first: a reflect.Select per value costs streams of small items about 5 % throughput
 	val, ok = rv.TryRecv()
 	if !val.IsValid() {
 		cases := [2]reflect.SelectCase{
@@ -480,6 +455,7 @@ func recvUnlessDone(rv reflect.Value, done <-chan struct{}) (val reflect.Value, 
 			return reflect.Value{}, false, true
 		}
 	}
+	// a value that raced done is dropped
 	if isClosed(done) {
 		return reflect.Value{}, false, true
 	}

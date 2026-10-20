@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Test Python codec functionality — encode + roundtrip verification."""
-
 import math
 import os
 import sys
@@ -141,7 +139,6 @@ test_cases: list[dict[str, Any]] = [
 
 
 def compare_values(expected: Any, actual: Any, test_name: str) -> bool:
-    """Compare values with special handling for certain types."""
     if test_name == "float_nan":
         return isinstance(expected, float) and math.isnan(expected) and isinstance(actual, float) and math.isnan(actual)
 

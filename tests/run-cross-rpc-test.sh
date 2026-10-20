@@ -138,9 +138,7 @@ fi
 
 echo -e "${GREEN}NATS is running (PID: $NATS_PID)${NC}\n"
 
-# Pre-build the Go example so all three servers can start together. `go run`
-# neither forwards SIGTERM nor propagates the program's exit code, so we run the
-# compiled binary directly.
+# go run neither forwards SIGTERM nor returns the exit code, so run the built binary
 if [ -n "$GO_TARGETS" ]; then
     echo -e "${GREEN}Building Go example...${NC}"
     if ! (cd "$SCRIPT_DIR/../go" && go build -o "$BIN_DIR/cross-go" ./examples/cross-language/); then
@@ -151,8 +149,7 @@ fi
 
 if [ -n "$PYTHON_TARGETS" ]; then
     echo -e "${GREEN}Starting Python server...${NC}"
-    # exec so $! is the python process itself (not the cd-subshell), otherwise
-    # our SIGTERM would hit the subshell and the example never shuts down cleanly.
+    # exec so $! is the python process and SIGTERM reaches it, not the cd subshell
     ( cd "$SCRIPT_DIR/../python" && exec python run_example.py cross_language_test --targets "$PYTHON_TARGETS" ) > "$BIN_DIR/python.log" 2>&1 &
     PYTHON_PID=$!
 fi
@@ -169,9 +166,7 @@ if [ -n "$GO_TARGETS" ]; then
     GO_PID=$!
 fi
 
-# Wait until every started runtime has finished its client phase (each prints
-# "server running" once done) or has exited early. Tearing the processes down
-# after a fixed delay would cut calls off mid-flight.
+# a fixed delay would cut calls off mid-flight: wait for "server running" or an early exit
 deadline=$((SECONDS + 120))
 while true; do
     pending=0
@@ -194,8 +189,7 @@ done
 
 echo -e "\n${CYAN}Stopping servers & collecting results${NC}"
 
-# Ask each runtime to shut down. Each example tracks its own failed calls and
-# exits non-zero if any failed, so we just collect the exit codes.
+# each example exits non-zero when one of its calls failed
 for pid_var in PYTHON_PID NODE_PID GO_PID; do
     pid="${!pid_var}"
     [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null

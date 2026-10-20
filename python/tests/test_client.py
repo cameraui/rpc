@@ -1999,7 +1999,6 @@ def test_register_handler_answers_its_method_list_after_subscribing_the_methods(
 
 
 async def answer_attempts(client: Any, nc: MockNC, subject: str, methods: Any, probe: bool = True) -> None:
-    """503 every call to subject, answer the method list with methods (503 when None, nothing without probe)."""
     answered = 0
     while True:
         await asyncio.sleep(0.001)

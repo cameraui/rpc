@@ -40,8 +40,7 @@ def offline_nats_client() -> nats_aio_client.Client:
 
 
 def test_nats_resolves_a_subscription_future_from_the_read_loop() -> None:
-    # fails when a nats-py update changes how a subscription future is resolved, the reply mux then
-    # falls back to queued delivery
+    # fails when nats-py resolves subscription futures another way, the reply mux then falls back to queued delivery
     async def run() -> None:
         nc = offline_nats_client()
         seen: list[Any] = []
@@ -110,8 +109,7 @@ def test_inline_sink_keeps_handler_errors_out_of_the_read_loop() -> None:
 
 
 def test_a_subscription_knows_its_connection_and_ends_cleanly_on_close() -> None:
-    # fails when a nats-py update drops Subscription._conn or the closed callback: a connection closed for
-    # good would then drop every subscription entry again instead of keeping it for the next connect()
+    # fails when nats-py drops Subscription._conn or the closed callback: entries of a closed connection would be dropped again
     async def run() -> None:
         nc = offline_nats_client()
 
@@ -135,8 +133,7 @@ def test_a_subscription_knows_its_connection_and_ends_cleanly_on_close() -> None
 
 
 def test_nats_marks_the_connection_closed_before_it_ends_subscriptions_and_calls_closed_cb() -> None:
-    # fails when a nats-py update reorders its close: entries would be dropped for good again, or a
-    # connection closed for good would no longer end the sessions at the close
+    # fails when nats-py reorders its close: entries would be dropped for good, or sessions not ended at the close
     async def run() -> None:
         nc = offline_nats_client()
 
@@ -174,8 +171,7 @@ def test_nats_marks_the_connection_closed_before_it_ends_subscriptions_and_calls
 
 
 def test_installed_nats_py_is_a_tested_release_for_the_patches() -> None:
-    # fails on a nats-py release outside TESTED_NATS_VERSIONS: check PayloadParser and NatsConnection against
-    # its parser.py and flush code, then add the release, otherwise connections silently fall back to stock
+    # fails on a nats-py release outside TESTED_NATS_VERSIONS: check the patches against it, then add the release
     assert patches._nats_version() in patches.TESTED_NATS_VERSIONS  # pyright: ignore[reportPrivateUsage]
     assert patches.PAYLOAD_PARSER is True
     assert patches.DIRECT_WRITES is True
@@ -191,8 +187,7 @@ def test_nats_keeps_one_parser_per_connection_and_reads_through_it() -> None:
 
 
 def test_nats_publishes_through_flush_pending_and_its_flusher() -> None:
-    # fails when a nats-py update stops routing publishes through _flush_pending or changes what the flusher
-    # writes, NatsConnection's direct write would then skip or duplicate pending commands
+    # fails when nats-py stops publishing through _flush_pending or changes what the flusher writes
     client = nats_aio_client.Client
     assert {"_send_command", "_flush_pending", "_flush_queue"} <= set(client._send_publish.__code__.co_names)
     assert {"_pending", "_pending_data_size", "writelines", "drain"} <= set(client._flusher.__code__.co_names)
@@ -200,8 +195,7 @@ def test_nats_publishes_through_flush_pending_and_its_flusher() -> None:
 
 
 def test_nats_has_what_the_handler_drain_uses() -> None:
-    # fails when a nats-py update moves the pieces the drain uses: teardowns would then end handler
-    # subscriptions at once again and running calls would wait for their timeout
+    # fails when nats-py moves what the drain uses: teardowns would end handler subscriptions at once again
     async def run() -> None:
         nc = offline_nats_client()
         handled: list[bytes] = []
@@ -240,8 +234,7 @@ def test_nats_has_what_the_handler_drain_uses() -> None:
 
 
 def test_nats_builds_every_message_through_its_msg_class() -> None:
-    # fails when a nats-py update builds messages another way: drop_expired would then see no arrival
-    # time and run every request again
+    # fails when nats-py builds messages another way: drop_expired would then see no arrival time
     async def run() -> None:
         nc = offline_nats_client()
         nc.msg_class = patches.ArrivalMsg

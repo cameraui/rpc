@@ -2,9 +2,6 @@ import Foundation
 
 import CameraUIRPC
 
-// live smoke against a running camera.ui server:
-//   CUI_HOST=… CUI_PORT=3443 CUI_TOKEN=cui_… [CUI_CERT=/path/server.pem] swift run smoke-test
-
 let env = ProcessInfo.processInfo.environment
 guard let host = env["CUI_HOST"], let token = env["CUI_TOKEN"] else {
   print("usage: CUI_HOST=… CUI_TOKEN=cui_… [CUI_PORT=3443] [CUI_CERT=server.pem] smoke-test")

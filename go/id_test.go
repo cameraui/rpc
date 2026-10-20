@@ -8,7 +8,6 @@ import (
 func TestGenerateID(t *testing.T) {
 	id := GenerateID()
 
-	// Format: {timestamp}-{random9}
 	pattern := `^\d+-[a-z0-9]{9}$`
 	matched, err := regexp.MatchString(pattern, id)
 	if err != nil {

@@ -69,7 +69,16 @@ describe('pull-callback iterator callbacks after return()', () => {
   it('are dropped when they arrive before the init reply', async () => {
     const { client, nc, sent, open } = iteratorClient();
     const frames: unknown[] = [];
-    const iter = client.callPullIteratorWithCallback('rpc.ns.play', { onFrame: (frame: unknown) => void frames.push(frame) }, ['onFrame'], 'cam');
+    const iter = client.callPullIteratorWithCallback(
+      'rpc.ns.play',
+      {
+        onFrame: (frame: unknown) => {
+          frames.push(frame);
+        },
+      },
+      ['onFrame'],
+      'cam',
+    );
     const first = iter.next();
     await drainMicrotasks();
     const [init] = sent('rpc.ns.play');

@@ -22,9 +22,7 @@ type PullValue struct {
 	Error error
 }
 
-// CallStream makes a push-based streaming RPC call.
-// Returns a channel that yields StreamValue items until the stream ends.
-// Cancel via the context to stop early.
+// CallStream makes a push-based streaming RPC call whose channel yields values until the stream ends or ctx is done.
 func (c *Client) CallStream(ctx context.Context, subject string, args ...any) (<-chan StreamValue, error) {
 	var ch <-chan StreamValue
 	err := c.withNoResponderRetry(ctx, nil, methodProbe{}, func() error {
@@ -35,8 +33,7 @@ func (c *Client) CallStream(ctx context.Context, subject string, args ...any) (<
 	return ch, err
 }
 
-// CallStreamWithOptions is the same as CallStream but with per-call no-responder
-// retry overrides. Pass nil to use client-wide defaults.
+// CallStreamWithOptions is CallStream with per-call no-responder retry overrides, nil keeps the client defaults.
 func (c *Client) CallStreamWithOptions(ctx context.Context, subject string, opts *RequestOptions, args ...any) (<-chan StreamValue, error) {
 	return c.callStreamWithOptions(ctx, subject, opts, methodProbe{}, args...)
 }
@@ -56,7 +53,6 @@ func (c *Client) callStreamWithOptions(ctx context.Context, subject string, opts
 	return ch, err
 }
 
-// callStreamOnce performs a single streaming RPC call attempt.
 func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any) (<-chan StreamValue, error) {
 	if c.needsConnect() {
 		if err := c.Connect(ctx); err != nil {
@@ -78,16 +74,11 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 
 	ch := make(chan StreamValue, 64)
 
-	// statusDone releases the late-503 watcher goroutine below when the
-	// stream terminates through any other path (end/error/ctx cancel) —
-	// the previous per-call inbox achieved that via AutoUnsubscribe(1).
 	statusDone := make(chan struct{})
 	var statusOnce sync.Once
 	closeStatus := func() { statusOnce.Do(func() { close(statusDone) }) }
 
-	// mu serializes every send on ch with close(ch): the subscription
-	// goroutine pushes while ctx cancel, Disconnect or Suspend may end the
-	// stream. end closes done first, so a push parked on a full buffer lets go
+	// mu serializes every send on ch with close(ch); end closes done first so a push parked on a full buffer lets go
 	var mu sync.Mutex
 	ended := false
 	done := make(chan struct{})
@@ -135,8 +126,7 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 	}
 	c.streamHandlers.Store(id, sh)
 
-	// a slow consumer backs up into nats.go instead of losing items, as the
-	// reply mux does; the end message must not be dropped either
+	// a slow consumer backs up into nats.go instead of losing items, the end message must not be dropped either
 	unsub, err := c.Subscribe(streamSubject, func(data []byte) {
 		var msg StreamMessage
 		if err := DecodeMessageInto(data, &msg); err != nil {
@@ -175,8 +165,7 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 		return nil, err
 	}
 
-	// ends with ctx or with the stream itself (end, error, late 503,
-	// Disconnect, Suspend), so a finished stream does not keep its subscription
+	// ends with ctx or with the stream itself, so a finished stream does not keep its subscription
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -190,12 +179,7 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 		unsub()
 	}()
 
-	// No-responder detection via the muxed reply inbox: the request's reply
-	// subject `rpc.reply.<id>` only ever carries a 503 status — stream
-	// responders never publish a direct RPC response. One-shot: the mux
-	// removes the handler when it fires. The buffered channel lets us detect
-	// the common synchronous case (no responders at publish time) below and
-	// return an error the retry wrapper can act on.
+	// the reply subject only ever carries a 503 status, stream responders never answer on it
 	noRespCh := make(chan *RPCException, 1)
 	c.statusHandlers.Store(id, func(error) {
 		select {
@@ -223,10 +207,9 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 		return nil, err
 	}
 
-	// Flush to ensure the 503 response (if any) is received before we return
+	// the flush lets a synchronous 503 arrive before the check below
 	_ = nc.Flush()
 
-	// Check for no-responder error
 	select {
 	case noRespErr := <-noRespCh:
 		c.streamHandlers.Delete(id)
@@ -237,9 +220,7 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 	default:
 	}
 
-	// Wire up the 503 handler for late arrivals (edge case: the status
-	// delivery raced the flush). statusDone reclaims the goroutine when the
-	// stream terminates normally.
+	// a late 503 that raced the flush
 	go func() {
 		select {
 		case noRespErr := <-noRespCh:
@@ -254,11 +235,7 @@ func (c *Client) callStreamOnce(ctx context.Context, subject string, args ...any
 	return ch, nil
 }
 
-// CallPullIterator makes a pull-based iterator RPC call.
-// Returns a channel that yields PullValue items on demand.
-// Cancel via the context to stop early. When ctx ends while the call is still
-// being set up, the call returns at once and the session the responder sets
-// up anyway is cancelled when its answer arrives.
+// CallPullIterator makes a pull-based iterator RPC call whose channel yields values on demand until ctx is done.
 func (c *Client) CallPullIterator(ctx context.Context, subject string, args ...any) (<-chan PullValue, error) {
 	return c.callPullIterator(ctx, subject, nil, args...)
 }
@@ -275,13 +252,9 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 	iteratorID := c.generateID()
 	requestSubject := fmt.Sprintf("_rpc.iterator.%s.request", iteratorID)
 	responseSubject := fmt.Sprintf("_rpc.iterator.%s.response", iteratorID)
-	// 503 status inbox for `next` requests, served by the muxed reply inbox:
-	// iteratorID starts with replyPrefix, so this subject falls under the mux
-	// wildcard. Real iterator responses keep arriving on responseSubject —
-	// only no-responder statuses land here.
+	// only the 503 statuses of next requests land here, the responses come on responseSubject
 	statusInbox := "rpc.reply." + iteratorID
 
-	// Initialize the pull iterator
 	initParams := PullIteratorParams{
 		PullIterator: true,
 		IteratorID:   iteratorID,
@@ -293,9 +266,7 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 
 	ch := make(chan PullValue, 1)
 
-	// Registered with the client for the iterator's lifetime: a consumer
-	// parked in a next() wait must be force-settled when the connection is
-	// torn down (Disconnect/Suspend), or it hangs forever.
+	// settles a consumer parked in next() when the connection is torn down, or it hangs forever
 	disconnected := make(chan struct{})
 	var settleOnce sync.Once
 	c.pullIteratorSettles.Store(iteratorID, func() {
@@ -306,8 +277,6 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 		defer close(ch)
 		defer c.pullIteratorSettles.Delete(iteratorID)
 
-		// Subscribe to responses. ended is written by this goroutine and read
-		// by the NATS subscription goroutine — atomic.Bool avoids the race.
 		respCh := make(chan PullIteratorResponse, 8)
 		var ended atomic.Bool
 
@@ -326,10 +295,6 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 		}
 		defer unsub()
 
-		// No-responder detection for `next` requests via the muxed reply
-		// inbox (one-shot; replaces the previous lack of any detection /
-		// Node's per-iterator max:1 status inbox). The handler feeds an
-		// error response into the regular response path.
 		noResponders := &RPCError{Code: "503", Message: "No responders for " + subject}
 		c.statusHandlers.Store(iteratorID, func(error) {
 			if !ended.Load() {
@@ -343,9 +308,7 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 			_ = c.Publish(requestSubject, cancelReq)
 		}
 
-		// sendDisconnected delivers the connection error to a parked
-		// consumer without blocking; if nobody is waiting, the closed
-		// channel terminates the consumer's range loop instead.
+		// with nobody waiting, the closed channel ends the consumer's range loop instead
 		sendDisconnected := func() {
 			ended.Store(true)
 			select {
@@ -354,9 +317,6 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 			}
 		}
 
-		// sendToConsumer wraps a channel send in a ctx-aware select so
-		// a consumer that has stopped reading doesn't permanently park
-		// the goroutine. See client_pull_callback.go for rationale.
 		sendToConsumer := func(v PullValue) bool {
 			select {
 			case ch <- v:
@@ -372,9 +332,7 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 		}
 
 		for {
-			// Send next request. `reply` points at the status inbox so a
-			// vanished responder surfaces as a 503 on the mux instead of a
-			// silent hang.
+			// reply points at the status inbox so a vanished responder shows as a 503 instead of a hang
 			nextReq := PullIteratorRequest{
 				ID:   iteratorID,
 				Type: "next",
@@ -384,7 +342,6 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 				return
 			}
 
-			// Wait for response
 			select {
 			case resp := <-respCh:
 				switch resp.Type {
@@ -418,9 +375,6 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 	return ch, nil
 }
 
-// a cancel that overtakes the init call reaches no session yet, so the call
-// runs on to its own timeout, past ctx's deadline too; one cancel follows
-// every init that went out and did not hand its session over
 func (c *Client) initPullSession(ctx context.Context, subject, kind, iteratorID string, opts *RequestOptions, params any) error {
 	cancelled := func(err error) error {
 		return fmt.Errorf("init %s: %w", kind, NewRPCException(ErrCodeTimeout, fmt.Sprintf("RPC call to %q context cancelled: %v", subject, err)))
@@ -449,6 +403,7 @@ func (c *Client) initPullSession(ctx context.Context, subject, kind, iteratorID 
 		return call(ctx)
 	}
 
+	// a cancel that overtakes the init reaches no session yet, so the init runs on to its own timeout and a cancel follows
 	detached, stop := context.WithoutCancel(ctx), context.CancelFunc(func() {})
 	if deadline, ok := ctx.Deadline(); ok {
 		timeout := c.Options.Timeout
@@ -475,9 +430,9 @@ func (c *Client) initPullSession(ctx context.Context, subject, kind, iteratorID 
 	}
 }
 
-// the 503 of a next request is a no-responder this client saw itself
 func pullError(e, local *RPCError, subject string) *RPCException {
 	ex := RPCExceptionFromError(e)
+	// the 503 of a next request is a no-responder this client saw itself
 	if e == local {
 		ex.upstream = subject
 	}

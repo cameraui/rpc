@@ -13,7 +13,7 @@ func main() {
 	fmt.Println("Plain Object Property Access Test (Go)")
 	fmt.Println()
 
-	// Declare first, then assign self-referencing closures.
+	// declared first so the closures below can reference it
 	handlers := map[string]any{
 		"name":    "test-service",
 		"version": "1.0.0",

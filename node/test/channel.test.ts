@@ -9,7 +9,6 @@ import type { NatsConnection } from '@nats-io/transport-node';
 
 vi.mock('@nats-io/transport-node', async (importOriginal) => ({ ...(await importOriginal<typeof import('@nats-io/transport-node')>()), connect: vi.fn() }));
 
-// what the server hands every live subscriber of the request a client sent
 function deliverRequest(nc: ReturnType<typeof createClient>['nc'], index = 0) {
   const { subject, data, opts } = nc.requests[index];
   return nc.subs
@@ -35,7 +34,7 @@ describe('channel requests', () => {
     await asking.onRequest(askingHandler);
     await answering.onRequest(answeringHandler);
 
-    void asking.request({ q: 1 }).catch(() => {});
+    asking.request({ q: 1 }).catch(() => {});
     await vi.waitFor(() => expect(nc.requests.length).toBe(1));
     deliverRequest(nc);
     await flushAsync();
@@ -61,7 +60,7 @@ describe('channel requests', () => {
     const { client, nc } = createClient();
     await client.onRequest('svc.echo', (data) => data);
 
-    void client.request('svc.echo', { q: 1 }).catch(() => {});
+    client.request('svc.echo', { q: 1 }).catch(() => {});
     await vi.waitFor(() => expect(nc.requests.length).toBe(1));
     const [respond] = deliverRequest(nc);
     await flushAsync();

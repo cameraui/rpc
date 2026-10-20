@@ -17,8 +17,6 @@ CLOSED = {"code": "CONNECTION_CLOSED", "message": "Connection closed", "data": N
 
 
 class DrainNC(nats_aio_client.Client):
-    """nats-py's client without a socket: commands are recorded and the server answers every PING."""
-
     def __init__(self) -> None:
         super().__init__()
         self._status = nats_aio_client.Client.CONNECTED
@@ -49,8 +47,6 @@ class DrainNC(nats_aio_client.Client):
 
 
 class SilentNC(DrainNC):
-    """A half-dead link: nats-py still reports it connected, but no PONG comes back."""
-
     async def _send_command(self, cmd: bytes, priority: bool = False) -> None:
         self.commands.append(cmd)
 

@@ -10,11 +10,6 @@ public enum RPCCodecError: Error, CustomStringConvertible {
   }
 }
 
-/// Wire codec on top of MessagePack. Messages without large binaries are plain
-/// msgpack; messages containing Data values >= binaryExtractThreshold are
-/// framed as [magic "CUIB"][u32 LE envLen][msgpack envelope][bin0][bin1]...,
-/// with each extracted binary replaced by { "__cui_bin__": index, "l": length }
-/// in the envelope. Mirrors rpc/node/src/codec.ts, which documents the format.
 public enum RPCCodec {
   public static let binaryExtractThreshold = 16_384
 
@@ -76,8 +71,7 @@ public enum RPCCodec {
     collectSegmentLengths(envelope, into: &lengths)
     let segmentCount = lengths.isEmpty ? 0 : (lengths.keys.max()! + 1)
 
-    // segments lie back-to-back in index order, whatever order their
-    // placeholders appear in the envelope
+    // segments follow in index order, whatever order the placeholders have in the envelope
     var segments: [Data] = []
     segments.reserveCapacity(segmentCount)
     var offset = base + segmentBase
@@ -119,9 +113,8 @@ public enum RPCCodec {
     return value
   }
 
-  // strict: exactly the two placeholder keys with non-negative integers,
-  // anything else is user data and passes through untouched
   private static func placeholder(_ value: Any?) -> (index: Int, length: Int)? {
+    // anything but exactly these two keys with non-negative ints is user data
     guard
       let map = value as? [String: Any?],
       map.count == 2,

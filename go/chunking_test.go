@@ -14,14 +14,12 @@ func TestCreateChunks(t *testing.T) {
 		t.Errorf("expected 4 chunks, got %d", len(chunks))
 	}
 
-	// Verify all chunk IDs
 	for _, c := range chunks {
 		if c.ID != "test-id" {
 			t.Errorf("chunk ID = %v, want test-id", c.ID)
 		}
 	}
 
-	// Verify last chunk
 	if !chunks[len(chunks)-1].IsLast {
 		t.Error("expected last chunk to have IsLast=true")
 	}
@@ -66,7 +64,6 @@ func TestChunkAssemblerOutOfOrder(t *testing.T) {
 
 	assembler := NewChunkAssembler("ooo-id", len(original), len(chunks), chunkSize)
 
-	// Add in reverse order
 	for _, chunk := range slices.Backward(chunks) {
 		_, err := assembler.AddChunk(chunk)
 		if err != nil {

@@ -61,7 +61,7 @@ async function main() {
     { subject: 'math.add', data: { a: 5, b: 3, operation: 'add' } },
     { subject: 'math.multiply', data: { a: 4, b: 7, operation: 'multiply' } },
     { subject: 'math.divide', data: { a: 20, b: 4, operation: 'divide' } },
-    { subject: 'math.divide', data: { a: 10, b: 0, operation: 'divide' } }, // Error case
+    { subject: 'math.divide', data: { a: 10, b: 0, operation: 'divide' } },
   ];
 
   for (const test of mathTests) {
@@ -84,7 +84,7 @@ async function main() {
     return {
       data: buffer,
       size: buffer.length,
-      checksum: buffer.length, // Simplified checksum
+      checksum: buffer.length, // stand-in for a real checksum
     };
   });
 

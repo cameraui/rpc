@@ -50,8 +50,8 @@ class OperationTimer:
 
 
 small_data = "This is a small test message"
-medium_data = bytes([i % 256 for i in range(5 * 1024 * 1024)])  # 5MB
-large_data = bytes([i % 256 for i in range(10 * 1024 * 1024)])  # 10MB
+medium_data = bytes([i % 256 for i in range(5 * 1024 * 1024)])
+large_data = bytes([i % 256 for i in range(10 * 1024 * 1024)])
 
 
 @RPCClass
@@ -113,12 +113,12 @@ async def test_all_features() -> None:
 
     print("\n 1. Native Request/Reply")
 
-    # Setup (handler registration + subscription settle) outside the measurement
+    # setup stays outside the measurement
     async def echo_handler(data: Any) -> dict[str, Any]:
         return {"echo": data["msg"], "timestamp": int(time.perf_counter() * 1000)}
 
     unsub = await server.on_request("echo.*", echo_handler)
-    await asyncio.sleep(0.05)  # Let subscription settle
+    await asyncio.sleep(0.05)  # let the subscription settle
 
     with timer.start_operation("Request Handler Setup & 100 calls"):
         for i in range(100):
@@ -141,7 +141,7 @@ async def test_all_features() -> None:
     }
 
     unsub_rpc = await server.register_handler("test", handlers)
-    await asyncio.sleep(0.05)  # More time for handler setup
+    await asyncio.sleep(0.05)  # let the handler set up
 
     test_proxy = client.create_proxy("test")
 
@@ -198,7 +198,6 @@ async def test_all_features() -> None:
         for i in range(1000):
             await client_channel.send({"index": i, "data": f"Message {i}"})
 
-        # Wait for the receive counter instead of a fixed sleep
         await wait_for_condition(lambda: len(messages_received) >= 1000)
 
     assert len(messages_received) == 1000
@@ -233,8 +232,8 @@ async def test_all_features() -> None:
             TestService(),
         )
 
-    # Verification (settle sleep + discovery) outside the measurement
-    await asyncio.sleep(0.1)  # Let service register
+    # verification stays outside the measurement
+    await asyncio.sleep(0.1)  # let the service register
 
     monitor = client.service.monitor()
     services = await monitor.info("perf-service")
@@ -259,7 +258,7 @@ async def test_all_features() -> None:
 
         assert stream_sum == sum(range(100))
 
-    # Services don't support chunking, so large data goes via RPC
+    # services do not chunk, so large data goes via RPC
     print("\n 8b. Large Data via RPC Handler")
 
     async def handle_get_large_data() -> bytes:
@@ -295,8 +294,7 @@ async def test_all_features() -> None:
         results = await asyncio.gather(*tasks)
         assert len(results) == 500
 
-        # Keep the handler for mixed workload test
-        # await unsub_concurrent()
+        # the handler stays for the mixed workload test
 
     print("\n 10. Error Handling")
     with timer.start_operation("Error Handling Test"):
@@ -307,7 +305,7 @@ async def test_all_features() -> None:
             await calc_service.error_method(True)
             raise AssertionError("Should have raised exception")
         except RPCException as e:
-            # The error code might come as a string "500" or the enum value
+            # the error code may come as the string "500" or as the enum value
             assert str(e.code) == "500" or e.code == ErrorCode.INTERNAL_ERROR
 
     print("\n 11. Isolated Connection Proxy")
@@ -346,7 +344,7 @@ async def test_all_features() -> None:
 
                 ops.append(asyncio.create_task(test_channel.send({"event": "mixed", "data": "test"})))
 
-            # Service calls don't support auto-chunking, so use echo to avoid "maximum payload exceeded"
+            # service calls do not chunk, echo avoids maximum payload exceeded
             ops.append(asyncio.create_task(calc_service.echo("test data")))
 
             await asyncio.gather(*ops)

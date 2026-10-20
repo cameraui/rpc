@@ -83,7 +83,6 @@ func TestFormatErrorObjectStdError(t *testing.T) {
 func TestRPCExceptionErrorInterface(t *testing.T) {
 	exc := NewRPCException(ErrCodeTimeout, "timed out")
 
-	// Should implement error interface
 	var err error = exc
 	if err.Error() == "" {
 		t.Error("expected non-empty error message")

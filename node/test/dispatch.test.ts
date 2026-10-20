@@ -4,9 +4,7 @@ import { createBoundedDispatcher, createSerialDispatcher, sleep } from '../src/u
 
 interface Msg {
   id: number;
-  /** When set, the handler is async and waits this long before finishing. */
   delayMs?: number;
-  /** When set, the handler throws (sync) or rejects (async). */
   fail?: boolean;
 }
 
@@ -14,12 +12,10 @@ function makeHandler(events: string[]) {
   return (msg: Msg): void | Promise<void> => {
     events.push(`start:${msg.id}`);
     if (msg.delayMs === undefined) {
-      // Synchronous handler
       if (msg.fail) throw new Error(`sync-fail-${msg.id}`);
       events.push(`end:${msg.id}`);
       return;
     }
-    // Asynchronous handler
     return sleep(msg.delayMs).then(() => {
       if (msg.fail) throw new Error(`async-fail-${msg.id}`);
       events.push(`end:${msg.id}`);
@@ -35,7 +31,7 @@ describe('createSerialDispatcher', () => {
     dispatch({ id: 1 });
     dispatch({ id: 2 });
 
-    // Assert synchronously — before any microtask has a chance to run.
+    // before any microtask runs
     expect(events).toEqual(['start:1', 'end:1', 'start:2', 'end:2']);
   });
 
@@ -43,10 +39,10 @@ describe('createSerialDispatcher', () => {
     const events: string[] = [];
     const { dispatch, flush } = createSerialDispatcher(makeHandler(events), () => {});
 
-    dispatch({ id: 1, delayMs: 15 }); // async, slow
-    dispatch({ id: 2 }); // sync — must wait for 1
-    dispatch({ id: 3, delayMs: 1 }); // async, fast — must still run after 2
-    dispatch({ id: 4 }); // sync — must run last
+    dispatch({ id: 1, delayMs: 15 });
+    dispatch({ id: 2 });
+    dispatch({ id: 3, delayMs: 1 });
+    dispatch({ id: 4 });
 
     await flush();
 
@@ -60,7 +56,7 @@ describe('createSerialDispatcher', () => {
     dispatch({ id: 1, delayMs: 1 });
     await flush();
 
-    // Chain is idle again — sync handler must execute inline.
+    // idle again, so the sync handler runs inline
     dispatch({ id: 2 });
     expect(events).toEqual(['start:1', 'end:1', 'start:2', 'end:2']);
   });
@@ -70,10 +66,10 @@ describe('createSerialDispatcher', () => {
     const { dispatch, flush } = createSerialDispatcher(makeHandler(events), () => {});
 
     dispatch({ id: 1, delayMs: 5 });
-    await sleep(1); // chain still busy
+    await sleep(1);
     dispatch({ id: 2 });
     dispatch({ id: 3, delayMs: 5 });
-    await sleep(20); // 1 and its followers settle; 3 done too
+    await sleep(20);
     dispatch({ id: 4 });
 
     await flush();
@@ -86,9 +82,9 @@ describe('createSerialDispatcher', () => {
     const errors: string[] = [];
     const { dispatch, flush } = createSerialDispatcher(makeHandler(events), (error) => errors.push((error as Error).message));
 
-    dispatch({ id: 1, fail: true }); // sync throw on idle chain
-    dispatch({ id: 2, delayMs: 1, fail: true }); // async reject
-    dispatch({ id: 3, fail: true }); // sync throw while chain busy
+    dispatch({ id: 1, fail: true }); // sync throw on an idle chain
+    dispatch({ id: 2, delayMs: 1, fail: true });
+    dispatch({ id: 3, fail: true }); // sync throw on a busy chain
     dispatch({ id: 4 });
 
     await flush();
@@ -101,7 +97,7 @@ describe('createSerialDispatcher', () => {
     const events: string[] = [];
     const { dispatch, flush } = createSerialDispatcher(makeHandler(events), () => {});
 
-    dispatch({ id: 1 }); // sync — done inline
+    dispatch({ id: 1 });
 
     let flushed = false;
     const p = flush().then(() => {

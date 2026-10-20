@@ -2,7 +2,7 @@ import { createRPCClient } from '../src/index.js';
 
 import type { RPCClient } from '../src/index.js';
 
-const largeBuffer = Buffer.alloc(2 * 1024 * 1024).fill('x'); // 2MB
+const largeBuffer = Buffer.alloc(2 * 1024 * 1024).fill('x');
 
 async function channelExample() {
   console.log('Channel Communication Example\n');

@@ -56,7 +56,9 @@ describe('service endpoints', () => {
       {
         watch(callback: (value: unknown) => Promise<void>) {
           push = callback;
-          return () => void cleanups++;
+          return () => {
+            cleanups++;
+          };
         },
         async *play(callbacks: { onFrame: (n: number) => void }) {
           callbacks.onFrame(1);
@@ -104,7 +106,7 @@ describe('service proxy', () => {
     const { client, nc } = createClient();
     const proxy = createServiceProxy<{ whoami(): Promise<string> }>(client, info({}));
 
-    void proxy.whoami().catch(() => {});
+    proxy.whoami().catch(() => {});
     await until(() => nc.published.length === 1);
     expect(nc.published[0].subject).toBe('svc.alpha.whoami');
     expect(nc.subs.map((s) => s.pattern)).toContain(`svc.alpha.whoami.reply.${(decode(nc.published[0].data) as { id: string }).id}`);
@@ -115,7 +117,7 @@ describe('service proxy', () => {
     (client as any)._maxPayloadSize = 1000;
     const proxy = createServiceProxy<{ whoami(blob: Uint8Array): Promise<string> }>(client, info({ metadata: { 'cui.chunk.direct': '1' } }));
 
-    void proxy.whoami(new Uint8Array(5000)).catch(() => {});
+    proxy.whoami(new Uint8Array(5000)).catch(() => {});
     await until(() => nc.published.length > 2);
     const target = '$CUI.SVC.INST1.whoami';
     expect(new Set(nc.published.map((p) => p.subject))).toEqual(new Set([target]));
@@ -123,7 +125,7 @@ describe('service proxy', () => {
     expect(nc.subs.some((s) => s.pattern.startsWith(`${target}.reply.`))).toBe(true);
 
     nc.published.length = 0;
-    void proxy.whoami(new Uint8Array(10)).catch(() => {});
+    proxy.whoami(new Uint8Array(10)).catch(() => {});
     await until(() => nc.published.length === 1);
     expect(nc.published[0].subject).toBe('svc.alpha.whoami');
   });
@@ -133,7 +135,7 @@ describe('service proxy', () => {
     (client as any)._maxPayloadSize = 1000;
     const proxy = createServiceProxy<{ whoami(blob: Uint8Array): Promise<string> }>(client, info({}));
 
-    void proxy.whoami(new Uint8Array(5000)).catch(() => {});
+    proxy.whoami(new Uint8Array(5000)).catch(() => {});
     await until(() => nc.published.length > 2);
     expect(new Set(nc.published.map((p) => p.subject))).toEqual(new Set(['svc.alpha.whoami']));
   });
@@ -143,7 +145,7 @@ describe('service proxy', () => {
     const proxy = createServiceProxy<any>(client, info({ endpoints: [{ name: 'play', subject: 'svc.alpha.play', queue_group: 'q', metadata: {} } as any] }));
 
     const iter = proxy.play(rpcCallbacks({ onFrame: () => {} }));
-    void iter.next().catch(() => {});
+    iter.next().catch(() => {});
     await until(() => nc.published.some((p) => p.subject === 'svc.alpha.play'));
     const init = decode(nc.published.find((p) => p.subject === 'svc.alpha.play')!.data) as { params: [{ __pullCallback: boolean }] };
     expect(init.params[0].__pullCallback).toBe(true);

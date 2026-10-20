@@ -68,7 +68,6 @@ def version_exists_on_pypi(package_name: str, version: str) -> bool:
 
 
 def ensure_py_typed() -> None:
-    """Ensure py.typed marker file exists."""
     package_dir = Path(package_dir_name)
     typed_file = package_dir / "py.typed"
     if not typed_file.exists():
@@ -79,7 +78,6 @@ def ensure_py_typed() -> None:
 
 
 def cleanup_old_pyi_files() -> None:
-    """Remove any old .pyi stub files (no longer needed)."""
     package_dir = Path(package_dir_name)
     removed_count = 0
     for pyi_file in package_dir.rglob("*.pyi"):
@@ -98,42 +96,34 @@ def main() -> None:
 
     print(f"\n{Colors.HEADER}{Colors.BOLD}Building {package_name} v{version}{Colors.END}\n")
 
-    # Cleanup previous builds
     log("Cleaning up previous builds...")
     for dir_name in ["dist", "build", f"{package_dir_name}.egg-info", "stubs"]:
         if os.path.exists(dir_name):
             shutil.rmtree(dir_name)
             log(f"Removed {dir_name}/", "info")
 
-    # Remove old .pyi files
     cleanup_old_pyi_files()
 
-    # Ensure py.typed marker exists
     ensure_py_typed()
 
-    # Run mypy type check
     log("Running mypy type check...")
     run_command(f"mypy -p {package_dir_name}")
     log("Type check passed", "success")
 
-    # Build package
     log("Building package...")
     run_command("python -m build --sdist")
     log("Package built successfully", "success")
 
-    # Check if package is valid
     log("Validating package with twine...")
     run_command("twine check dist/*")
     log("Package is valid", "success")
 
-    # Check if package version already exists
     log("Checking PyPI for existing version...")
     if version_exists_on_pypi(package_name, version):
         log(f"Version {version} already exists on PyPI. Please update the version number.", "error")
         raise Exception("Version already exists")
     log("Version check passed", "success")
 
-    # Setup twine credentials if not exists
     home = Path.home()
     pypirc = home / ".pypirc"
 
@@ -147,11 +137,9 @@ def main() -> None:
 
         with open(pypirc, "w") as f:
             config.write(f)
-        # Secure the file
         os.chmod(pypirc, 0o600)
         log(".pypirc file created", "success")
 
-    # Publish package
     try:
         log("Publishing package to PyPI...")
         run_command("twine upload dist/*")
@@ -165,35 +153,28 @@ def main() -> None:
 
 
 def build_local() -> None:
-    """Build package locally without publishing to PyPI."""
     version = get_package_version()
 
     print(f"\n{Colors.HEADER}{Colors.BOLD}Building {package_name} v{version} (local){Colors.END}\n")
 
-    # Cleanup previous builds
     log("Cleaning up previous builds...")
     for dir_name in ["dist", "build", f"{package_dir_name}.egg-info", "stubs"]:
         if os.path.exists(dir_name):
             shutil.rmtree(dir_name)
             log(f"Removed {dir_name}/", "info")
 
-    # Remove old .pyi files
     cleanup_old_pyi_files()
 
-    # Ensure py.typed marker exists
     ensure_py_typed()
 
-    # Run mypy type check
     log("Running mypy type check...")
     run_command(f"mypy -p {package_dir_name}")
     log("Type check passed", "success")
 
-    # Build package
     log("Building package...")
     run_command("python -m build --sdist")
     log("Package built successfully", "success")
 
-    # Check if package is valid
     log("Validating package with twine...")
     run_command("twine check dist/*")
     log("Package is valid", "success")

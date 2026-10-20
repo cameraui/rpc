@@ -1,6 +1,6 @@
 import { createRPCClient } from '../src/index.js';
 
-const largeBuffer = Buffer.alloc(5 * 1024 * 1024).fill('x'); // 5MB
+const largeBuffer = Buffer.alloc(5 * 1024 * 1024).fill('x');
 
 async function main() {
   const totalStart = performance.now();
@@ -85,7 +85,7 @@ async function main() {
 
   console.log('=== Testing Concurrent Channel Requests ===\n');
 
-  // Unsubscribe the previous handler to avoid conflicts
+  // the previous handler would answer too
   unsubB();
 
   let requestCount = 0;

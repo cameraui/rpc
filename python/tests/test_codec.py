@@ -1,5 +1,3 @@
-"""Tests for the MessagePack codec round-trips."""
-
 import struct
 from datetime import UTC, date, datetime, time
 from enum import Enum, StrEnum
@@ -171,8 +169,7 @@ def _bytes(length: int, fill: int = 7) -> bytes:
     return bytes([fill]) * length
 
 
-# Extractable sizes are expressed relative to the threshold so the tests
-# survive threshold tuning.
+# sizes relative to the threshold, so the tests survive tuning it
 T = BINARY_EXTRACT_THRESHOLD
 
 
@@ -190,14 +187,12 @@ class TestFraming:
         message = {"id": "abc", "params": [bin_data]}
         encoded = encode_message(message)
 
-        # Magic "CUIB"
         assert encoded[:4] == b"CUIB"
 
         env_len = struct.unpack_from("<I", encoded, 4)[0]
         envelope = decode(encoded[8 : 8 + env_len])
         assert envelope == {"id": "abc", "params": [{"__cui_bin__": 0, "l": T + 1024}]}
 
-        # Segment lies back-to-back after the envelope
         assert len(encoded) == 8 + env_len + T + 1024
         assert encoded[8 + env_len :] == bin_data
 
@@ -305,7 +300,7 @@ class TestZeroCopyDecode:
         view = result["params"][0]
         assert isinstance(view, memoryview)
         assert view.obj is encoded
-        # Mutating the receive buffer is visible through the view (no copy).
+        # mutating the receive buffer shows through the view, no copy
         encoded[-1] = 0x99
         assert view[-1] == 0x99
 
@@ -335,8 +330,7 @@ class TestPlaceholderCollisionSafety:
         assert result["params"][0] == {"__cui_bin__": 0, "l": 1, "extra": True}
 
     def test_leaves_placeholder_shaped_user_maps_untouched_in_binary_free_messages(self) -> None:
-        # Without extracted binaries there is no CUIB frame, hence no
-        # placeholder substitution at all.
+        # without extracted binaries there is no CUIB frame, so no placeholder substitution
         message = {"params": [{"__cui_bin__": 0, "l": 123}]}
         result = message_roundtrip(message)
         assert result["params"][0] == {"__cui_bin__": 0, "l": 123}
@@ -344,9 +338,7 @@ class TestPlaceholderCollisionSafety:
 
 class TestOutOfOrderPlaceholders:
     def test_restores_segments_whose_placeholders_appear_out_of_traversal_order(self) -> None:
-        # A port whose map serialization order differs from its extraction
-        # order (e.g. Go map iteration) may emit placeholder 1 before 0 in
-        # the envelope. Segments still lie back-to-back in index order.
+        # Go map iteration may emit placeholder 1 before 0, segments still follow in index order
         seg0 = _bytes(T, 0xAA)
         seg1 = _bytes(T + 2048, 0xBB)
         envelope = encode({"b": {"__cui_bin__": 1, "l": T + 2048}, "a": {"__cui_bin__": 0, "l": T}})

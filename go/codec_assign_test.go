@@ -196,9 +196,8 @@ type asgAlias struct {
 	Name string `msgpack:"name,alias:title"`
 }
 
-// one field only: msgpack panics on nil into time.Time, and with a second field map order decides whether it gets there
 type asgTimed struct {
-	At time.Time `msgpack:"at"`
+	At time.Time `msgpack:"at"` // alone: msgpack panics on nil into time.Time, a second field makes reaching it map-order dependent
 }
 
 type asgCustomValue struct {
@@ -297,8 +296,7 @@ type asgGen struct {
 	r *rand.Rand
 }
 
-// msgpack reads these through reflection only
-var _ = []any{asgNumbers{hidden: ""}, asgAsArray{_msgpack: struct{}{}}}
+var _ = []any{asgNumbers{hidden: ""}, asgAsArray{_msgpack: struct{}{}}} // msgpack reads these through reflection only
 
 var asgTargets = []reflect.Type{
 	reflect.TypeFor[asgEvent](),
@@ -333,7 +331,6 @@ var asgTargets = []reflect.Type{
 	reflect.TypeFor[map[string]string](),
 }
 
-// the pre-assign coerceValue, kept as the reference the assigner has to match
 func legacyCoerceValue(val any, target reflect.Type, pooled bool) reflect.Value {
 	if val == nil {
 		return reflect.Zero(target)
@@ -416,7 +413,6 @@ func coerceOrPanic(fn func() reflect.Value) (result any, panicked string) {
 	return fn().Interface(), ""
 }
 
-// the new result's wire is overwritten before comparing: a struct field must never view the frame
 func checkCoerceParity(t testing.TB, target reflect.Type, wire []byte) {
 	t.Helper()
 	wireNew := bytes.Clone(wire)
@@ -434,6 +430,7 @@ func checkCoerceParity(t testing.TB, target reflect.Type, wire []byte) {
 	if gotPanic != wantPanic {
 		t.Fatalf("%v: panic %q, reference panic %q", target, gotPanic, wantPanic)
 	}
+	// a struct field must never view the frame
 	if k := target.Kind(); k == reflect.Struct || k == reflect.Pointer {
 		for i := range wireNew {
 			wireNew[i] = 0xAA
@@ -573,7 +570,6 @@ func FuzzAssignGenericMatchesRoundTrip(f *testing.F) {
 	})
 }
 
-// keys that land on a field another key also fills, see asgGen.forType
 func hasOrderDependentKey(v any) bool {
 	switch x := v.(type) {
 	case map[string]any:
@@ -649,7 +645,7 @@ func TestConvertPooledAllocatesOnlyTheDecodedCopy(t *testing.T) {
 	if err := convertPooled(src, &dst); err != nil || len(dst.Data) != 1<<20 {
 		t.Fatalf("convertPooled: %v, %d bytes", err, len(dst.Data))
 	}
-	// TotalAlloc is process wide and goroutines left by other tests only add to it, so the least of several batches counts
+	// TotalAlloc is process wide and other tests' goroutines only add to it, so the least of several batches counts
 	perCall := func(fn func()) uint64 {
 		least := uint64(math.MaxUint64)
 		for range 5 {
@@ -1062,7 +1058,6 @@ func (g *asgGen) anyValue(depth int) any {
 	}
 }
 
-// the argument work of one call: decode the request, then hand the handler its typed value
 func BenchmarkHandlerArg(b *testing.B) {
 	for _, fx := range ingestFixtures(b) {
 		fn := reflect.MakeFunc(reflect.FuncOf([]reflect.Type{fx.target}, nil, false), func([]reflect.Value) []reflect.Value { return nil })

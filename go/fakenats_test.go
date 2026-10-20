@@ -97,7 +97,6 @@ func (s *fakeNATS) publishes(match func(subject string) bool) int {
 	return n
 }
 
-// subscriptions whose subject starts with prefix, over all connections
 func (s *fakeNATS) subsWithPrefix(prefix string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -112,42 +111,36 @@ func (s *fakeNATS) subsWithPrefix(prefix string) int {
 	return n
 }
 
-// publishes to subject that named a reply subject
 func (s *fakeNATS) requestsTo(subject string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.requests[subject]
 }
 
-// subjects in the order they reached the server
 func (s *fakeNATS) publishOrder() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Clone(s.routed)
 }
 
-// a 503 for a request then reaches the client before its Flush returns
 func (s *fakeNATS) delayPongs(d time.Duration) {
 	s.mu.Lock()
 	s.pongDelay = d
 	s.mu.Unlock()
 }
 
-// a 503 then reaches the client after the Flush behind its request returned
 func (s *fakeNATS) delayNoResponders(d time.Duration) {
 	s.mu.Lock()
 	s.lateNoResp = d
 	s.mu.Unlock()
 }
 
-// INFO announces n as max_payload to connections that come later
 func (s *fakeNATS) setMaxPayload(n int) {
 	s.mu.Lock()
 	s.maxPayload = n
 	s.mu.Unlock()
 }
 
-// a SUB reaches the routing table only after d, like a busy server
 func (s *fakeNATS) delaySubs(d time.Duration) {
 	s.mu.Lock()
 	s.subDelay = d
@@ -160,7 +153,6 @@ func (s *fakeNATS) pingCount() int {
 	return s.pings
 }
 
-// a refused connection is closed before INFO, so it counts as a failed attempt
 func (s *fakeNATS) setRefuse(on bool) {
 	s.mu.Lock()
 	s.refuse = on

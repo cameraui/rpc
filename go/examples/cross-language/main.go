@@ -193,7 +193,6 @@ func main() {
 		from, _ := msg["from"].(string)
 		msgType, _ := msg["type"].(string)
 
-		// Only respond to initial messages from other services, not responses
 		if from != "go" && msgType != "response" {
 			channel.Send(map[string]any{
 				"from":     "go",
@@ -205,7 +204,7 @@ func main() {
 	})
 	fmt.Println("Go channel ready")
 
-	// Wait for other services to set up
+	// the other language services need time to set up
 	time.Sleep(3 * time.Second)
 
 	fmt.Printf("\nGo calling target services...\n\n")
@@ -342,8 +341,7 @@ func main() {
 			fmt.Printf("Callback subscription test with %s: %d events received\n", target, cbCount)
 		}
 
-		// Error propagation: the peer handler returns/raises an error; it must
-		// reach us as an error carrying the same message, not a silent success.
+		// the peer's error must arrive as an error with the same message, not as a silent success
 		errToken := fmt.Sprintf("boom go->%s", target)
 		if _, errPropErr := proxy.Invoke(ctx, "raiseError", errToken); errPropErr == nil {
 			fmt.Printf("%s raiseError did NOT propagate an error\n", target)

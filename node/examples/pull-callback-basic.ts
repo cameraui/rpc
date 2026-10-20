@@ -1,7 +1,6 @@
 import { createRPCClient, rpcCallbacks } from '../src/index.js';
 
 interface DataService {
-  // Method name must contain "pull" to route to pull-callback mode.
   pullBatches(batchCount: number, chunksPerBatch: number, callbacks: { onChunk: (data: { batch: number; index: number } | null) => void }): AsyncGenerator<void>;
 }
 
@@ -77,7 +76,7 @@ async function main() {
 
   const elapsed = performance.now() - start;
 
-  // Give any in-flight callback messages one more tick to land.
+  // let in-flight callback messages land
   await new Promise((resolve) => setTimeout(resolve, 50));
 
   console.log('\nResults');

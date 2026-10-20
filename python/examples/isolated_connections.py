@@ -65,7 +65,7 @@ async def test_isolated_channels():
     print("Sending heavy traffic on isolated channel...")
     isolated_start = time.perf_counter()
     promises: list[asyncio.Task[Any]] = []
-    test_buffer = b"x" * 10000  # Pre-allocate 10KB buffer
+    test_buffer = b"x" * 10000
     for i in range(1000):
         promises.append(
             asyncio.create_task(
@@ -109,7 +109,6 @@ async def test_isolated_proxies():
     await server.connect()
     unsub = await server.register_handler("test", TestService())
 
-    # Setup client
     client = create_rpc_client(
         {
             "servers": ["nats://localhost:4222"],
@@ -201,7 +200,7 @@ async def test_mixed_workload():
 
     data_start = time.perf_counter()
     data_promises: list[asyncio.Task[Any]] = []
-    data_buffer = b"x" * (100 * 1024)  # Pre-allocate 100KB buffer
+    data_buffer = b"x" * (100 * 1024)
     for i in range(100):
         data_promises.append(
             asyncio.create_task(

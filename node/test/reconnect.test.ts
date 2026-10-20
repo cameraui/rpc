@@ -27,7 +27,6 @@ function reply(client: RPCClient, nc: ReturnType<typeof createMockNc>, req: RPCM
   muxSub(client, nc).callback(null, { subject: `rpc.reply.${req.id}`, data: encode({ id: req.id, result }) });
 }
 
-// what the promise settles with within `ms`, 'pending' otherwise
 function within(promise: Promise<unknown>, ms: number): Promise<unknown> {
   return Promise.race([
     promise.then(
@@ -38,7 +37,6 @@ function within(promise: Promise<unknown>, ms: number): Promise<unknown> {
   ]);
 }
 
-// answers the init call of a pull iterator and waits for its first next request
 async function openPull(client: RPCClient, nc: ReturnType<typeof createMockNc>, iter: AsyncGenerator<any>, subject: string) {
   const first = iter.next();
   await vi.waitFor(() => expect(sent(nc, subject).length).toBe(1));

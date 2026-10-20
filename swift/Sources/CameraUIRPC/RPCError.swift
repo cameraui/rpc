@@ -28,10 +28,7 @@ public struct RPCRemoteError: Error, CustomStringConvertible {
   }
 }
 
-/// Codes of an `RPCRemoteError` that the client raises itself.
 public enum RPCErrorCode {
-  /// The NATS server refused the request: this connection may not publish
-  /// to the subject in `data["subject"]`. A retry meets the same refusal.
   public static let forbidden = "FORBIDDEN"
 }
 
@@ -40,8 +37,6 @@ public enum RPCClientError: Error, CustomStringConvertible {
   case timeout(String)
   case noResponders(String)
   case invalidResponse(String)
-  /// The server turned the token or the connection down (WebSocket close
-  /// 4400, 4401 or 4403). Redialing with the same token repeats it.
   case unauthorized(code: UInt16, reason: String)
 
   public var description: String {

@@ -106,7 +106,6 @@ describe('presizeSplitPayloads', () => {
   });
 });
 
-// a real protocol handler whose transport records what goes to the socket; `node` puts it on a NodeTransport
 function protocolOn(node: boolean, writes: Buffer[]) {
   const nc = new (NatsConnectionImpl as unknown as new (opts: object) => any)({ servers: '127.0.0.1:1' });
   const protocol = new ProtocolHandler(nc.options, nc) as any;
@@ -218,7 +217,6 @@ describe('packSmallPublishes', () => {
   });
 });
 
-// a NATS server that answers PING, sends `messages` to the first SUB in pieces of `piece` bytes and records each connection
 async function messageServer(messages: Uint8Array[], info: Record<string, unknown> = {}, piece = 7_000) {
   const connections: Buffer[][] = [];
   const sockets: Socket[] = [];
@@ -254,7 +252,6 @@ async function messageServer(messages: Uint8Array[], info: Record<string, unknow
   };
 }
 
-// a server that writes only what the test sends through its sockets
 async function quietServer() {
   const sockets: Socket[] = [];
   const server = createServer((socket) => {

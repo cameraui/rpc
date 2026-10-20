@@ -7,7 +7,6 @@ import type { RPCMessage } from '../src/types.js';
 
 const METHODS = ['ping', 'db.find'];
 
-// answers every rpc.ns.* call with the method name, and with the method list when asked for it
 function served() {
   const ctx = createClient();
   const seen: { method: string; discover: boolean }[] = [];

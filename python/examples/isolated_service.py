@@ -98,7 +98,7 @@ async def main():
     compute_proxy = await client.create_service_proxy(
         "compute",
         isolated_connection=True,
-        timeout=60000,  # 60 seconds for heavy computations
+        timeout=60000,  # 60 s for heavy computations
     )
     compute_proxy_service: ComputeService = compute_proxy.proxy
     print("Compute service proxy created (isolated connection)")

@@ -15,8 +15,6 @@ struct FakeMessage {
   let payload: Data
 }
 
-// a single-process NATS server over plain TCP: enough protocol for the rpc client,
-// plus switches to drop every connection and to refuse new ones
 final class FakeNatsServer: @unchecked Sendable {
   private let lock = NSLock()
   private var listenFD: Int32 = -1
@@ -83,7 +81,6 @@ final class FakeNatsServer: @unchecked Sendable {
     }
   }
 
-  // the sockets stay open but nothing is answered or delivered, like a half-open link
   func silenceConnections() {
     lock.lock()
     let open = connections
@@ -99,14 +96,12 @@ final class FakeNatsServer: @unchecked Sendable {
     lock.unlock()
   }
 
-  // publishes there are answered with nats-server's permissions violation
   func refusePublishes(to pattern: String) {
     lock.lock()
     refusedPublishes.append(pattern)
     lock.unlock()
   }
 
-  // the sockets stay open but nothing is read, so the client's writes back up
   func pauseReads() {
     lock.lock()
     readsPaused = true
@@ -151,7 +146,6 @@ final class FakeNatsServer: @unchecked Sendable {
     publish(reply, data)
   }
 
-  // the client publishes a pull-iterator next/cancel or a call envelope as msgpack
   static func decode(_ message: FakeMessage) -> [String: Any?] {
     (try? RPCCodec.decodeMessage(message.payload)) as? [String: Any?] ?? [:]
   }
@@ -166,7 +160,6 @@ final class FakeNatsServer: @unchecked Sendable {
     return wanted.count == actual.count
   }
 
-  // false when the publish was refused
   fileprivate func received(_ message: FakeMessage) -> Bool {
     lock.lock()
     published.append(message)
@@ -347,7 +340,6 @@ final class FakeNatsConnection: @unchecked Sendable {
     closeSocket(fd)
   }
 
-  // bytes consumed by the next complete operation, nil when more input is needed
   private func parse(_ buffer: Data) -> Int? {
     guard let lineEnd = buffer.range(of: Data("\r\n".utf8)) else { return nil }
     let line = String(decoding: buffer[buffer.startIndex..<lineEnd.lowerBound], as: UTF8.self)

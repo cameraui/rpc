@@ -25,7 +25,6 @@ async function connected() {
   return { client, nc, refuse, sentTo };
 }
 
-// what the promise settles with within `ms`, 'pending' otherwise
 function within(promise: Promise<unknown>, ms: number): Promise<unknown> {
   return Promise.race([
     promise.then(

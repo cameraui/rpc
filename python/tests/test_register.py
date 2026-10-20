@@ -15,8 +15,6 @@ PING = b"PING\r\n"
 
 
 class GatedNC(DrainNC):
-    """Writes SUBs like nats-py does; a PING is answered once the test opens the gate."""
-
     def __init__(self, open_gate: bool = False) -> None:
         super().__init__()
         self.pong_gate = asyncio.Event()
@@ -166,8 +164,6 @@ def test_session_subjects_subscribe_without_a_yield_of_their_own() -> None:
 
 
 class FlushNC(GatedNC):
-    """nats-py without the queued PING: the confirm falls back to flush()."""
-
     def __init__(self) -> None:
         super().__init__(open_gate=True)
         self.flushed: list[list[bytes]] = []

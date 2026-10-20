@@ -13,8 +13,6 @@ from camera_ui_rpc.codec import decode, encode
 
 
 class Sleeps:
-    """Records the retry delays and skips them."""
-
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.delays: list[float] = []
         self._sleep = asyncio.sleep

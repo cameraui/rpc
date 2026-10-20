@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Helper script to run examples."""
-
 import sys
 from pathlib import Path
 
 import uvloop
 
-# Add the parent directory to the path so we can import examples
 sys.path.insert(0, str(Path(__file__).parent))
 
 if __name__ == "__main__":
@@ -17,7 +14,6 @@ if __name__ == "__main__":
 
     example_name = sys.argv[1]
 
-    # Import and run the example
     try:
         if example_name == "auto_chunking":
             from examples.auto_chunking import main

@@ -13,11 +13,11 @@ import (
 
 var (
 	smallData  = "This is a small response that fits in a single message"
-	mediumData = make([]byte, 5*1024*1024)  // 5MB
-	largeData  = make([]byte, 50*1024*1024) // 50MB
+	mediumData = make([]byte, 5*1024*1024)
+	largeData  = make([]byte, 50*1024*1024)
 
 	chunkBuffers [3][]byte
-	echoData     = make([]byte, 4*1024*1024) // 4MB
+	echoData     = make([]byte, 4*1024*1024)
 )
 
 func init() {

@@ -125,7 +125,7 @@ func main() {
 		}
 	}
 
-	// Allow server teardown + any in-flight callbacks to settle.
+	// let the server teardown and in-flight callbacks settle
 	time.Sleep(500 * time.Millisecond)
 
 	fmt.Println()
@@ -136,8 +136,7 @@ func main() {
 	fmt.Printf("  Chunks received after cancel:  %d (expected small, lookahead drain)\n", chunksAfterCancel.Load())
 	fmt.Printf("  Server teardown count:         %d (expected 1)\n", svc.TeardownCount.Load())
 
-	// NOTE: Go API inherently has 1-batch lookahead, so up to 3 chunks (1
-	// extra batch) may arrive after cancel.
+	// the Go API has a 1-batch lookahead, so up to 3 chunks may arrive after cancel
 	ok := batchesConsumed == 3 &&
 		svc.TeardownCount.Load() == 1 &&
 		svc.ProducedBatches.Load() <= 5 &&

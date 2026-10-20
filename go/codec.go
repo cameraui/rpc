@@ -11,14 +11,10 @@ import (
 )
 
 func init() {
-	// Register msgpackr-specific extension type for cross-language compatibility.
-	// msgpackr (Node.js) encodes JavaScript `undefined` as msgpack ext type 0.
-	// The msgpack timestamp extension (type -1 / 0xff) is handled natively
+	// msgpackr encodes JavaScript undefined as ext type 0
 	msgpack.RegisterExt(0, (*msgpackrUndefined)(nil))
 }
 
-// msgpackrUndefined represents JavaScript's `undefined` value.
-// msgpackr encodes `undefined` as msgpack ext type 0 with empty data.
 type msgpackrUndefined struct{}
 
 func (u msgpackrUndefined) MarshalMsgpack() ([]byte, error) {
@@ -29,8 +25,7 @@ func (u *msgpackrUndefined) UnmarshalMsgpack(b []byte) error {
 	return nil
 }
 
-// Encode serializes data to MessagePack binary format.
-// Compatible with msgpackr (useRecords=false, bundleStrings=false).
+// Encode serializes data to MessagePack, compatible with msgpackr (useRecords=false, bundleStrings=false).
 func Encode(v any) ([]byte, error) {
 	data, err := encodeToBytes(func(enc *msgpack.Encoder) error { return encodeFast(enc, v) })
 	if err != nil {
@@ -39,30 +34,13 @@ func Encode(v any) ([]byte, error) {
 	return data, nil
 }
 
-// encodeBufPool recycles encode buffers for the hot publish path so that
-// per-publish encoding (e.g. NVR frame rates) does not allocate a fresh
-// []byte per call.
-//
-// INVARIANT (pool safety): a buffer handed out by encodePooled may be
-// returned to the pool ONLY once no in-flight publish still references its
-// bytes. nats.go copies the payload synchronously into the connection's
-// flush buffer *inside* Publish/PublishRequest/PublishMsg (a bufio-style
-// write happens before the call returns — the headers variant included) and
-// never retains the caller's slice afterwards. Releasing after the last
-// publish call has returned is therefore safe. The chunking path keeps
-// sub-slices of the encoded buffer alive until its last PublishMsg — release
-// only after that.
-var encodeBufPool = sync.Pool{
+var encodeBufPool = sync.Pool{ // put a buffer back only after its last publish returned
 	New: func() any { return new(bytes.Buffer) },
 }
 
-// maxPooledEncodeBuf caps the capacity of buffers returned to the pool so a
-// single oversized payload does not pin memory for the process lifetime.
-const maxPooledEncodeBuf = 4 << 20 // 4MB
+// a bigger buffer is dropped so one oversized payload does not pin memory
+const maxPooledEncodeBuf = 4 << 20
 
-// encodePooled serializes data exactly like Encode but into a pooled buffer.
-// The returned release func must be called exactly once, and only when the
-// returned bytes are no longer referenced (see encodeBufPool invariant).
 func encodePooled(v any) (encoded []byte, release func(), err error) {
 	buf, err := encodeToPooledBuf(v)
 	if err != nil {
@@ -75,8 +53,6 @@ func encodeToPooledBuf(v any) (*bytes.Buffer, error) {
 	buf := encodeBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 
-	// Encoder.Reset resets all encoder state (flags, structTag, dict), so a
-	// pooled encoder behaves identically to msgpack.Marshal.
 	enc := msgpack.GetEncoder()
 	enc.Reset(buf)
 	err := encodeFast(enc, v)
@@ -112,34 +88,26 @@ func Decode(data []byte, v any) error {
 		return nil
 	}
 
-	// Check if the error is a type mismatch (wire type doesn't match Go struct field type).
-	// vmihailenco/msgpack produces "invalid code=XX decoding YYY" for these cases:
-	//   0xca/0xcb: float32/float64 where int expected (JS number encoding)
-	//   0xd4-0xd8: fixext where string/int expected (JS undefined)
-	//   0xc7-0xc9: ext where string/int expected
+	// JS numbers arrive as floats and undefined as an ext where the struct wants an int or a string
 	if !isTypeMismatch(err) {
 		return err
 	}
 
-	// Fallback: decode as generic any with loose interface typing, normalize values
-	// (float64→int64, undefined→nil), re-encode, and decode into the target struct.
 	dec := msgpack.NewDecoder(bytes.NewReader(data))
 	dec.UseLooseInterfaceDecoding(true)
 
 	var raw any
 	if rerr := dec.Decode(&raw); rerr != nil {
-		return err // return original error
+		return err
 	}
 
 	coerced := coerceValues(raw)
 	buf, rerr := encodeToPooledBuf(coerced)
 	if rerr != nil {
-		return err // return original error
+		return err
 	}
 
-	// the failed attempt above left whatever it managed to decode behind, and
-	// msgpack decodes into a non-nil `any` field through the value it already
-	// holds, which is unaddressable and panics
+	// the failed decode left values behind, msgpack panics decoding into a non-nil any field
 	resetValue(v)
 
 	err = msgpack.Unmarshal(buf.Bytes(), v)
@@ -160,12 +128,7 @@ func resetValue(v any) {
 
 func isTypeMismatch(err error) bool {
 	msg := err.Error()
-	// vmihailenco/msgpack uses these patterns for wire type mismatches:
-	//   "invalid code=XX decoding YYY"      — type decoders (string, int, float, bool, nil, array, ext)
-	//   "unexpected code=XX decoding YYY"    — struct/map decoder
-	//   "unsupported code=XX decoding YYY"   — query decoder
-	// Matching " code=" + " decoding " catches all variants without matching structural
-	// errors (EOF, corruption, truncation) which use different formats.
+	// the invalid, unexpected and unsupported "code=XX decoding YYY" errors, not EOF or corruption
 	return strings.Contains(msg, " code=") && strings.Contains(msg, " decoding ")
 }
 
@@ -203,11 +166,7 @@ func coerceValues(v any) any {
 	}
 }
 
-// NormalizeUndefined recursively replaces msgpackr's `undefined` ext values
-// (decoded as msgpackrUndefined structs) with Go nil, descending into maps and
-// slices. The struct otherwise leaks through generic (`any`) decode paths that
-// succeed without the coerceValues fallback, and serializes back out as `{}`
-// (an empty struct), corrupting string/number config values into "[object Object]".
+// NormalizeUndefined replaces msgpackr's undefined ext values with nil, descending into maps and slices.
 func NormalizeUndefined(v any) any {
 	switch val := v.(type) {
 	case *msgpackrUndefined:
@@ -229,8 +188,7 @@ func NormalizeUndefined(v any) any {
 	}
 }
 
-// DecodeRaw deserializes MessagePack binary data into a generic interface.
-// Uses loose interface decoding for consistent numeric types (int64, uint64, float64).
+// DecodeRaw decodes MessagePack into a generic value with loose interface decoding (int64, uint64, float64).
 func DecodeRaw(data []byte) (any, error) {
 	dec := msgpack.NewDecoder(bytes.NewReader(data))
 	dec.UseLooseInterfaceDecoding(true)
@@ -240,8 +198,7 @@ func DecodeRaw(data []byte) (any, error) {
 	return v, err
 }
 
-// DecodeToMap deserializes MessagePack binary data into a map.
-// Uses loose interface decoding for consistent numeric types.
+// DecodeToMap decodes MessagePack into a map with loose interface decoding.
 func DecodeToMap(data []byte) (map[string]any, error) {
 	dec := msgpack.NewDecoder(bytes.NewReader(data))
 	dec.UseLooseInterfaceDecoding(true)

@@ -20,12 +20,10 @@ vi.mock('../src/codec.js', async (importOriginal) => {
 
 const MAX_PAYLOAD = 4 * 1024 * 1024;
 
-// a real nats-core connection whose transport only records what would go to the socket
 function fakeConnection() {
   const sent: Uint8Array[] = [];
   const nc = new (NatsConnectionImpl as unknown as new (opts: object) => any)({ servers: '127.0.0.1:1' });
   nc.protocol = new ProtocolHandler(nc.options, nc);
-  // counts the copies nats-core makes when it packs several queued buffers into one
   let packCopies = 0;
   const outbound = nc.protocol.outbound;
   const pack = outbound.pack.bind(outbound);
@@ -57,7 +55,6 @@ function sameMemory(a: Uint8Array, b: Uint8Array): boolean {
   return a.buffer === b.buffer && a.byteOffset === b.byteOffset && a.byteLength === b.byteLength;
 }
 
-// the payload of the first PUB to `subject` in a byte stream
 function pubPayload(stream: Buffer, subject: string): Buffer {
   const text = stream.toString('latin1');
   const match = new RegExp(`PUB ${subject} (?:\\S+ )?(\\d+)\r\n`).exec(text);
@@ -66,7 +63,6 @@ function pubPayload(stream: Buffer, subject: string): Buffer {
   return stream.subarray(start, start + Number(match[1]));
 }
 
-// a NATS server that sends INFO, answers PING until stopPongs() and records everything it receives
 async function fakeNatsServer() {
   const received: Buffer[] = [];
   const sockets: Socket[] = [];
@@ -487,7 +483,6 @@ describe('oversized handler replies', () => {
     return ctx;
   }
 
-  // resolves once the header and every chunk it announces went out on subject
   async function chunkedTransfer(published: ReturnType<typeof createClient>['nc']['published'], subject: string) {
     await vi.waitFor(() => {
       const messages = published.filter((p) => p.subject === subject && p.opts?.headers);
@@ -555,8 +550,8 @@ describe('inline replies of one socket read', () => {
     };
     await rpc.registerHandler('ns', { echo: (v: unknown) => v });
     await settle();
-    // one socket read: nats-core dispatches its messages back to back
     function read(count: number) {
+      // one socket read, nats-core dispatches its messages back to back
       for (let i = 0; i < count; i++) {
         callbacks.get('rpc.ns.echo')!(null, { subject: 'rpc.ns.echo', data: encode({ id: `a.${i}`, method: 'call', params: [i] }) });
       }

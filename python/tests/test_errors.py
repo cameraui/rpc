@@ -1,5 +1,3 @@
-"""Tests for RPC exception types and helpers."""
-
 import pytest
 from nats import errors as nats_errors
 

@@ -102,7 +102,7 @@ async function main() {
     generatePrimes(limit: number): AsyncGenerator<number>;
   }>('compute', {
     isolatedConnection: true,
-    timeout: 60000, // 60 seconds for heavy computations
+    timeout: 60000, // heavy computations
   });
   console.log('Compute service proxy created (isolated connection)');
 

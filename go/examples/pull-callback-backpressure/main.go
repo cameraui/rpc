@@ -11,17 +11,10 @@ import (
 	rpc "github.com/cameraui/rpc/go"
 )
 
-// DataService verifies that the server generator suspends at yield when
-// the client slows down batch consumption.
 type DataService struct{}
 
-// PullPacedBatches produces batchCount batches of chunksPerBatch items each.
-// Each chunk carries a server-side timestamp so the client can measure the
-// inter-batch gap against its own delay and verify end-to-end backpressure.
 func (s *DataService) PullPacedBatches(batchCount, chunksPerBatch int, invoker *rpc.CallbackInvoker) (<-chan struct{}, error) {
-	// Unbuffered: ch <- struct{}{} blocks until the framework's Recv() fires
-	// on client next(). This is the "yield" — must be synchronous for
-	// backpressure.
+	// unbuffered: the send blocks until the client's next, which gives the backpressure
 	ch := make(chan struct{})
 	go func() {
 		defer close(ch)
@@ -34,7 +27,7 @@ func (s *DataService) PullPacedBatches(batchCount, chunksPerBatch int, invoker *
 				invoker.Invoke("onChunk", map[string]any{
 					"batch": b,
 					"index": i,
-					"ts":    float64(time.Since(batchStart).Microseconds()) / 1000.0, // ms relative
+					"ts":    float64(time.Since(batchStart).Microseconds()) / 1000.0, // ms since batch start
 					"wall":  time.Now().UnixMicro(),
 				})
 			}
@@ -115,9 +108,7 @@ func main() {
 			if batch < 0 || int(batch) >= BATCHES {
 				return
 			}
-			// Measure client-side arrival — NATS RTT (<1ms) is negligible
-			// compared to the 500ms client delay, and this avoids msgpack
-			// type-coercion surprises for server-sent timestamps.
+			// measured on arrival, the NATS round trip is negligible next to the 500ms client delay
 			now := time.Now().UnixMicro()
 			mu.Lock()
 			s := &stats[batch]
@@ -176,18 +167,12 @@ func main() {
 		fmt.Printf("  Gap between batch %d and %d: %.1fms\n", i-1, i, gapMs)
 	}
 
-	// Real backpressure proof: total elapsed time must be ~ BATCHES * CLIENT_DELAY.
-	// If the server rushed ahead, total would be much shorter.
+	// client-paced: the total must be about BATCHES * CLIENT_DELAY
 	totalMs := float64(elapsed.Microseconds()) / 1000.0
 	expectedTotalMs := float64(BATCHES) * float64(CLIENT_DELAY/time.Millisecond)
 	fmt.Printf("\nTotal elapsed: %.1fms (expected ~%.0fms)\n", totalMs, expectedTotalMs)
 
-	// Go's channel semantics mean the client goroutine always sends the next
-	// `next` request immediately after the consumer reads (they unblock
-	// simultaneously). So the server produces the next batch in parallel while
-	// the consumer sleeps — giving a 1-batch lookahead. The total elapsed
-	// time still reflects client-paced execution, which is the real proof
-	// that backpressure is working.
+	// the next request goes out as soon as the consumer reads, so the server runs one batch ahead
 	bpOk := math.Abs(totalMs-expectedTotalMs) < expectedTotalMs*0.2
 
 	fmt.Println()

@@ -92,7 +92,7 @@ async function main() {
       name: 'compute',
       version: '1.0.0',
       description: 'High-performance compute service',
-      queue: 'compute-workers', // Enable load balancing
+      queue: 'compute-workers',
       metadata: {
         host: 'server1',
         gpu: 'true',
@@ -120,7 +120,7 @@ async function main() {
       name: 'compute',
       version: '1.0.0',
       description: 'High-performance compute service',
-      queue: 'compute-workers', // Same queue for load balancing
+      queue: 'compute-workers', // same queue, the workers share the load
       metadata: {
         host: 'server2',
         gpu: 'false',

@@ -203,9 +203,6 @@ func main() {
 	}
 }
 
-// Tests rpc.Decode() into typed structs, including the float→int coercion
-// fallback that handles JavaScript's IEEE 754 number encoding.
-
 type CameraConfig struct {
 	CameraID     string  `msgpack:"cameraId"`
 	FPS          int     `msgpack:"fps"`
@@ -686,8 +683,6 @@ func testStructDecode() (passed, failed int) {
 	return
 }
 
-// buildMsgpackWithUndefined builds msgpack bytes for a map where the given undefinedKey
-// has a JS undefined value (fixext 1, type 0 — 0xd4 0x00 0x00).
 func buildMsgpackWithUndefined(fields map[string]any, undefinedKey string) []byte {
 	var buf bytes.Buffer
 	enc := msgpack.NewEncoder(&buf)
@@ -770,7 +765,7 @@ func compareValues(expected, actual any, testName string) bool {
 		return false
 	}
 
-	// Binary — DecodeRaw with UseLooseInterfaceDecoding decodes msgpack bin as string
+	// DecodeRaw with UseLooseInterfaceDecoding decodes msgpack bin as string
 	if eb, ok := expected.([]byte); ok {
 		if ab, ok := actual.([]byte); ok {
 			if len(eb) == 0 && len(ab) == 0 {

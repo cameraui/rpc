@@ -30,7 +30,6 @@ var (
 
 type assignField struct {
 	index []int
-	// the key of an inlined embedded struct, msgpack decodes it into all of the struct
 	whole bool
 }
 
@@ -44,9 +43,6 @@ type assignInfo struct {
 	fields map[string]assignField
 }
 
-// dst must be a settable zero value: on true it equals a strict msgpack decode of
-// Encode(coerceValues(src)), on false it may be partly written. src is read as
-// coerceValues would leave it, so the walk that rewrites it is not needed first.
 func assignGeneric(dst reflect.Value, src any) bool {
 	t := dst.Type()
 	info := assignInfoFor(t)
@@ -228,7 +224,6 @@ func assignSlice(dst reflect.Value, src any) bool {
 	return true
 }
 
-// msgpack fails on more elements than the array holds and leaves the rest zero on fewer
 func assignArray(dst reflect.Value, src any) bool {
 	if dst.Type().Elem().Kind() == reflect.Uint8 {
 		switch b := src.(type) {
@@ -299,8 +294,6 @@ func assignMap(dst reflect.Value, src any) bool {
 	return true
 }
 
-// msgpack returns the dynamic types it was given, so an `any` position keeps v and
-// only binaries get copied; Go int, ext types and undefined change on the way
 func ownGeneric(v any) (any, bool) {
 	switch x := v.(type) {
 	case nil, bool, string,
@@ -350,8 +343,6 @@ func assignInfoFor(t reflect.Type) *assignInfo {
 	return info
 }
 
-// mirrors msgpack's getFields, the list is what an outer struct inlines; as_array,
-// alias, intern and pointer, unexported or custom embeds make the struct not plain
 func buildAssignFields(t reflect.Type) (map[string]assignField, []assignNamed, bool) {
 	fields := make(map[string]assignField, t.NumField())
 	list := make([]assignNamed, 0, t.NumField())
@@ -457,7 +448,6 @@ func plainDecodeType(t reflect.Type) bool {
 	return false
 }
 
-// unsigned values above MaxInt64 wrap, as msgpack reads them
 func wireInt(v any) (int64, bool) {
 	switch n := v.(type) {
 	case int8:
@@ -477,6 +467,7 @@ func wireInt(v any) (int64, bool) {
 	case uint32:
 		return int64(n), true
 	case uint64:
+		// wraps above MaxInt64, as msgpack reads it
 		return int64(n), true
 	case uint:
 		return int64(n), true
@@ -484,7 +475,6 @@ func wireInt(v any) (int64, bool) {
 	return 0, false
 }
 
-// the int64 coerceValues makes of an integral float, other ints as they are
 func coercedInt(v any) (int64, bool) {
 	switch f := v.(type) {
 	case float64:
@@ -495,10 +485,10 @@ func coercedInt(v any) (int64, bool) {
 	return wireInt(v)
 }
 
-// an integral float went through int64 in coerceValues, which also drops a minus zero
 func coercedFloat64(v any) (float64, bool) {
 	switch f := v.(type) {
 	case float64:
+		// coerceValues sent an integral float through int64, which also drops a minus zero
 		if n, ok := integralFloat64(f); ok {
 			return float64(n), true
 		}

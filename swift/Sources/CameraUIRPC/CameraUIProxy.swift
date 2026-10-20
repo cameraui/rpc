@@ -1,8 +1,6 @@
 import Foundation
 
 extension RPCClientOptions {
-  /// Options for the bus of a camera.ui server. The 15 s ping interval
-  /// notices a link that died silently within 45 s.
   public static func cameraUI(
     serverURL: URL,
     token: String,
@@ -11,7 +9,7 @@ extension RPCClientOptions {
     skipHostnameVerification: Bool = false,
     skipCertificateVerification: Bool = false,
     additionalTrustRoots: [Data] = [],
-    pingInterval: TimeInterval = 15
+    pingInterval: TimeInterval = 15  // a silently dead link shows within 45 s
   ) -> RPCClientOptions {
     var components = URLComponents(url: serverURL, resolvingAgainstBaseURL: false)!
     let insecure = components.scheme == "http" || components.scheme == "ws"

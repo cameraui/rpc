@@ -97,7 +97,7 @@ async function main() {
     elapsed = performance.now() - start;
     console.log(`Streamed ${count} items in ${elapsed.toFixed(1)}ms`);
 
-    // Isolated handlers should also stop when the main server disconnects
+    // isolated handlers stop too when the main server disconnects
     console.log('\nTest 5: Main Server Disconnect');
     console.log('Disconnecting main server...');
     await server.disconnect();

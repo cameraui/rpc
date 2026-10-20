@@ -230,8 +230,6 @@ def test_a_service_call_whose_inbox_cannot_subscribe_leaves_nothing_behind() -> 
 
 
 class DiscoveryNC:
-    """Answers $SRV requests after a delay, with a no-responder status or garbage first when asked."""
-
     def __init__(self, replies: list[tuple[float, Any]]) -> None:
         self.replies = replies
         self.queue: asyncio.Queue[Any] = asyncio.Queue()

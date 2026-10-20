@@ -75,7 +75,7 @@ async function main() {
     }
   }
 
-  // Wait briefly for any straggler callback messages.
+  // let straggler callback messages land
   await new Promise((resolve) => setTimeout(resolve, 300));
 
   console.log('\nResults');

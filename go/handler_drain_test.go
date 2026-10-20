@@ -29,7 +29,6 @@ func drainPeers(t *testing.T, serverOpts *ClientOptions, handlers map[string]any
 	return s, server, cleanup, proxy
 }
 
-// n calls in arrival order, each result carries the time it took
 func callsInBackground(proxy *Proxy, method string, args []any, n int) []chan drainResult {
 	results := make([]chan drainResult, 0, n)
 	start := time.Now()
@@ -229,8 +228,7 @@ func TestDrainRemovesTheSubscriptionFirst(t *testing.T) {
 	go func() { _ = server.Disconnect() }()
 	time.Sleep(30 * time.Millisecond)
 
-	// with the subscription gone the caller sees no responders at once, a
-	// retry would find another instance
+	// with the subscription gone the caller sees no responders at once, a retry would find another instance
 	begin := time.Now()
 	_, err := proxy.Invoke(context.Background(), "other")
 	var rerr *RPCException

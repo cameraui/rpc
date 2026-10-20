@@ -13,9 +13,9 @@ vi.mock('@nats-io/transport-node', async (importOriginal) => ({ ...(await import
 
 type Ctx = ReturnType<typeof createClient>;
 
-// like nats.js: a subscription that is gone on the client drops what still arrives
 function deliver({ nc }: Ctx, method: string, id: string, params: unknown = []): boolean {
   const sub = nc.subs.findLast((s) => s.pattern === `rpc.ns.${method}`);
+  // like nats.js, a subscription gone on the client drops what still arrives
   if (!sub || sub.isClosed()) return false;
   sub.callback(null, { subject: `rpc.ns.${method}`, data: encode({ id, method: 'call', params }) });
   return true;

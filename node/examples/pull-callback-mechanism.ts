@@ -59,7 +59,7 @@ async function main() {
   const start = performance.now();
 
   for await (const _ of service.pullSteady(COUNT, cbs)) {
-    // No delay in consumer — tight loop.
+    // no delay, tight loop
   }
 
   const elapsed = performance.now() - start;
@@ -71,7 +71,6 @@ async function main() {
   console.log(`  Expected (serialized): ${COUNT * HANDLER_DELAY_MS}ms`);
   console.log(`  Expected (no BP):      ~${COUNT * 2}ms (network only)`);
 
-  // Check: no two handlers were running at the same time.
   let overlaps = 0;
   for (let i = 1; i < handlerStarts.length; i++) {
     if (handlerStarts[i] < handlerEnds[i - 1] - 5) overlaps++; // 5ms slack

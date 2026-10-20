@@ -7,11 +7,6 @@ import (
 	"sync"
 )
 
-// handleCallbackRequestGo handles a callback subscription request.
-// It creates a wrapper function matching the handler's func(T) parameter,
-// calls the handler with it, and manages the subscription lifecycle.
-// onFinished is invoked when the client cancels the subscription so the
-// caller can drop its cleanup-map entry for this session.
 func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []any, callbackSubject, requestID string, client *Client, orphan *orphanConfig, onFinished func()) (func(), error) {
 	if !isControlSubject(callbackSubject, callbackSubjectPrefix) {
 		return nil, NewRPCException(ErrCodeInvalidParams, "callback subject must start with "+callbackSubjectPrefix)
@@ -20,7 +15,6 @@ func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []an
 	fnType := fn.Type()
 	first := contextParams(fnType)
 
-	// Find the func(T) parameter position
 	callbackParamIdx := -1
 	for i := first; i < fnType.NumIn(); i++ {
 		if fnType.In(i).Kind() == reflect.Func {
@@ -32,7 +26,6 @@ func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []an
 		return nil, NewRPCException(ErrCodeInternalError, "handler has no func parameter for callback")
 	}
 
-	// Get the callback parameter type: func(T) or func(T) error
 	callbackType := fnType.In(callbackParamIdx)
 	hasErrorReturn := callbackType.NumOut() == 1 && callbackType.Out(0).Implements(reflect.TypeFor[error]())
 	if callbackType.NumIn() != 1 || (callbackType.NumOut() != 0 && !hasErrorReturn) {
@@ -45,7 +38,6 @@ func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []an
 		return client.publishInternal(callbackSubject, CallbackMessage{ID: requestID, Type: "ping"}, reply)
 	})
 
-	// Create wrapper function that publishes to callbackSubject
 	wrapperFunc := reflect.MakeFunc(callbackType, func(wrapperArgs []reflect.Value) []reflect.Value {
 		if !client.IsConnected() {
 			if hasErrorReturn {
@@ -77,7 +69,6 @@ func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []an
 		}
 	}()
 
-	// Build call arguments: [ctx], then the wrapper at the callback position
 	numIn := fnType.NumIn()
 	callArgs := make([]reflect.Value, numIn)
 	argIdx := 0
@@ -97,14 +88,12 @@ func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []an
 		}
 	}
 
-	// Call handler
 	results := fn.Call(callArgs)
 	handlerResult, handlerErr := processResults(results)
 	if handlerErr != nil {
 		return nil, handlerErr
 	}
 
-	// Extract cleanup function from result
 	var handlerCleanup func()
 	if handlerResult != nil {
 		if fn, ok := handlerResult.(func()); ok {
@@ -112,8 +101,7 @@ func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []an
 		}
 	}
 
-	// Handler cleanup must run exactly once — the cancel message and a later
-	// RegisterHandler/Disconnect cleanup would otherwise both invoke it.
+	// once only: the cancel message and a later RegisterHandler/Disconnect cleanup would both run it
 	var cleanupOnce sync.Once
 	runHandlerCleanup := func() {
 		cleanupOnce.Do(func() {
@@ -126,8 +114,7 @@ func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []an
 	}
 	started = true
 
-	// Subscribe to cancel subject for cleanup. cancelUnsub is assigned after
-	// Subscribe returns but read from the NATS callback goroutine — guard it.
+	// cancelUnsub is assigned after Subscribe returns but read on the NATS callback goroutine
 	var cancelUnsubMu sync.Mutex
 	var cancelUnsub func()
 	finish := func() {
@@ -152,7 +139,6 @@ func handleCallbackRequestGo(parent context.Context, fn reflect.Value, args []an
 	cancelUnsubMu.Unlock()
 	probe.start(finish)
 
-	// Return combined cleanup
 	cleanup := func() {
 		unsub()
 		runHandlerCleanup()

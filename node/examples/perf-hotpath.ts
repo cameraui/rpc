@@ -1,10 +1,5 @@
 import { createRPCClient, rpcCallbacks } from '../src/index.js';
 
-// Hot-path benchmark: measures the production-critical RPC paths
-// (NVR frame delivery, parallel/sequential calls, channel throughput).
-// Setup happens outside the measurements; each section runs one
-// unmeasured warmup round first.
-
 const ONEWAY_BATCHES = 5;
 const ONEWAY_FRAMES_PER_BATCH = 1000;
 const PARALLEL_CALLS = 500;
@@ -16,7 +11,6 @@ interface FrameService {
 }
 
 class FrameServiceImpl {
-  // Method name contains "pull" so it routes through pull-callback mode.
   async *pullFrames(batches: number, framesPerBatch: number, frameSize: number, callbacks: { onFrame: (frame: Uint8Array) => void }) {
     const frame = new Uint8Array(frameSize);
     for (let i = 0; i < frame.length; i++) {
@@ -80,7 +74,6 @@ async function runOneway(proxy: FrameService, frameSize: number, batches: number
 async function main(): Promise<void> {
   console.log('Perf Hotpath Benchmark (Node.js)\n');
 
-  // --- Setup (not measured) ---
   const server = createRPCClient({
     servers: ['nats://localhost:4222'],
     name: 'perf-hotpath-server',
@@ -101,25 +94,23 @@ async function main(): Promise<void> {
     echo: async (obj: Record<string, unknown>) => obj,
   };
   const unsubEcho = await server.registerHandler('hotpath-rpc', echoHandlers);
-  await sleep(50); // Let subscriptions settle
+  await sleep(50); // let the subscriptions settle
 
   const frameProxy = client.createProxy<FrameService>('hotpath-frames');
   const echoProxy = client.createProxy<typeof echoHandlers>('hotpath-rpc');
 
-  // --- 1. Oneway callback throughput (NVR frame path) ---
   console.log('1. Oneway Callback Throughput (pull-callback iterator)');
 
-  await runOneway(frameProxy, 1024, 1, 50); // warmup (not measured)
+  await runOneway(frameProxy, 1024, 1, 50); // warmup
   const oneway1k = await runOneway(frameProxy, 1024, ONEWAY_BATCHES, ONEWAY_FRAMES_PER_BATCH);
   const msgsPerSec = Math.round((ONEWAY_BATCHES * ONEWAY_FRAMES_PER_BATCH) / (oneway1k.elapsedMs / 1000));
   console.log(`Oneway 1KB: ${oneway1k.elapsedMs.toFixed(2)}ms (${msgsPerSec} msg/s)`);
 
-  await runOneway(frameProxy, 100 * 1024, 1, 50); // warmup (not measured)
+  await runOneway(frameProxy, 100 * 1024, 1, 50); // warmup
   const oneway100k = await runOneway(frameProxy, 100 * 1024, ONEWAY_BATCHES, ONEWAY_FRAMES_PER_BATCH);
   const mbPerSec = oneway100k.bytes / (1024 * 1024) / (oneway100k.elapsedMs / 1000);
   console.log(`Oneway 100KB: ${oneway100k.elapsedMs.toFixed(2)}ms (${mbPerSec.toFixed(1)} MB/s)`);
 
-  // --- 2. Parallel calls ---
   console.log('\n2. Parallel Calls');
 
   const echoCall = async (i: number) => {
@@ -129,18 +120,17 @@ async function main(): Promise<void> {
     }
   };
 
-  await Promise.all(Array.from({ length: 20 }, (_, i) => echoCall(i))); // warmup (not measured)
+  await Promise.all(Array.from({ length: 20 }, (_, i) => echoCall(i))); // warmup
 
   const parallelStart = performance.now();
   await Promise.all(Array.from({ length: PARALLEL_CALLS }, (_, i) => echoCall(i)));
   const parallelMs = performance.now() - parallelStart;
   console.log(`Parallel ${PARALLEL_CALLS} calls: ${parallelMs.toFixed(2)}ms`);
 
-  // --- 3. Sequential calls ---
   console.log('\n3. Sequential Calls');
 
   for (let i = 0; i < 10; i++) {
-    await echoCall(i); // warmup (not measured)
+    await echoCall(i); // warmup
   }
 
   const seqStart = performance.now();
@@ -151,7 +141,6 @@ async function main(): Promise<void> {
   const usPerCall = (seqMs * 1000) / SEQUENTIAL_CALLS;
   console.log(`Sequential ${SEQUENTIAL_CALLS} calls: ${seqMs.toFixed(2)}ms (${usPerCall.toFixed(1)} µs/call)`);
 
-  // --- 4. Channel throughput ---
   console.log('\n4. Channel Throughput');
 
   const serverChannel = await server.channel('hotpath-channel');
@@ -161,9 +150,9 @@ async function main(): Promise<void> {
   serverChannel.on('message', () => {
     channelReceived++;
   });
-  await sleep(50); // Let subscription settle
+  await sleep(50); // let the subscription settle
 
-  // Warmup (not measured)
+  // warmup
   for (let i = 0; i < 10; i++) {
     await clientChannel.send({ index: i, warmup: true });
   }
@@ -182,7 +171,6 @@ async function main(): Promise<void> {
   await serverChannel.close();
   await clientChannel.close();
 
-  // --- Cleanup ---
   await unsubFrames();
   await unsubEcho();
   await client.disconnect();

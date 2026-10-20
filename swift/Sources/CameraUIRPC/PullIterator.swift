@@ -36,7 +36,6 @@ public final class PullIterator: AsyncSequence, Sendable {
 }
 
 actor PullIteratorSession {
-  // a response with the count of callback messages that had arrived by then
   private struct Boundary {
     let response: [String: Any?]
     let callbacks: UInt64
@@ -134,8 +133,7 @@ actor PullIteratorSession {
 
     switch response["type"] as? String {
     case "value":
-      // opt-in n+1 prefetch: request the next batch before draining this
-      // one, so the server produces while the client processes
+      // opt-in prefetch: the server produces the next batch while this one drains
       if prefetch && !ended && !cleanedUp {
         do {
           try await sendNextRequest()
@@ -219,8 +217,6 @@ actor PullIteratorSession {
     return await withCheckedContinuation { waiter = $0 }
   }
 
-  // handlers run as the frames arrive; a boundary waits only for the callbacks
-  // that came before it, so a slow handler still holds the next request
   private func startCallbackPump() {
     guard let callbackSub else { return }
     let callbacks = self.callbacks
@@ -254,7 +250,6 @@ actor PullIteratorSession {
     releaseCallbackWaiters()
   }
 
-  // a closed subscription drops what it still buffered
   private func endPump() {
     pumpEnded = true
     releaseCallbackWaiters()

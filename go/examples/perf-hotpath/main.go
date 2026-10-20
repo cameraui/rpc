@@ -1,10 +1,5 @@
 package main
 
-// Hot-path benchmark: measures the production-critical RPC paths
-// (NVR frame delivery, parallel/sequential calls, channel throughput).
-// Setup happens outside the measurements; each section runs one
-// unmeasured warmup round first.
-
 import (
 	"context"
 	"fmt"
@@ -26,9 +21,8 @@ const (
 
 type FrameService struct{}
 
-// PullFrames routes through pull-callback mode (method name contains "pull").
 func (s *FrameService) PullFrames(batches, framesPerBatch, frameSize int, invoker *rpc.CallbackInvoker) (<-chan struct{}, error) {
-	// Unbuffered: the `ch <- struct{}{}` is the yield statement.
+	// unbuffered: the send is the yield
 	ch := make(chan struct{})
 	go func() {
 		defer close(ch)
@@ -64,7 +58,6 @@ func waitFor(cond func() bool, timeout time.Duration) error {
 	return nil
 }
 
-// runOneway runs one pull-callback iteration; returns (elapsedMs, bytesReceived).
 func runOneway(ctx context.Context, proxy *rpc.Proxy, frameSize, batches, framesPerBatch int) (float64, int64, error) {
 	expected := int64(batches * framesPerBatch)
 	var frames atomic.Int64
@@ -110,7 +103,6 @@ func run() error {
 
 	ctx := context.Background()
 
-	// --- Setup (not measured) ---
 	server := rpc.NewClient(rpc.ClientOptions{
 		Servers: []string{"nats://localhost:4222"},
 		Name:    "perf-hotpath-server",
@@ -143,12 +135,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("register echo handler: %w", err)
 	}
-	time.Sleep(50 * time.Millisecond) // Let subscriptions settle
+	time.Sleep(50 * time.Millisecond) // let subscriptions settle
 
 	frameProxy := client.CreateProxy("hotpath-frames")
 	echoProxy := client.CreateProxy("hotpath-rpc")
 
-	// --- 1. Oneway callback throughput (NVR frame path) ---
 	fmt.Println("1. Oneway Callback Throughput (pull-callback iterator)")
 
 	if _, _, err := runOneway(ctx, frameProxy, 1024, 1, 50); err != nil { // warmup (not measured)
@@ -171,7 +162,6 @@ func run() error {
 	mbPerSec := float64(oneway100kBytes) / (1024 * 1024) / (oneway100kMs / 1000)
 	fmt.Printf("Oneway 100KB: %.2fms (%.1f MB/s)\n", oneway100kMs, mbPerSec)
 
-	// --- 2. Parallel calls ---
 	fmt.Println("\n2. Parallel Calls")
 
 	echoCall := func(i int) error {
@@ -217,7 +207,6 @@ func run() error {
 	parallelMs := float64(time.Since(parallelStart).Microseconds()) / 1000
 	fmt.Printf("Parallel %d calls: %.2fms\n", parallelCalls, parallelMs)
 
-	// --- 3. Sequential calls ---
 	fmt.Println("\n3. Sequential Calls")
 
 	for i := range 10 { // warmup (not measured)
@@ -236,7 +225,6 @@ func run() error {
 	usPerCall := seqMs * 1000 / float64(sequentialCalls)
 	fmt.Printf("Sequential %d calls: %.2fms (%.1f µs/call)\n", sequentialCalls, seqMs, usPerCall)
 
-	// --- 4. Channel throughput ---
 	fmt.Println("\n4. Channel Throughput")
 
 	serverChannel, err := server.Channel("hotpath-channel")
@@ -252,9 +240,9 @@ func run() error {
 	serverChannel.OnMessage(func(data any) {
 		channelReceived.Add(1)
 	})
-	time.Sleep(50 * time.Millisecond) // Let subscription settle
+	time.Sleep(50 * time.Millisecond) // let the subscription settle
 
-	// Warmup (not measured)
+	// warmup (not measured)
 	for i := range 10 {
 		if err := clientChannel.Send(map[string]any{"index": i, "warmup": true}); err != nil {
 			return fmt.Errorf("channel warmup send %d: %w", i, err)
@@ -281,7 +269,6 @@ func run() error {
 	_ = serverChannel.Close()
 	_ = clientChannel.Close()
 
-	// --- Cleanup ---
 	_ = unsubFrames()
 	_ = unsubEcho()
 	_ = client.Disconnect()
@@ -298,7 +285,6 @@ func main() {
 	}
 }
 
-// toInt coerces msgpack-decoded numeric values to int64.
 func toInt(v any) (int64, bool) {
 	switch n := v.(type) {
 	case int:

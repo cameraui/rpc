@@ -8,7 +8,6 @@ import uvloop
 
 from camera_ui_rpc import RPCClass, RPCNested, ServiceConfig, create_rpc_client
 
-# Pre-allocate buffer for consistent performance testing
 buffer_2mb = bytearray(2 * 1024 * 1024)
 for i in range(len(buffer_2mb)):
     buffer_2mb[i] = i % 256
@@ -70,8 +69,8 @@ class InfoNamespace:
             "healthy": True,
             "uptime": time.perf_counter() - startup_time,
             "memory": {
-                "rss": os.getpid(),  # Simplified, would need psutil for real memory usage
-                "heapUsed": 0,  # Python doesn't have direct heap stats like Node.js
+                "rss": os.getpid(),  # simplified, psutil would give the real memory usage
+                "heapUsed": 0,  # Python has no heap stats like Node.js
             },
         }
 
@@ -225,7 +224,7 @@ async def main():
         {
             "healthy": status["healthy"],
             "uptime": f"{status['uptime']:.2f}s",
-            "memory": f"{status['memory']['rss']}",  # Simplified
+            "memory": f"{status['memory']['rss']}",
         },
     )
 

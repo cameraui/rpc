@@ -8,8 +8,6 @@ struct ChunkError: Error, CustomStringConvertible {
   var description: String { reason }
 }
 
-// one per client, so a receiver per subscription does not multiply what a
-// sender can make it allocate
 final class TransferBudget: @unchecked Sendable {
   let limit: Int
 
@@ -27,7 +25,6 @@ final class TransferBudget: @unchecked Sendable {
     return epoch
   }
 
-  // the epoch the bytes count in, nil when they do not fit
   func reserve(_ bytes: Int) -> Int? {
     lock.lock()
     defer { lock.unlock() }
@@ -43,8 +40,6 @@ final class TransferBudget: @unchecked Sendable {
     used = max(0, used - bytes)
   }
 
-  // a lost link breaks every transfer in flight: their bytes stop counting at
-  // once, each receiver drops them with its next message or sweep
   func reset() {
     lock.lock()
     defer { lock.unlock() }
@@ -82,7 +77,6 @@ final class ChunkAssembler {
     return nil
   }
 
-  // the caller checks problem() first, a repeated index is ignored
   func add(index: Int, data: Data) -> Data? {
     guard !received.contains(index) else { return nil }
     if buffer == nil {
@@ -95,10 +89,6 @@ final class ChunkAssembler {
   }
 }
 
-// a message above the NATS max payload arrives as a msgpack header
-// {type:'chunked',transferId,totalChunks,totalSize,chunkSize} followed by raw
-// chunks, correlated via the x-chunked-transfer / x-chunk-id / x-chunk-index
-// headers
 final class ChunkReceiver: @unchecked Sendable {
   static let defaultMaxTransferSize = 1 << 30
   static let maxChunkSize = 64 << 20
@@ -136,7 +126,6 @@ final class ChunkReceiver: @unchecked Sendable {
     return transfers.count
   }
 
-  // nil while a transfer is incomplete and for refused parts
   func receive(_ message: NatsMessage) -> Data? {
     guard let payload = message.payload else { return nil }
     switch Self.header(message, Self.transferHeader) {
@@ -189,7 +178,6 @@ final class ChunkReceiver: @unchecked Sendable {
     armSweepLocked()
   }
 
-  // a chunk that does not fit throws and drops its transfer
   func add(key: String, index rawIndex: String?, data: Data) throws -> Data? {
     let epoch = budget.currentEpoch
     lock.lock()
@@ -234,9 +222,8 @@ final class ChunkReceiver: @unchecked Sendable {
     }
   }
 
-  // senders write the index with toString, str or strconv.Itoa: a sign, a
-  // blank or more than 15 digits is never a real index
   static func parseIndex(_ raw: String?) -> Int? {
+    // senders write plain digits, so a sign, a blank or more than 15 digits is never a real index
     guard let raw, !raw.isEmpty, raw.utf8.count <= 15, raw.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else {
       return nil
     }

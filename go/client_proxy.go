@@ -8,8 +8,7 @@ import (
 	"time"
 )
 
-// the first retry delays are shorter than a remote namespace takes to answer
-// __methods, the probe gets at least this long
+// the first retry delays are shorter than a namespace takes to answer __methods
 const methodProbeWindow = 500 * time.Millisecond
 
 type methodProbe struct {
@@ -17,8 +16,7 @@ type methodProbe struct {
 	method string
 }
 
-// Proxy provides a convenient way to make RPC calls to a specific namespace.
-// Since Go doesn't have JS-style dynamic proxies, this uses explicit method calls.
+// Proxy makes RPC calls to a specific namespace.
 type Proxy struct {
 	client    *Client
 	namespace string
@@ -34,8 +32,7 @@ func (c *Client) CreateProxy(namespace string) *Proxy {
 	}
 }
 
-// CreateIsolatedProxy creates a proxy with its own isolated NATS connection.
-// Returns the proxy and a close function.
+// CreateIsolatedProxy creates a proxy with its own NATS connection and returns it with a close function.
 func (c *Client) CreateIsolatedProxy(namespace string) (*Proxy, func() error, error) {
 	isolated := c.createIsolatedClient("proxy-" + namespace)
 	if err := isolated.Connect(context.Background()); err != nil {
@@ -58,9 +55,7 @@ func (c *Client) CreateIsolatedProxy(namespace string) (*Proxy, func() error, er
 	return proxy, closeFunc, nil
 }
 
-// Sub creates a nested sub-proxy for the given name.
-// Example: proxy.Sub("db").Invoke(ctx, "find", "key")
-// This calls rpc.{namespace}.db.find
+// Sub returns a nested sub-proxy, proxy.Sub("db").Invoke(ctx, "find") calls rpc.<namespace>.db.find.
 func (p *Proxy) Sub(name string) *Proxy {
 	return &Proxy{
 		client:    p.client,
@@ -70,25 +65,20 @@ func (p *Proxy) Sub(name string) *Proxy {
 	}
 }
 
-// WithOptions returns a copy of the proxy whose calls use opts for the
-// per-call timeout and no-responder retry, as CallWithOptions does. Sub proxies
-// of the copy inherit the options. Streams use only the retry part.
+// WithOptions returns a copy of the proxy whose calls use opts for the timeout and the no-responder retry.
 func (p *Proxy) WithOptions(opts RequestOptions) *Proxy {
 	cp := *p
 	cp.opts = &opts
 	return &cp
 }
 
-// Invoke makes a normal RPC call through the proxy. When nobody serves the
-// method but the namespace is up, the call fails at once with the no-responder
-// error instead of retrying.
+// Invoke makes a normal RPC call through the proxy and fails at once when the namespace is up but lacks the method.
 func (p *Proxy) Invoke(ctx context.Context, method string, args ...any) (any, error) {
 	subject := p.buildSubject(method)
 	return p.client.callWithOptions(ctx, subject, p.opts, methodProbe{p, method}, args...)
 }
 
-// InvokeStream makes a push-based streaming RPC call through the proxy. A
-// method the namespace does not serve fails at once, as in Invoke.
+// InvokeStream makes a push-based streaming RPC call through the proxy.
 func (p *Proxy) InvokeStream(ctx context.Context, method string, args ...any) (<-chan StreamValue, error) {
 	subject := p.buildSubject(method)
 	return p.client.callStreamWithOptions(ctx, subject, p.opts, methodProbe{p, method}, args...)
@@ -100,16 +90,13 @@ func (p *Proxy) InvokePullIterator(ctx context.Context, method string, args ...a
 	return p.client.callPullIterator(ctx, subject, p.opts, args...)
 }
 
-// InvokeCallback makes a callback subscription RPC call through the proxy.
-// The callback is invoked for each value pushed by the handler.
-// Returns an unsubscribe function.
+// InvokeCallback makes a callback subscription RPC call through the proxy and returns its unsubscribe function.
 func (p *Proxy) InvokeCallback(method string, args []any, callback func(any)) (func(), error) {
 	subject := p.buildSubject(method)
 	return callWithCallback(p.client, subject, p.opts, args, callback)
 }
 
-// InvokePullIteratorWithCallback makes a pull-iterator-with-callbacks call.
-// See Client.CallPullIteratorWithCallback for semantics.
+// InvokePullIteratorWithCallback makes a pull-iterator-with-callbacks call through the proxy.
 func (p *Proxy) InvokePullIteratorWithCallback(
 	ctx context.Context,
 	method string,
@@ -137,8 +124,6 @@ func (p *Proxy) String() string {
 	return fmt.Sprintf("[RPCProxy %s]", p.namespace)
 }
 
-// gone closes once the namespace answers without the method, every later retry
-// wait sees it; an old responder, a dead namespace or no answer leave it open
 func (m methodProbe) start(ctx context.Context, delay time.Duration) (gone <-chan struct{}, stop context.CancelFunc) {
 	probeCtx, cancel := context.WithTimeout(ctx, max(delay, methodProbeWindow))
 	missing := make(chan struct{})
@@ -239,10 +224,7 @@ func (sp *ServiceProxy) Close() error {
 	return nil
 }
 
-// Invoke calls a method on the service. A request too large for one message
-// goes to the instance the proxy found, when that instance takes chunked
-// requests on its own subject; with several instances behind one queue its
-// chunks would otherwise be spread over them.
+// Invoke calls a method on the service; a chunked request goes to the found instance so a queue does not spread its chunks.
 func (sp *ServiceProxy) Invoke(ctx context.Context, method string, args ...any) (any, error) {
 	subject := sp.findEndpointSubject(method)
 	if subject == "" {
@@ -276,9 +258,7 @@ func (sp *ServiceProxy) InvokePullIterator(ctx context.Context, method string, a
 	return sp.client.CallPullIterator(ctx, subject, args...)
 }
 
-// InvokeCallback makes a callback subscription call on the service.
-// The callback is invoked for each value pushed by the handler.
-// Returns an unsubscribe function.
+// InvokeCallback makes a callback subscription call on the service and returns its unsubscribe function.
 func (sp *ServiceProxy) InvokeCallback(method string, args []any, callback func(any)) (func(), error) {
 	subject := sp.findEndpointSubject(method)
 	if subject == "" {
@@ -287,8 +267,7 @@ func (sp *ServiceProxy) InvokeCallback(method string, args []any, callback func(
 	return CallWithCallback(sp.client, subject, args, callback)
 }
 
-// InvokePullIteratorWithCallback makes a pull-iterator-with-callbacks call on
-// the service. See Client.CallPullIteratorWithCallback for semantics.
+// InvokePullIteratorWithCallback makes a pull-iterator-with-callbacks call on the service.
 func (sp *ServiceProxy) InvokePullIteratorWithCallback(
 	ctx context.Context,
 	method string,
@@ -319,10 +298,9 @@ func (sp *ServiceProxy) fullPath(method string) string {
 	return method
 }
 
-// the subject of this service alone first, the bare one of an older responder
-// may also reach another service with a method of the same name
 func (sp *ServiceProxy) findEndpointSubject(method string) string {
 	fullPath := sp.fullPath(method)
+	// own subject first, the bare one of an older responder may reach another service with the same method
 	own := svcSubjectPrefix + sp.info.Name + "." + fullPath
 	for _, ep := range sp.info.Endpoints {
 		if ep.Subject == own {

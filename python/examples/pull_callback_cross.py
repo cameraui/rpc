@@ -32,7 +32,7 @@ async def run_server(name: str) -> None:
         }
     )
     await client.connect()
-    # Register under camelCase subject so Node/Go clients can reach it.
+    # camelCase subject so Node and Go clients can reach it
     handlers = {"pullBatches": pull_batches}
     unsub = await client.register_handler(f"pullcb-{name}", handlers, without_decorators=True)
     print(f"[py-server {name}] registered under namespace pullcb-{name}, ready.")
@@ -80,8 +80,7 @@ async def test_target(client_name: str, target: str) -> bool:
         CHUNKS = 5
 
         batches_consumed = 0
-        # camelCase method name — matches Node/Go conventions and the
-        # camelCase key in the server's handler dict.
+        # camelCase, the key in the server's handler dict
         async for _ in proxy.pullBatches(BATCHES, CHUNKS, cbs):
             batches_consumed += 1
 

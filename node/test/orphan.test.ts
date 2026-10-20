@@ -11,7 +11,6 @@ const PROBE = { intervalMs: 20, graceMs: 60 };
 const REQUEST = '_rpc.iterator.p1.request';
 const RESPONSE = '_rpc.iterator.p1.response';
 
-// a producer client whose server answers a publish with reply on `gone` subjects with a no-responder status
 function producer() {
   const { client, nc } = createClient();
   const gone = new Set<string>();
@@ -43,7 +42,17 @@ describe('orphan probe of callback sessions', () => {
     const subject = 'rpc.cb.c1';
     gone.add(subject);
 
-    await handleCallbackRequest(() => () => void cleanups++, [], subject, 'c1', client, undefined, PROBE);
+    await handleCallbackRequest(
+      () => () => {
+        cleanups++;
+      },
+      [],
+      subject,
+      'c1',
+      client,
+      undefined,
+      PROBE,
+    );
     expect(nc.subs.some((sub) => sub.pattern === `${subject}.cancel` && !sub.closed)).toBe(true);
 
     await vi.waitFor(() => expect(cleanups).toBe(1), { timeout: 1000 });
@@ -89,7 +98,17 @@ describe('orphan probe of callback sessions', () => {
     const subject = 'rpc.cb.c3';
     gone.add(subject);
 
-    const cleanup = await handleCallbackRequest(() => () => void cleanups++, [], subject, 'c3', client, undefined, { intervalMs: 20, graceMs: 200 });
+    const cleanup = await handleCallbackRequest(
+      () => () => {
+        cleanups++;
+      },
+      [],
+      subject,
+      'c3',
+      client,
+      undefined,
+      { intervalMs: 20, graceMs: 200 },
+    );
     await sleep(70);
     gone.delete(subject);
     await sleep(250);
@@ -194,7 +213,15 @@ describe('orphan probe option', () => {
     gone.add('rpc.cb.c4');
     let cleanups = 0;
 
-    const cleanup = await client.registerHandler('ns', { watch: () => () => void cleanups++ }, { orphanProbe: false });
+    const cleanup = await client.registerHandler(
+      'ns',
+      {
+        watch: () => () => {
+          cleanups++;
+        },
+      },
+      { orphanProbe: false },
+    );
     nc.subs
       .find((sub) => sub.pattern === 'rpc.ns.watch')!
       .callback(null, { subject: 'rpc.ns.watch', data: encode({ id: 'w.1', method: 'call', params: [{ __callback: true, __callbackSubject: 'rpc.cb.c4', args: [] }] }) });
@@ -211,7 +238,11 @@ describe('orphan probe option', () => {
     gone.add('rpc.cb.c5');
     let cleanups = 0;
 
-    await client.registerHandler('ns', { watch: () => () => void cleanups++ });
+    await client.registerHandler('ns', {
+      watch: () => () => {
+        cleanups++;
+      },
+    });
     nc.subs
       .find((sub) => sub.pattern === 'rpc.ns.watch')!
       .callback(null, { subject: 'rpc.ns.watch', data: encode({ id: 'w.2', method: 'call', params: [{ __callback: true, __callbackSubject: 'rpc.cb.c5', args: [] }] }) });

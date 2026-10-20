@@ -14,7 +14,6 @@ class EventService:
         self._subscribers: list[Any] = []
 
     async def on_events(self, prefix: str, callback: Any) -> Any:
-        """Subscribe to events. Handler receives a callback to push values."""
         self._subscribers.append(callback)
         print(f"New subscriber for prefix '{prefix}'")
 
