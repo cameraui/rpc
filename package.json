@@ -55,6 +55,6 @@
     "tsx": "^4.23.15",
     "typescript": "5.9.3",
     "typescript-eslint": "^8.72.0",
-    "updates": "^19.2.1"
+    "updates": "^19.3.0"
   }
 }
