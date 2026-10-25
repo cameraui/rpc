@@ -3,7 +3,7 @@ module github.com/cameraui/rpc/go
 go 1.27.0
 
 require (
-	github.com/nats-io/nats.go v1.54.0
+	github.com/nats-io/nats.go v1.55.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/vmihailenco/tagparser/v2 v2.0.0
 )

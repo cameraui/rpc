@@ -6,7 +6,7 @@ replace github.com/cameraui/rpc/go => ../go
 
 require (
 	github.com/cameraui/rpc/go v0.0.0-00010101000000-000000000000
-	github.com/nats-io/nats.go v1.54.0
+	github.com/nats-io/nats.go v1.55.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 
