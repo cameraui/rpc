@@ -31,7 +31,7 @@
     "bench": "tsx tests/harness/bench.ts",
     "test": "npm run test:unit && npm run test:integration",
     "release": "bash scripts/release.sh",
-    "update": "updates -M npm,pypi,go,cargo,docker,make --update ./ && updates --file go,node,python,tests --update ./"
+    "update": "updates -M npm,pypi,go,cargo,docker --update ./ && updates --file go,node,python,tests --update ./"
   },
   "homepage": "https://github.com/cameraui/rpc#readme",
   "bugs": {
