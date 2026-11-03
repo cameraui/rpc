@@ -30,4 +30,4 @@ A message without large binaries is plain msgpack. A message that holds a binary
 
 ---
 
-_Part of the camera.ui ecosystem - A comprehensive camera management solution._
+_Part of camera.ui, the local-first camera and NVR platform._
