@@ -36,10 +36,10 @@ jobs:
             exit 1
           fi
 
-      - name: Build sdist
+      - name: Build sdist and wheel
         run: |
           pip install build
-          cd python && python -m build --sdist
+          cd python && python -m build
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@v1.14.3
