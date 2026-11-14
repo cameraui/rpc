@@ -280,14 +280,16 @@ class StreamMessage(TypedDict):
 
 class PullIteratorRequest(TypedDict):
     id: str
-    type: Literal["next", "cancel"]
+    type: Literal["next", "cancel", "probe"]
+    step: NotRequired[int]
 
 
 class PullIteratorResponse(TypedDict):
     id: str
-    type: Literal["value", "done", "error"]
+    type: Literal["value", "done", "error", "idle"]
     value: NotRequired[Any | None]
     error: NotRequired[RPCError | None]
+    step: NotRequired[int]
 
 
 class ErrorCode(StrEnum):

@@ -267,6 +267,71 @@ func TestOrphanPullIteratorSessionEnds(t *testing.T) {
 	waitEnded(t, ended, "pull iterator session")
 }
 
+func TestPullSessionWhoseCancelGotLostEndsWithItsPing(t *testing.T) {
+	s := startFakeNATS(t)
+	// with a grace no test waits for, only the consumer's answer ends the session
+	server := orphanServer(t, s, 10*time.Millisecond, time.Hour)
+	ended := make(chan struct{})
+	if _, err := server.RegisterHandler("pull", map[string]any{
+		"items": func(ctx context.Context) <-chan int {
+			go func() {
+				<-ctx.Done()
+				close(ended)
+			}()
+			return make(chan int)
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// the handler holds a session its consumer does not know, like after a cancel that never arrived
+	consumer := connectFake(t, s, nil)
+	consumer.ensureMuxSubscription(true)
+	iteratorID := consumer.generateID()
+	if _, err := consumer.Call(context.Background(), "rpc.pull.items", PullIteratorParams{PullIterator: true, IteratorID: iteratorID}); err != nil {
+		t.Fatal(err)
+	}
+	waitEnded(t, ended, "pull session without a consumer")
+}
+
+func TestPullSessionOfAnIdleConsumerOutlivesItsPings(t *testing.T) {
+	s := startFakeNATS(t)
+	server := orphanServer(t, s, 10*time.Millisecond, time.Hour)
+	ended := make(chan struct{})
+	if _, err := server.RegisterHandler("pull", map[string]any{
+		"items": func(ctx context.Context) <-chan int {
+			ch := make(chan int)
+			go func() {
+				defer close(ended)
+				for i := 0; ; i++ {
+					select {
+					case ch <- i:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+			return ch
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	consumer := connectFake(t, s, nil)
+	session, leave := context.WithCancel(context.Background())
+	values, err := consumer.CallPullIterator(session, "rpc.pull.items")
+	if err != nil {
+		t.Fatal(err)
+	}
+	staysOpen(t, ended, 150*time.Millisecond, "pull session of an idle consumer")
+	if v := <-values; v.Error != nil || fmt.Sprint(v.Value) != "0" {
+		t.Fatalf("value after the idle pings = %+v", v)
+	}
+
+	leave()
+	waitEnded(t, ended, "pull session after its consumer left")
+}
+
 func TestOrphanPushStreamEnds(t *testing.T) {
 	s := startFakeNATS(t)
 	server := orphanServer(t, s, 10*time.Millisecond, 60*time.Millisecond)

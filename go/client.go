@@ -17,7 +17,10 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-const registerFlushTimeout = 2 * time.Second
+const (
+	registerFlushTimeout     = 2 * time.Second
+	defaultPullProbeInterval = 30 * time.Second
+)
 
 var (
 	defaultRetryDelays = []time.Duration{
@@ -86,6 +89,10 @@ type Client struct {
 	streamHandlers  sync.Map // map[string]*streamHandler
 
 	pullIteratorSettles sync.Map // map[string]func()
+	// the pull sessions this client consumes, a handler's ping for any other id is answered with a cancel
+	pullSessions sync.Map // map[string]struct{}
+	// how long a pull step stays unanswered before this client asks its handler about it
+	pullProbeInterval time.Duration
 
 	isolatedClients   []*Client
 	isolatedClientsMu sync.Mutex
@@ -149,6 +156,8 @@ func NewClient(opts ClientOptions) *Client { //nolint:gocritic // opts is copied
 		chunkBudget:     budget,
 		subEntries:      make(map[int]*subscriptionEntry),
 		replyPrefix:     replyPrefix,
+
+		pullProbeInterval: defaultPullProbeInterval,
 	}
 }
 
@@ -745,8 +754,27 @@ func (c *Client) handleMuxMessage(msg *nats.Msg) {
 			hdr.TotalSize, hdr.ChunkSize,
 		)
 	default:
-		c.settleReply(strings.TrimPrefix(msg.Subject, "rpc.reply."), msg.Data)
+		id := strings.TrimPrefix(msg.Subject, "rpc.reply.")
+		if !c.settleReply(id, msg.Data) {
+			c.endUnknownPullSession(id, msg.Data)
+		}
 	}
+}
+
+func (c *Client) endUnknownPullSession(id string, data []byte) {
+	// a ping is a few bytes, a late reply of any size is not decoded for this
+	if len(data) > 64 {
+		return
+	}
+	if _, known := c.pullSessions.Load(id); known {
+		return
+	}
+	var ping orphanPing
+	if err := DecodeMessageInto(data, &ping); err != nil || ping.Type != "ping" {
+		return
+	}
+	// the handler still holds a session that ended here, its cancel got lost on the way
+	_ = c.Publish("_rpc.iterator."+id+".request", PullIteratorRequest{ID: id, Type: "cancel"})
 }
 
 func (c *Client) failChunkedReply(callID string, err error) {
@@ -766,10 +794,10 @@ func (c *Client) failChunkedReply(callID string, err error) {
 	close(pr.done)
 }
 
-func (c *Client) settleReply(callID string, data []byte) {
+func (c *Client) settleReply(callID string, data []byte) bool {
 	v, ok := c.pendingRequests.LoadAndDelete(callID)
 	if !ok {
-		return
+		return false
 	}
 	pr := v.(*pendingRequest)
 	if key := pr.transferKey.Load(); key != nil {
@@ -777,6 +805,7 @@ func (c *Client) settleReply(callID string, data []byte) {
 	}
 	pr.raw = data
 	close(pr.done)
+	return true
 }
 
 // Request sends a native NATS request/reply, with automatic retry on no-responder errors.

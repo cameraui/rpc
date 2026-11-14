@@ -16,6 +16,7 @@ public struct RPCClientOptions: Sendable {
   public var pingInterval: TimeInterval?  // seconds, nil keeps the nats.swift default of 60 s
   public var connectTimeout: TimeInterval?  // seconds incl. TLS and upgrade, nil keeps the nats.swift default of 10 s
   public var maxTransferSize: Int  // bytes, also the cap of all transfers in progress together
+  var pullProbeInterval: TimeInterval = 30  // seconds a pull step stays unanswered before its handler is asked about it
 
   public init(
     url: URL,
@@ -113,6 +114,7 @@ public actor RPCClient {
   private var streamRefusals: [String: StreamRefusal] = [:]
   private var iteratorSettles: [String: @Sendable () -> Void] = [:]
   private var openSessions: [String: SessionCancel] = [:]
+  private var openingPullSessions: Set<String> = []
   private var owedCancels: [String: SessionCancel] = [:]
   private var eventContinuations: [UUID: AsyncStream<RPCConnectionEvent>.Continuation] = [:]
   private var counter: UInt64 = 0
@@ -595,6 +597,8 @@ public actor RPCClient {
     }
 
     let cancel = SessionCancel(subject: requestSubject, frame: ["id": iteratorId, "type": "cancel"])
+    openingPullSessions.insert(iteratorId)
+    defer { openingPullSessions.remove(iteratorId) }
     let initResult: Any?
     do {
       initResult = try await callSubject(subject, args: [params])
@@ -628,6 +632,7 @@ public actor RPCClient {
       iteratorId: iteratorId,
       requestSubject: requestSubject,
       statusInbox: statusInbox,
+      probeInterval: options.pullProbeInterval,
       callbacks: callbacks,
       prefetch: prefetch,
       callbackSub: callbackSub,
@@ -870,7 +875,11 @@ public actor RPCClient {
 
     let chunkType = ChunkReceiver.header(message, ChunkReceiver.transferHeader)
     guard chunkType == "header" || chunkType == "chunk" else {
-      route(payloadData: payload)
+      if pending[id] == nil, isPing(payload) {
+        endUnknownPullSession(id)
+      } else {
+        route(payloadData: payload)
+      }
       return
     }
     // a chunked reply nobody waits for is dropped, a broken one fails its call at once
@@ -893,6 +902,21 @@ public actor RPCClient {
       let reason = "chunked reply to \(entry.subject) failed: \(error)"
       settle(id: id, with: .failure(RPCClientError.invalidResponse(reason)))
     }
+  }
+
+  private func isPing(_ payload: Data) -> Bool {
+    // a ping is a few bytes, a late reply of any size is not decoded for this
+    guard payload.count <= 64, let frame = (try? RPCCodec.decodeMessage(payload)) as? [String: Any?] else {
+      return false
+    }
+    return frame["type"] as? String == "ping" && frame["id"] == nil
+  }
+
+  private func endUnknownPullSession(_ id: String) {
+    guard openSessions[id] == nil, !openingPullSessions.contains(id) else { return }
+    // the handler still holds a session that ended here, its cancel got lost on the way
+    let cancel = SessionCancel(subject: "_rpc.iterator.\(id).request", frame: ["id": id, "type": "cancel"])
+    Task { await sendCancel(id, cancel) }
   }
 
   private func route(payloadData: Data, callId: String? = nil) {

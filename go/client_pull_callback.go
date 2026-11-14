@@ -81,7 +81,9 @@ func (c *Client) callPullIteratorWithCallback(
 		OnewayMethods:   oneway,
 		Args:            args,
 	}
+	c.pullSessions.Store(iteratorID, struct{}{})
 	if err := c.initPullSession(ctx, subject, "pull-callback iterator", iteratorID, opts, initParams); err != nil {
+		c.pullSessions.Delete(iteratorID)
 		cbUnsub()
 		return nil, err
 	}
@@ -99,6 +101,7 @@ func (c *Client) callPullIteratorWithCallback(
 	go func() {
 		defer close(ch)
 		defer c.pullIteratorSettles.Delete(iteratorID)
+		defer c.pullSessions.Delete(iteratorID)
 		defer cbUnsub()
 
 		respCh := make(chan PullIteratorResponse, 8)
@@ -174,6 +177,9 @@ func (c *Client) callPullIteratorWithCallback(
 			}
 		}
 
+		watch := newPullWatch(c, iteratorID)
+		defer watch.stop()
+
 		for {
 			// reply points at the status inbox so a vanished responder shows as a 503 instead of a hang
 			nextReq := PullIteratorRequest{ID: iteratorID, Type: "next"}
@@ -181,36 +187,49 @@ func (c *Client) callPullIteratorWithCallback(
 				sendToConsumer(PullValue{Error: err})
 				return
 			}
+			watch.step()
 
-			select {
-			case resp := <-respCh:
-				switch resp.Type {
-				case "value":
-					// the batch's callbacks arrive before its value response, so they are queued in cbSub by now
-					drainCallbacks()
-					if !sendToConsumer(PullValue{}) {
+		answer:
+			for {
+				select {
+				case resp := <-respCh:
+					switch resp.Type {
+					case "value":
+						// the batch's callbacks arrive before its value response, so they are queued in cbSub by now
+						drainCallbacks()
+						if !sendToConsumer(PullValue{}) {
+							return
+						}
+						break answer
+					case "done":
+						drainCallbacks()
 						return
+					case "error":
+						var pv PullValue
+						if resp.Error != nil {
+							pv = PullValue{Error: pullError(resp.Error, noResponders, subject)}
+						} else {
+							pv = PullValue{Error: NewRPCException(ErrCodeStreamError, "Iterator error")}
+						}
+						sendToConsumer(pv)
+						return
+					case "idle":
+						if watch.lost(resp) {
+							sendCancel()
+							sendToConsumer(PullValue{Error: errPullMessageLost()})
+							return
+						}
 					}
-				case "done":
-					drainCallbacks()
+				case <-watch.due():
+					watch.probe()
+				case <-ctx.Done():
+					sendCancel()
+					ended.Store(true)
 					return
-				case "error":
-					var pv PullValue
-					if resp.Error != nil {
-						pv = PullValue{Error: pullError(resp.Error, noResponders, subject)}
-					} else {
-						pv = PullValue{Error: NewRPCException(ErrCodeStreamError, "Iterator error")}
-					}
-					sendToConsumer(pv)
+				case <-disconnected:
+					sendDisconnected()
 					return
 				}
-			case <-ctx.Done():
-				sendCancel()
-				ended.Store(true)
-				return
-			case <-disconnected:
-				sendDisconnected()
-				return
 			}
 		}
 	}()

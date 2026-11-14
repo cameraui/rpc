@@ -116,6 +116,8 @@ type pullSession struct {
 	serving         bool
 	cancelled       bool
 	failure         *PullIteratorResponse
+	// steps the consumer asked for that have no answer yet
+	owed int
 }
 
 func newPullSession(id string, client *Client, cancel context.CancelFunc, probe *orphanProbe, onFinished func()) *pullSession {
@@ -199,6 +201,8 @@ func (s *pullSession) handleRequest(data []byte) {
 		if failure := s.next(); failure != nil {
 			s.end(failure, false, true)
 		}
+	case "probe":
+		s.reportIdle(req.Step)
 	}
 }
 
@@ -209,8 +213,19 @@ func (s *pullSession) next() *PullIteratorResponse {
 	if s.failure != nil && s.serving {
 		return s.failure
 	}
+	s.owed++
 	s.pump.request()
 	return nil
+}
+
+func (s *pullSession) reportIdle(step uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ended || !s.serving || s.owed > 0 {
+		return
+	}
+	// every step asked for has its answer, a consumer that still waits for one lost a message
+	_ = s.client.publishInternal(s.responseSubject, PullIteratorResponse{ID: s.id, Type: "idle", Step: step}, "")
 }
 
 func (s *pullSession) fail(err error) {
@@ -236,6 +251,7 @@ func (s *pullSession) respond(resp PullIteratorResponse) {
 	if !s.ended {
 		err = s.client.publishInternal(s.responseSubject, resp, s.probe.replyFor())
 	}
+	s.owed--
 	s.mu.Unlock()
 	if err != nil && s.client.IsConnected() {
 		s.end(&PullIteratorResponse{ID: s.id, Type: "error", Error: FormatErrorObject(err)}, false, true)

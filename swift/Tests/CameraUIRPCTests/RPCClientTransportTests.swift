@@ -321,6 +321,95 @@ final class RPCClientTransportTests: XCTestCase {
     XCTAssertTrue(iteratorRequests("next").isEmpty, "a cancelled consumer still asked for a batch")
   }
 
+  func testPingForAPullSessionThisClientDoesNotHoldIsAnsweredWithACancel() async throws {
+    servePullInit("pull")
+    let client = try await makeClient()
+    let iterator = try await client.callPullIterator("test", "pull")
+    let held = try XCTUnwrap(server.messages(on: "rpc.test.pull").first.flatMap(iteratorId))
+    let gone = held + "gone"
+    let ping = try RPCCodec.encodeMessage(["type": "ping"] as [String: Any?])
+
+    // the handler pings both, only the session nobody holds here is told to end
+    server.publish("rpc.reply.\(held)", ping)
+    server.publish("rpc.reply.\(gone)", ping)
+    let cancelled = await eventually(timeout: 2) { self.iteratorRequests("cancel").count == 1 }
+    XCTAssertTrue(cancelled, "a session without a consumer was never cancelled")
+    XCTAssertEqual(iteratorRequests("cancel").first?.subject, "_rpc.iterator.\(gone).request")
+
+    await iterator.cancel()
+    let ended = await eventually(timeout: 2) { self.iteratorRequests("cancel").count == 2 }
+    XCTAssertTrue(ended, "the session that was held was never cancelled")
+    server.publish("rpc.reply.\(held)", ping)
+    let again = await eventually(timeout: 2) { self.iteratorRequests("cancel").count == 3 }
+    XCTAssertTrue(again, "a ping after the session ended here was not answered")
+  }
+
+  func testPullStepThatLostAMessageEndsWithAnErrorAndCancelsItsSession() async throws {
+    servePullInit("pull")
+    // the handler never saw the next, so it has nothing open when it is asked
+    servePullSteps { request, _ in
+      request["type"] as? String == "probe" ? ["type": "idle", "step": request["step"] ?? nil] : nil
+    }
+    let client = try await makeClient(pullProbeInterval: 0.05)
+    let iterator = try await client.callPullIterator("test", "pull")
+
+    let outcome = Task { () -> String in
+      do {
+        return try await iterator.makeAsyncIterator().next() == nil ? "ended" : "value"
+      } catch let error as RPCRemoteError {
+        return error.description
+      } catch {
+        return "\(error)"
+      }
+    }
+
+    let ended = await result(of: outcome, within: 3)
+    XCTAssertEqual(
+      ended, "STREAM_ERROR: pull session lost a message, the handler waits for a step this client already asked for")
+    let cancelled = await eventually(timeout: 2) { self.iteratorRequests("cancel").count == 1 }
+    XCTAssertTrue(cancelled, "the handler of the lost step was never cancelled")
+
+    let probes = iteratorRequests("probe").count
+    try await Task.sleep(nanoseconds: 200_000_000)
+    XCTAssertEqual(iteratorRequests("probe").count, probes, "a session that ended still asks its handler")
+  }
+
+  func testPullStepOutlivesItsProbesAndIdleAnswersToEarlierSteps() async throws {
+    servePullInit("pull")
+    // probes that waited in a stalled connection get their answers after the step they asked about
+    servePullSteps { request, server in
+      guard let id = request["id"] as? String else { return nil }
+      switch request["type"] as? String {
+      case "probe":
+        return ["type": "idle", "step": (request["step"] as? Int ?? 0) - 1]
+      case "next":
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) {
+          let value: [String: Any?] = ["id": id, "type": "value", "value": 7]
+          server.publish("_rpc.iterator.\(id).response", try! RPCCodec.encodeMessage(value))
+        }
+        return nil
+      default:
+        return nil
+      }
+    }
+    let client = try await makeClient(pullProbeInterval: 0.05)
+    let iterator = try await client.callPullIterator("test", "pull")
+
+    let outcome = Task { () -> String in
+      do {
+        return "\(String(describing: try await iterator.makeAsyncIterator().next()))"
+      } catch {
+        return "\(error)"
+      }
+    }
+
+    let value = await result(of: outcome, within: 3)
+    XCTAssertEqual(value, "Optional(Optional(7))")
+    XCTAssertGreaterThanOrEqual(iteratorRequests("probe").count, 3)
+    XCTAssertTrue(iteratorRequests("cancel").isEmpty)
+    await iterator.cancel()
+  }
+
   func testPullIteratorWhoseInitTimesOutCancelsItsSession() async throws {
     let client = try await makeClient(requestTimeout: 0.5)
 
@@ -458,20 +547,28 @@ final class RPCClientTransportTests: XCTestCase {
   }
 
   private func makeClient(
-    requestTimeout: TimeInterval = 5, pingInterval: TimeInterval? = nil
+    requestTimeout: TimeInterval = 5, pingInterval: TimeInterval? = nil, pullProbeInterval: TimeInterval? = nil
   ) async throws
     -> RPCClient
   {
-    let options = RPCClientOptions(
+    var options = RPCClientOptions(
       url: server.url,
       connId: "conn\(UInt32.random(in: 1000...9999))",
       requestTimeout: requestTimeout,
       pingInterval: pingInterval
     )
+    if let pullProbeInterval {
+      options.pullProbeInterval = pullProbeInterval
+    }
     let client = RPCClient(options: options)
     try await client.connect()
     clients.append(client)
     return client
+  }
+
+  private func iteratorId(_ initCall: FakeMessage) -> String? {
+    let params = (FakeNatsServer.decode(initCall)["params"] as? [Any?])?.first as? [String: Any?]
+    return params?["__iteratorId"] as? String
   }
 
   private func iteratorRequests(_ type: String) -> [FakeMessage] {
@@ -492,6 +589,16 @@ final class RPCClientTransportTests: XCTestCase {
     server.onPublish("rpc.test.\(method)") { [server] message in
       let envelope = FakeNatsServer.decode(message)
       server!.reply(to: message, ["id": envelope["id"] ?? nil, "result": nil] as [String: Any?])
+    }
+  }
+
+  private func servePullSteps(_ answer: @escaping ([String: Any?], FakeNatsServer) -> [String: Any?]?) {
+    server.onPublish("_rpc.iterator.>") { [server] message in
+      guard message.subject.hasSuffix(".request") else { return }
+      let request = FakeNatsServer.decode(message)
+      guard let id = request["id"] as? String, var response = answer(request, server!) else { return }
+      response["id"] = id
+      server!.publish("_rpc.iterator.\(id).response", try! RPCCodec.encodeMessage(response))
     }
   }
 

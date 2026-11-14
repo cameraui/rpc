@@ -29,6 +29,7 @@ type fakeNATS struct {
 	subDelay   time.Duration
 	pings      int
 	refuse     bool
+	lose       func(subject string) bool
 }
 
 type fakeConn struct {
@@ -132,6 +133,13 @@ func (s *fakeNATS) delayPongs(d time.Duration) {
 func (s *fakeNATS) delayNoResponders(d time.Duration) {
 	s.mu.Lock()
 	s.lateNoResp = d
+	s.mu.Unlock()
+}
+
+// the next message on a matching subject disappears like one written into a dead connection: no delivery, no 503
+func (s *fakeNATS) loseNext(match func(subject string) bool) {
+	s.mu.Lock()
+	s.lose = match
 	s.mu.Unlock()
 }
 
@@ -288,6 +296,11 @@ func (s *fakeNATS) route(from *fakeConn, subject, reply string, hdr, data []byte
 		s.requests[subject]++
 	}
 	s.routed = append(s.routed, subject)
+	if s.lose != nil && s.lose(subject) {
+		s.lose = nil
+		s.mu.Unlock()
+		return
+	}
 	for c := range s.conns {
 		for sid, sub := range c.subs {
 			if !subjectMatches(sub.subject, subject) {

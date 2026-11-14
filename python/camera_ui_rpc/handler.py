@@ -496,6 +496,13 @@ class _PullSession:
             self._step = _start_step(self._next(self._step))
         elif kind == "cancel":
             await self._cancel()
+        elif kind == "probe" and (self._first is not None or self._step is None or self._step.done()):
+            # every step asked for has its answer, a consumer that still waits for one lost a message
+            idle: PullIteratorResponse = {"id": self._id, "type": "idle"}
+            if (step := msg.get("step")) is not None:
+                idle["step"] = step
+            with contextlib.suppress(Exception):
+                await self._client.publish(self._response_subject, idle)
 
     async def _next(
         self, previous: asyncio.Task[None] | None, asked: asyncio.Future[None] | None = None

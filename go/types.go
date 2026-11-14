@@ -53,15 +53,19 @@ type StreamMessage struct {
 // PullIteratorRequest is the wire-format for a pull-based iterator request.
 type PullIteratorRequest struct {
 	ID   string `msgpack:"id"`
-	Type string `msgpack:"type"` // "next", "cancel"
+	Type string `msgpack:"type"` // "next", "cancel", "probe"
+	// the step a probe asks about, counted by the consumer
+	Step uint64 `msgpack:"step,omitempty"`
 }
 
 // PullIteratorResponse is the wire-format for a pull-based iterator response.
 type PullIteratorResponse struct {
 	ID    string    `msgpack:"id"`
-	Type  string    `msgpack:"type"` // "value", "done", "error"
+	Type  string    `msgpack:"type"` // "value", "done", "error", "idle"
 	Value any       `msgpack:"value"`
 	Error *RPCError `msgpack:"error,omitempty"`
+	// the step of the probe an idle answers
+	Step uint64 `msgpack:"step,omitempty"`
 }
 
 // ChannelMessage is the wire-format for channel communication.

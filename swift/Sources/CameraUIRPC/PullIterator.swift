@@ -45,12 +45,18 @@ actor PullIteratorSession {
   private let iteratorId: String
   private let requestSubject: String
   private let statusInbox: String
+  private let probeInterval: TimeInterval
   private let callbacks: [String: PullCallback]
   private let prefetch: Bool
   private let callbackSub: NatsSubscription?
   private let callbackChunks: ChunkReceiver
   private var responseTask: Task<Void, Never>?
   private var callbackTask: Task<Void, Never>?
+  private var probeTask: Task<Void, Never>?
+  private var steps = 0
+  // the step this session waits for, 0 between steps
+  private var waiting = 0
+  private var waitingAtLastProbe = 0
   private var queue: [Boundary] = []
   private var waiter: CheckedContinuation<Boundary, Never>?
   private var handled: UInt64 = 0
@@ -66,6 +72,7 @@ actor PullIteratorSession {
     iteratorId: String,
     requestSubject: String,
     statusInbox: String,
+    probeInterval: TimeInterval,
     callbacks: [String: PullCallback],
     prefetch: Bool,
     callbackSub: NatsSubscription?,
@@ -75,6 +82,7 @@ actor PullIteratorSession {
     self.iteratorId = iteratorId
     self.requestSubject = requestSubject
     self.statusInbox = statusInbox
+    self.probeInterval = probeInterval
     self.callbacks = callbacks
     self.prefetch = prefetch
     self.callbackSub = callbackSub
@@ -94,6 +102,13 @@ actor PullIteratorSession {
           "type": "error",
           "error": ["code": "SUBSCRIPTION", "message": "\(error)"] as [String: Any?],
         ])
+      }
+    }
+    probeTask = Task { [weak self, probeInterval] in
+      while !Task.isCancelled {
+        try? await Task.sleep(nanoseconds: UInt64(probeInterval * 1_000_000_000))
+        guard let self, !Task.isCancelled else { return }
+        await self.probe()
       }
     }
   }
@@ -150,6 +165,11 @@ actor PullIteratorSession {
       return nil
     case "cancelled":
       return nil
+    case "lost":
+      await cleanup(sendCancel: true)
+      throw RPCRemoteError(
+        code: "STREAM_ERROR",
+        message: "pull session lost a message, the handler waits for a step this client already asked for")
     default:
       await cleanup(sendCancel: false)
       if let error = endedError {
@@ -177,6 +197,7 @@ actor PullIteratorSession {
   }
 
   func handleDisconnect() {
+    waiting = 0
     if !ended {
       ended = true
       endedError = RPCClientError.notConnected
@@ -188,7 +209,13 @@ actor PullIteratorSession {
   }
 
   private func onResponse(_ map: [String: Any?]) {
+    var response = map
     switch map["type"] as? String {
+    case "idle":
+      // the answer to this step would have arrived ahead of the idle,
+      // one for an earlier step crossed its answer on the way
+      guard waiting > 0, map["step"] as? Int == waiting else { return }
+      response = ["type": "lost"]
     case "error":
       ended = true
       endedError = RPCRemoteError(fromEnvelope: map["error"] as? [String: Any?])
@@ -197,7 +224,8 @@ actor PullIteratorSession {
     default:
       break
     }
-    let boundary = Boundary(response: map, callbacks: callbackSub?.received ?? 0)
+    waiting = 0
+    let boundary = Boundary(response: response, callbacks: callbackSub?.received ?? 0)
     if let waiter {
       self.waiter = nil
       waiter.resume(returning: boundary)
@@ -207,8 +235,26 @@ actor PullIteratorSession {
   }
 
   private func sendNextRequest() async throws {
+    steps += 1
+    waiting = steps
     let request: [String: Any?] = ["id": iteratorId, "type": "next"]
-    try await client.publishLinked(requestSubject, request, reply: statusInbox)
+    do {
+      try await client.publishLinked(requestSubject, request, reply: statusInbox)
+    } catch {
+      waiting = 0
+      throw error
+    }
+  }
+
+  private func probe() async {
+    // only a step that waited at the probe before has waited a whole interval
+    let step = waiting
+    let waited = step > 0 && step == waitingAtLastProbe
+    waitingAtLastProbe = step
+    guard waited else { return }
+    // a handler with nothing open answers idle, a session that is gone shows as a 503 on the status inbox
+    let request: [String: Any?] = ["id": iteratorId, "type": "probe", "step": step]
+    try? await client.publishLinked(requestSubject, request, reply: statusInbox)
   }
 
   private func awaitResponse() async -> Boundary {
@@ -271,6 +317,8 @@ actor PullIteratorSession {
     responseTask = nil
     callbackTask?.cancel()
     callbackTask = nil
+    probeTask?.cancel()
+    probeTask = nil
     releaseCallbackWaiters()
     callbackChunks.dispose()
     await client.removeStatusHandler(iteratorId)

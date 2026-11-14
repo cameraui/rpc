@@ -238,17 +238,21 @@ export interface StreamMessage<T = any> {
 export interface PullIteratorRequest {
   id: string;
 
-  type: 'next' | 'cancel';
+  type: 'next' | 'cancel' | 'probe';
+
+  step?: number;
 }
 
 export interface PullIteratorResponse<T = any> {
   id: string;
 
-  type: 'value' | 'done' | 'error';
+  type: 'value' | 'done' | 'error' | 'idle';
 
   value?: T;
 
   error?: RPCError;
+
+  step?: number;
 }
 
 export interface CallbackParams {

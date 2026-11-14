@@ -260,7 +260,9 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 		IteratorID:   iteratorID,
 		Args:         args,
 	}
+	c.pullSessions.Store(iteratorID, struct{}{})
 	if err := c.initPullSession(ctx, subject, "pull iterator", iteratorID, opts, initParams); err != nil {
+		c.pullSessions.Delete(iteratorID)
 		return nil, err
 	}
 
@@ -276,6 +278,7 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 	go func() {
 		defer close(ch)
 		defer c.pullIteratorSettles.Delete(iteratorID)
+		defer c.pullSessions.Delete(iteratorID)
 
 		respCh := make(chan PullIteratorResponse, 8)
 		var ended atomic.Bool
@@ -331,6 +334,9 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 			}
 		}
 
+		watch := newPullWatch(c, iteratorID)
+		defer watch.stop()
+
 		for {
 			// reply points at the status inbox so a vanished responder shows as a 503 instead of a hang
 			nextReq := PullIteratorRequest{
@@ -341,38 +347,93 @@ func (c *Client) callPullIterator(ctx context.Context, subject string, opts *Req
 				sendToConsumer(PullValue{Error: err})
 				return
 			}
+			watch.step()
 
-			select {
-			case resp := <-respCh:
-				switch resp.Type {
-				case "value":
-					if !sendToConsumer(PullValue{Value: resp.Value}) {
+		answer:
+			for {
+				select {
+				case resp := <-respCh:
+					switch resp.Type {
+					case "value":
+						if !sendToConsumer(PullValue{Value: resp.Value}) {
+							return
+						}
+						break answer
+					case "done":
 						return
+					case "error":
+						var pv PullValue
+						if resp.Error != nil {
+							pv = PullValue{Error: pullError(resp.Error, noResponders, subject)}
+						} else {
+							pv = PullValue{Error: NewRPCException(ErrCodeStreamError, "Iterator error")}
+						}
+						sendToConsumer(pv)
+						return
+					case "idle":
+						if watch.lost(resp) {
+							sendCancel()
+							sendToConsumer(PullValue{Error: errPullMessageLost()})
+							return
+						}
 					}
-				case "done":
+				case <-watch.due():
+					watch.probe()
+				case <-ctx.Done():
+					sendCancel()
+					ended.Store(true)
 					return
-				case "error":
-					var pv PullValue
-					if resp.Error != nil {
-						pv = PullValue{Error: pullError(resp.Error, noResponders, subject)}
-					} else {
-						pv = PullValue{Error: NewRPCException(ErrCodeStreamError, "Iterator error")}
-					}
-					sendToConsumer(pv)
+				case <-disconnected:
+					sendDisconnected()
 					return
 				}
-			case <-ctx.Done():
-				sendCancel()
-				ended.Store(true)
-				return
-			case <-disconnected:
-				sendDisconnected()
-				return
 			}
 		}
 	}()
 
 	return ch, nil
+}
+
+type pullWatch struct {
+	client *Client
+	id     string
+	timer  *time.Timer
+	// the step this client waits for, a probe carries it and the idle that answers it gives it back
+	asked uint64
+}
+
+func newPullWatch(c *Client, iteratorID string) *pullWatch {
+	w := &pullWatch{client: c, id: iteratorID, timer: time.NewTimer(c.pullProbeInterval)}
+	w.timer.Stop()
+	return w
+}
+
+func (w *pullWatch) step() {
+	w.asked++
+	w.timer.Reset(w.client.pullProbeInterval)
+}
+
+func (w *pullWatch) due() <-chan time.Time {
+	return w.timer.C
+}
+
+func (w *pullWatch) probe() {
+	// a handler with nothing open answers idle, a session that is gone shows as a 503 on the status inbox
+	_ = w.client.publishInternal("_rpc.iterator."+w.id+".request", PullIteratorRequest{ID: w.id, Type: "probe", Step: w.asked}, "rpc.reply."+w.id)
+	w.timer.Reset(w.client.pullProbeInterval)
+}
+
+func (w *pullWatch) lost(idle PullIteratorResponse) bool {
+	// the answer to this step would have arrived ahead of the idle, one for an earlier step crossed its answer on the way
+	return idle.Step == w.asked
+}
+
+func (w *pullWatch) stop() {
+	w.timer.Stop()
+}
+
+func errPullMessageLost() *RPCException {
+	return NewRPCException(ErrCodeStreamError, "pull session lost a message, the handler waits for a step this client already asked for")
 }
 
 func (c *Client) initPullSession(ctx context.Context, subject, kind, iteratorID string, opts *RequestOptions, params any) error {

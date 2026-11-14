@@ -7,11 +7,13 @@ from typing import Any, cast
 
 import pytest
 from test_client import SerialNC
+from test_drain import make_client as make_drain_client
 from test_handler import deliver, frames, open_pull, open_stream, pull, wait_for
 from test_mux import make_client, make_msg, no_responder_headers
+from test_setup_cancel import start_pull
 
 import camera_ui_rpc.client as rpc_client
-from camera_ui_rpc.codec import decode
+from camera_ui_rpc.codec import decode, encode
 
 FAST = {"interval_ms": 20, "grace_ms": 80}
 
@@ -353,5 +355,58 @@ def test_a_busy_pull_callback_session_carries_the_probe_on_its_callbacks() -> No
         carried = probes(nc, "_rpc.cb.it1")
         assert 3 <= len(carried) <= 8
         assert all(decode(p["data"]) == {"method": "frame", "args": [1]} for p in carried)
+
+    asyncio.run(run())
+
+
+def ping(client: Any, iterator_id: str) -> None:
+    client._handle_mux_message(make_msg(f"rpc.reply.{iterator_id}", encode({"type": "ping"})))
+
+
+def test_a_ping_for_a_pull_session_this_client_does_not_hold_is_answered_with_a_cancel() -> None:
+    async def run() -> None:
+        client, nc = make_client()
+        gone = f"{client._reply_prefix}.gone"
+        request = f"_rpc.iterator.{gone}.request"
+
+        ping(client, gone)
+        await wait_for(lambda: frames(nc, request) == [{"id": gone, "type": "cancel"}])
+
+        # a late reply to a call that timed out is no ping
+        late = encode({"id": gone, "result": {"type": "ping"}})
+        client._handle_mux_message(make_msg(f"rpc.reply.{gone}", late))
+        await asyncio.sleep(0.01)
+        assert len(frames(nc, request)) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("callbacks", [False, True], ids=["pull", "pull-callback"])
+def test_a_ping_for_a_pull_session_this_client_consumes_is_left_alone(callbacks: bool) -> None:
+    async def run() -> None:
+        client, nc = make_drain_client(timeout=300)
+        first, init, iterator_id = await start_pull(client, nc, callbacks)
+        request = f"_rpc.iterator.{iterator_id}.request"
+
+        # the handler may ping as soon as it holds the session, before the init call is answered here
+        ping(client, iterator_id)
+        await asyncio.sleep(0.01)
+        assert frames(nc, request) == []
+
+        reply = encode({"id": init["id"], "result": {"iteratorId": iterator_id}})
+        client._handle_mux_message(make_msg(f"rpc.reply.{init['id']}", reply))
+        await wait_for(lambda: frames(nc, request) == [{"id": iterator_id, "type": "next"}])
+        ping(client, iterator_id)
+        await asyncio.sleep(0.01)
+        assert frames(nc, request) == [{"id": iterator_id, "type": "next"}]
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await wait_for(lambda: iterator_id not in client._pull_sessions)
+        before = len(frames(nc, request))
+        ping(client, iterator_id)
+        await wait_for(lambda: len(frames(nc, request)) == before + 1)
+        assert frames(nc, request)[-1] == {"id": iterator_id, "type": "cancel"}
 
     asyncio.run(run())

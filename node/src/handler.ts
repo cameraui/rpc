@@ -524,6 +524,8 @@ async function servePullSession(
   let stepping = false;
   let generator: Producer | undefined;
   let steps: Promise<void> | undefined;
+  // steps the consumer asked for that have no answer yet
+  let owed = 0;
   // the first step of an eager session, started before the consumer asks for it
   let early: Promise<PullIteratorResponse> | undefined;
   let closing: Promise<void> | undefined;
@@ -604,7 +606,13 @@ async function servePullSession(
       if (generator) cancel();
       else cancelled = true;
     } else if (msg.type === 'next') {
-      steps = steps ? steps.then(step) : step();
+      owed++;
+      steps = (steps ? steps.then(step) : step()).finally(() => {
+        owed--;
+      });
+    } else if (msg.type === 'probe' && generator && owed === 0) {
+      // every step asked for has its answer, a consumer that still waits for one lost a message
+      sendQuietly(client, responseSubject, { id: iteratorId, type: 'idle', step: msg.step } satisfies PullIteratorResponse);
     }
   };
 

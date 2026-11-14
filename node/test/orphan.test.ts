@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { decode, encode } from '../src/codec.js';
 import { handleCallbackRequest, handlePullCallbackRequest, handlePullIteratorRequest, handleStreamRequest, probeSettings, sessionSignal } from '../src/handler.js';
 import { sleep } from '../src/utils.js';
-import { createClient, emptyHeaders, muxSub } from './mock-nc.js';
+import { createClient, drainMicrotasks, emptyHeaders, muxSub } from './mock-nc.js';
 
 import type { Published } from './mock-nc.js';
 
@@ -168,6 +168,52 @@ describe('orphan probe of pull sessions', () => {
     } finally {
       clearInterval(pump);
     }
+  });
+});
+
+describe('pull session whose cancel got lost', () => {
+  function cancels(nc: ReturnType<typeof createClient>['nc'], id: string) {
+    return nc.published.filter((p) => p.subject === `_rpc.iterator.${id}.request`).map((p) => decode(p.data) as { type: string });
+  }
+
+  it('answers the ping for a session this client does not hold with a cancel', async () => {
+    const { client, nc } = createClient();
+    (client as any).ensureMuxSubscription();
+    const id = `${(client as any).replyPrefix}.gone`;
+
+    muxSub(client, nc).callback(null, { subject: `rpc.reply.${id}`, data: encode({ type: 'ping' }), headers: emptyHeaders() });
+    expect(cancels(nc, id)).toEqual([{ id, type: 'cancel' }]);
+
+    // a late reply to a call that timed out is no ping
+    muxSub(client, nc).callback(null, { subject: `rpc.reply.${id}`, data: encode({ id, result: { type: 'ping' } }), headers: emptyHeaders() });
+    expect(cancels(nc, id)).toHaveLength(1);
+  });
+
+  it('leaves the ping for a session it consumes alone, from before the handler knows the session until it ends', async () => {
+    const { client, nc } = createClient();
+    const iter = client.callPullIterator('rpc.ns.pull');
+    const first = iter.next();
+    await drainMicrotasks();
+    const init = nc.published.map((p) => decode(p.data) as any).find((m) => m.method === 'call' && m.params?.[0]?.__pullIterator);
+    const id: string = init.params[0].__iteratorId;
+    const ping = () => muxSub(client, nc).callback(null, { subject: `rpc.reply.${id}`, data: encode({ type: 'ping' }), headers: emptyHeaders() });
+
+    ping();
+    expect(cancels(nc, id)).toEqual([]);
+
+    muxSub(client, nc).callback(null, { subject: `rpc.reply.${init.id}`, data: encode({ id: init.id, result: { iteratorId: id } }), headers: emptyHeaders() });
+    await vi.waitFor(() => expect(cancels(nc, id)).toEqual([{ id, type: 'next' }]));
+    ping();
+    expect(cancels(nc, id)).toEqual([{ id, type: 'next' }]);
+
+    nc.subs.find((s) => s.pattern === `_rpc.iterator.${id}.response`)!.callback(null, { data: encode({ id, type: 'value', value: 1 }) });
+    expect((await first).value).toBe(1);
+    await iter.return(undefined);
+    const afterReturn = cancels(nc, id).filter((req) => req.type === 'cancel').length;
+    expect(afterReturn).toBe(1);
+
+    ping();
+    expect(cancels(nc, id).filter((req) => req.type === 'cancel')).toHaveLength(afterReturn + 1);
   });
 });
 

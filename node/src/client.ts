@@ -4,8 +4,8 @@ import { Channel, PrivateChannel } from './channel.js';
 import { ChunkingManager, createChunks, parseChunkIndex, TransferBudget } from './chunking.js';
 import { assembleFrame, decode, decodeMessage, encode, encodeMessage, encodeMessageParts } from './codec.js';
 import { extractNestedMethodsWithDecorators, extractNestedMethodsWithoutDecorators } from './decorators.js';
-import { RPCException, createError, markLocalNoResponders } from './errors.js';
-import { callNormalRPC, formatErrorObject, handleStreamRequest, openSession, outsideSession, probeSettings, SessionOwner, sessionKind } from './handler.js';
+import { createError, markLocalNoResponders, RPCException } from './errors.js';
+import { callNormalRPC, formatErrorObject, handleStreamRequest, openSession, outsideSession, probeSettings, sessionKind, SessionOwner } from './handler.js';
 import { flushOutbound, packSmallPublishes, presizeSplitPayloads, PUBLISH_FRAME_MIN_SIZE, publishFrame, publishFrameZeroCopy, shareReadBuffer } from './patches.js';
 import { RPCService } from './service.js';
 import { ERROR_CODES } from './types.js';
@@ -22,6 +22,8 @@ import type {
   ChunkedTransferHeader,
   OrphanProbeOptions,
   Promisify,
+  ProxyCallOptions,
+  ProxyTimingReporter,
   PullCallbackCallOptions,
   PullCallbackParams,
   PullIteratorRequest,
@@ -33,8 +35,6 @@ import type {
   RPCMessage,
   RPCResponse,
   RPCTiming,
-  ProxyCallOptions,
-  ProxyTimingReporter,
   StreamMessage,
 } from './types.js';
 
@@ -57,6 +57,8 @@ const PAYLOAD_RESERVE = 8192;
 const MIN_PAYLOAD_LIMIT = 16384;
 // lets the sending channel end skip its own request in onRequest
 const SENDER_HEADER = 'x-channel-sender';
+// a pull step that stays unanswered this long makes the client ask its handler about it
+const PULL_PROBE_MS = 30_000;
 
 export function createRPCClient(options: RPCClientOptions): RPCClientImpl {
   return new RPCClient(options);
@@ -98,6 +100,34 @@ interface MethodProbe {
   onMethods?: (methods: string[]) => void;
 }
 
+class PullWatch {
+  private timer?: ReturnType<typeof setInterval>;
+  private steps = 0;
+  // the step this client waits for, 0 between steps
+  private waiting = 0;
+
+  constructor(
+    private readonly intervalMs: number,
+    private readonly probe: (step: number) => void,
+  ) {}
+
+  public asked(): void {
+    this.settled();
+    this.waiting = ++this.steps;
+    this.timer = setInterval(() => this.probe(this.waiting), this.intervalMs);
+  }
+
+  public settled(): void {
+    this.waiting = 0;
+    clearInterval(this.timer);
+  }
+
+  public lost(idle: PullIteratorResponse): boolean {
+    // the answer to this step would have arrived ahead of the idle, one for an earlier step crossed its answer on the way
+    return this.waiting > 0 && idle.step === this.waiting;
+  }
+}
+
 function scopedInbox(connId?: string): string {
   return createInbox(connId ? `_INBOX.${connId}` : undefined);
 }
@@ -113,6 +143,8 @@ export class RPCClient implements RPCClientImpl {
   private subscriptionSeq = 0;
   private subscriptionEntries = new Map<number, SubscriptionEntry>();
   private pullIteratorSettles = new Set<() => void>();
+  private pullSessions = new Set<string>();
+  private pullProbeMs = PULL_PROBE_MS;
 
   private readonly replyPrefix: string;
 
@@ -751,8 +783,30 @@ export class RPCClient implements RPCClientImpl {
         this.muxChunking.processChunk({ id: transferKey, chunkIndex, data: msg.data, isLast: false });
       }
     } else {
-      this.routeMuxResponse(decodeMessage(msg.data));
+      const data = decodeMessage(msg.data);
+      if (data?.type === 'ping' && data.id === undefined) this.endUnknownPullSession(msg.subject.slice('rpc.reply.'.length));
+      else this.routeMuxResponse(data);
     }
+  }
+
+  private endUnknownPullSession(id: string): void {
+    if (this.pullSessions.has(id)) return;
+    // the handler still holds a session that ended here, its cancel got lost on the way
+    this.publishOrChunk(`_rpc.iterator.${id}.request`, { id, type: 'cancel' } satisfies PullIteratorRequest)?.catch(() => {});
+  }
+
+  private probePullSession(id: string, step: number): void {
+    // a handler with nothing open answers idle, a session that is gone shows as a 503 on the status inbox
+    this.publish(`_rpc.iterator.${id}.request`, { id, type: 'probe', step } satisfies PullIteratorRequest, { reply: `rpc.reply.${id}` }).catch(() => {});
+  }
+
+  private giveUpPullSession(id: string): PullIteratorResponse {
+    this.publish(`_rpc.iterator.${id}.request`, { id, type: 'cancel' } satisfies PullIteratorRequest).catch(() => {});
+    return {
+      id,
+      type: 'error',
+      error: { code: ERROR_CODES.STREAM_ERROR, message: 'pull session lost a message, the handler waits for a step this client already asked for' },
+    };
   }
 
   private routeMuxResponse(data: any): void {
@@ -1878,6 +1932,7 @@ export class RPCClient implements RPCClientImpl {
 
     const responseQueue: PullIteratorResponse[] = [];
     let responseResolver: ((value: PullIteratorResponse) => void) | null = null;
+    const watch = new PullWatch(client.pullProbeMs, (step) => client.probePullSession(iteratorId, step));
 
     const settlePendingAsDone = (): void => {
       const r = responseResolver;
@@ -1889,6 +1944,7 @@ export class RPCClient implements RPCClientImpl {
 
     // settles a parked next() on teardown, otherwise the consumer's for await hangs
     const settleOnDisconnect = (): void => {
+      watch.settled();
       if (!ended) {
         ended = true;
         error = createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed');
@@ -1907,8 +1963,10 @@ export class RPCClient implements RPCClientImpl {
     const cleanupOnce = async (): Promise<void> => {
       if (cleanedUp) return;
       cleanedUp = true;
+      watch.settled();
       client.pullIteratorSettles.delete(settleOnDisconnect);
       client.statusHandlers.delete(iteratorId);
+      client.pullSessions.delete(iteratorId);
       responseUnsub?.();
       if (!ended) {
         ended = true;
@@ -1932,6 +1990,7 @@ export class RPCClient implements RPCClientImpl {
       client.pullIteratorSettles.add(settleOnDisconnect);
 
       iteratorId = generateId(client.replyPrefix);
+      client.pullSessions.add(iteratorId);
       requestSubject = `_rpc.iterator.${iteratorId}.request`;
       responseSubject = `_rpc.iterator.${iteratorId}.response`;
       // 503 inbox for next requests, under the mux wildcard since iteratorId starts with replyPrefix
@@ -1945,6 +2004,11 @@ export class RPCClient implements RPCClientImpl {
       }
 
       responseUnsub = await client.subscribe(responseSubject, (msg: PullIteratorResponse) => {
+        if (msg.type === 'idle') {
+          if (!watch.lost(msg)) return;
+          msg = client.giveUpPullSession(iteratorId);
+        }
+        watch.settled();
         if (msg.type === 'error') {
           error = RPCException.fromJSON(msg.error!);
           ended = true;
@@ -1962,6 +2026,7 @@ export class RPCClient implements RPCClientImpl {
 
       client.statusHandlers.set(iteratorId, () => {
         const e = new errors.NoRespondersError(subject);
+        watch.settled();
         ended = true;
         error = markLocalNoResponders(createError('503', e.message), subject);
         const response: PullIteratorResponse<any> = {
@@ -2005,7 +2070,10 @@ export class RPCClient implements RPCClientImpl {
           const held = client.holdForLink(subject);
           if (held) await held;
           // a connection that ended while held settled the iterator
-          if (!ended) await client.publish(requestSubject, nextRequest, { reply: statusInbox });
+          if (!ended) {
+            watch.asked();
+            await client.publish(requestSubject, nextRequest, { reply: statusInbox });
+          }
         } catch (err) {
           await cleanupOnce();
           throw err;
@@ -2107,6 +2175,7 @@ export class RPCClient implements RPCClientImpl {
 
     const responseQueue: PullIteratorResponse[] = [];
     let responseResolver: ((value: PullIteratorResponse) => void) | null = null;
+    const watch = new PullWatch(client.pullProbeMs, (step) => client.probePullSession(iteratorId, step));
     let callbackChain: Promise<void> = Promise.resolve();
     // the callback chain as it stood when a batch boundary arrived
     const batchTails = new WeakMap<PullIteratorResponse, Promise<void>>();
@@ -2123,6 +2192,7 @@ export class RPCClient implements RPCClientImpl {
 
     // settles a parked next() on teardown
     const settleOnDisconnect = (): void => {
+      watch.settled();
       if (!ended) {
         ended = true;
         error = createError(ERROR_CODES.CONNECTION_CLOSED, 'Connection closed');
@@ -2141,8 +2211,10 @@ export class RPCClient implements RPCClientImpl {
     const cleanupOnce = async (): Promise<void> => {
       if (cleanedUp) return;
       cleanedUp = true;
+      watch.settled();
       client.pullIteratorSettles.delete(settleOnDisconnect);
       client.statusHandlers.delete(iteratorId);
+      client.pullSessions.delete(iteratorId);
       callbackUnsub?.();
       responseUnsub?.();
       if (!ended) {
@@ -2167,6 +2239,7 @@ export class RPCClient implements RPCClientImpl {
       client.pullIteratorSettles.add(settleOnDisconnect);
 
       iteratorId = generateId(client.replyPrefix);
+      client.pullSessions.add(iteratorId);
       requestSubject = `_rpc.iterator.${iteratorId}.request`;
       responseSubject = `_rpc.iterator.${iteratorId}.response`;
       callbackSubject = `_rpc.cb.${iteratorId}`;
@@ -2222,6 +2295,11 @@ export class RPCClient implements RPCClientImpl {
       }
 
       responseUnsub = await client.subscribe(responseSubject, (msg: PullIteratorResponse) => {
+        if (msg.type === 'idle') {
+          if (!watch.lost(msg)) return;
+          msg = client.giveUpPullSession(iteratorId);
+        }
+        watch.settled();
         if (msg.type === 'error') {
           error = RPCException.fromJSON(msg.error!);
           ended = true;
@@ -2242,6 +2320,7 @@ export class RPCClient implements RPCClientImpl {
 
       client.statusHandlers.set(iteratorId, () => {
         const e = new errors.NoRespondersError(subject);
+        watch.settled();
         ended = true;
         error = markLocalNoResponders(createError('503', e.message), subject);
 
@@ -2290,7 +2369,10 @@ export class RPCClient implements RPCClientImpl {
             const held = client.holdForLink(subject);
             if (held) await held;
             // a connection that ended while held settled the iterator
-            if (!ended) await client.publish(requestSubject, nextRequest, { reply: statusInbox });
+            if (!ended) {
+              watch.asked();
+              await client.publish(requestSubject, nextRequest, { reply: statusInbox });
+            }
           } catch (err) {
             await cleanupOnce();
             throw err;
@@ -2334,10 +2416,12 @@ export class RPCClient implements RPCClientImpl {
         if (prefetch && !ended && !returned && !client.linkWaiters) {
           try {
             const prefetchRequest: PullIteratorRequest = { id: iteratorId, type: 'next' };
+            watch.asked();
             await client.publish(requestSubject, prefetchRequest, { reply: statusInbox });
             prefetched = true;
           } catch {
             prefetched = false;
+            watch.settled();
           }
         }
         // backpressure: wait for this batch's callbacks only, the chain at its boundary covers exactly this batch

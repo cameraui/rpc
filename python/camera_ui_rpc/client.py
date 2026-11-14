@@ -282,6 +282,8 @@ def _stop_lanes(registrations: Iterable[_Registration]) -> list[asyncio.Task[Non
 
 DEFAULT_ORPHAN_PROBE_INTERVAL_MS = 30_000
 DEFAULT_ORPHAN_PROBE_GRACE_MS = 300_000
+# seconds, a pull step that stays unanswered this long makes the client ask its handler about it
+PULL_PROBE_INTERVAL = 30.0
 
 
 class _OrphanProbe:
@@ -381,6 +383,53 @@ class _OrphanProbe:
         elif self._client.is_connected and self._ping is not None:
             run_in_background(self._ping(self._next_probe(now)))
         self._arm(self._interval)
+
+
+class _PullWatch:
+    __slots__ = ("_client", "_id", "_interval", "_step", "_timer")
+
+    def __init__(self, client: "RPCClient", iterator_id: str, interval: float) -> None:
+        self._client = client
+        self._id = iterator_id
+        self._interval = interval
+        self._step = 0
+        self._timer: asyncio.TimerHandle | None = None
+
+    async def answer(
+        self, answers: asyncio.Queue[PullIteratorResponse | Exception]
+    ) -> PullIteratorResponse | Exception:
+        self._step += 1
+        self._arm()
+        try:
+            while True:
+                response = await answers.get()
+                if isinstance(response, Exception) or response.get("type") != "idle":
+                    return response
+                # the answer to this step would have arrived ahead of the idle,
+                # one for an earlier step crossed its answer on the way
+                if response.get("step") == self._step:
+                    return create_error(
+                        ErrorCode.STREAM_ERROR,
+                        "pull session lost a message, the handler waits for a step this client already asked for",
+                    )
+        finally:
+            if self._timer is not None:
+                self._timer.cancel()
+
+    def _arm(self) -> None:
+        self._timer = asyncio.get_running_loop().call_later(self._interval, self._probe)
+
+    def _probe(self) -> None:
+        self._arm()
+        run_in_background(self._ask())
+
+    async def _ask(self) -> None:
+        # a handler with nothing open answers idle, a session that is gone shows as a 503 on the status inbox
+        probe: PullIteratorRequest = {"id": self._id, "type": "probe", "step": self._step}
+        with contextlib.suppress(Exception):
+            await self._client.publish(
+                f"_rpc.iterator.{self._id}.request", probe, reply=f"rpc.reply.{self._id}"
+            )
 
 
 def _expired(message: Any, arrived: float) -> bool:
@@ -492,6 +541,8 @@ class RPCClient(RPCClientProtocol):
         self.callback_cleanups: dict[str, Callable[[], Coroutine[Any, Any, None]]] = {}
         self.stream_cleanups: dict[str, Callable[[], Coroutine[Any, Any, None]]] = {}
         self._pull_iterator_settles: set[Callable[[], None]] = set()
+        self._pull_sessions: set[str] = set()
+        self._pull_probe_interval = PULL_PROBE_INTERVAL
         self._concurrent_calls: set[asyncio.Task[None]] = set()
         self._registrations: set[_Registration] = set()
         self._drained_subs: set[Subscription] = set()
@@ -1584,7 +1635,18 @@ class RPCClient(RPCClientProtocol):
                     {"id": transfer_key, "chunkIndex": chunk_index, "data": data, "isLast": False}
                 )
         else:
-            self._route_mux_response(decode_message(data))
+            decoded = decode_message(data)
+            if isinstance(decoded, dict) and decoded.get("type") == "ping" and "id" not in decoded:
+                self._end_unknown_pull_session(msg.subject[len("rpc.reply.") :])
+            else:
+                self._route_mux_response(decoded)
+
+    def _end_unknown_pull_session(self, iterator_id: str) -> None:
+        if iterator_id in self._pull_sessions:
+            return
+        # the handler still holds a session that ended here, its cancel got lost on the way
+        cancel: PullIteratorRequest = {"id": iterator_id, "type": "cancel"}
+        run_in_background(self.publish(f"_rpc.iterator.{iterator_id}.request", cancel))
 
     def _fail_chunked_reply(self, call_id: str, error: Exception) -> None:
         pending = self.pending_requests.pop(call_id, None)
@@ -2184,6 +2246,7 @@ class RPCClient(RPCClientProtocol):
             response_queue.put_nowait(settle_msg)
 
         self._pull_iterator_settles.add(settle_on_disconnect)
+        self._pull_sessions.add(iterator_id)
 
         try:
             await self._init_pull_session(
@@ -2195,6 +2258,7 @@ class RPCClient(RPCClientProtocol):
             )
         except BaseException:
             self._pull_iterator_settles.discard(settle_on_disconnect)
+            self._pull_sessions.discard(iterator_id)
             raise
 
         async def handle_response(msg: PullIteratorResponse) -> None:
@@ -2213,6 +2277,7 @@ class RPCClient(RPCClientProtocol):
 
         async def cleanup() -> None:
             self._pull_iterator_settles.discard(settle_on_disconnect)
+            self._pull_sessions.discard(iterator_id)
             self.status_handlers.pop(iterator_id, None)
 
             if unsubscribe is not None:
@@ -2234,6 +2299,7 @@ class RPCClient(RPCClientProtocol):
             response_queue.put_nowait(error)
 
         self.status_handlers[iterator_id] = on_no_responders
+        watch = _PullWatch(self, iterator_id, self._pull_probe_interval)
 
         try:
             # every next carries the status inbox, a 503 there means the responder died mid-iteration
@@ -2244,7 +2310,7 @@ class RPCClient(RPCClientProtocol):
                 }
                 await self.publish(request_subject, next_request, reply=status_inbox)
 
-                response = await response_queue.get()
+                response = await watch.answer(response_queue)
 
                 if isinstance(response, Exception):
                     raise response
@@ -2351,6 +2417,7 @@ class RPCClient(RPCClientProtocol):
             response_queue.put_nowait(settle_msg)
 
         self._pull_iterator_settles.add(settle_on_disconnect)
+        self._pull_sessions.add(iterator_id)
 
         init_params: PullCallbackParams = {
             "__pullCallback": True,
@@ -2367,6 +2434,7 @@ class RPCClient(RPCClientProtocol):
             )
         except BaseException:
             self._pull_iterator_settles.discard(settle_on_disconnect)
+            self._pull_sessions.discard(iterator_id)
             await cb_unsub()
             await stop_consumer()
             raise
@@ -2402,6 +2470,7 @@ class RPCClient(RPCClientProtocol):
 
         async def cleanup() -> None:
             self._pull_iterator_settles.discard(settle_on_disconnect)
+            self._pull_sessions.discard(iterator_id)
             self.status_handlers.pop(iterator_id, None)
             await cb_unsub()
             await stop_consumer()
@@ -2415,6 +2484,8 @@ class RPCClient(RPCClientProtocol):
                     }
                     await self.publish(request_subject, cancel_request)
 
+        watch = _PullWatch(self, iterator_id, self._pull_probe_interval)
+
         try:
             while True:
                 next_request: PullIteratorRequest = {
@@ -2423,7 +2494,7 @@ class RPCClient(RPCClientProtocol):
                 }
                 await self.publish(request_subject, next_request, reply=status_inbox)
 
-                response = await response_queue.get()
+                response = await watch.answer(response_queue)
 
                 if isinstance(response, Exception):
                     raise response
