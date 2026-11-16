@@ -5,7 +5,7 @@
   "description": "camera.ui rpc monorepo",
   "type": "module",
   "scripts": {
-    "audit": "npm audit fix && npm --prefix node audit fix",
+    "audit": "npm audit fix --min-release-age=0 && npm --prefix node audit fix --min-release-age=0",
     "build:node": "npm --prefix node run build",
     "build:go": "cd go && go build ./...",
     "build:python": "cd python && python scripts/build.py --local",
@@ -56,5 +56,9 @@
     "typescript": "5.9.3",
     "typescript-eslint": "^8.72.2",
     "updates": "^20.0.1"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "fsevents": true
   }
 }

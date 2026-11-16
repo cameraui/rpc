@@ -57,5 +57,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/cameraui/rpc.git"
+  },
+  "allowScripts": {
+    "fsevents": true,
+    "msgpackr-extract": true
   }
 }
