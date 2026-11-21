@@ -51,7 +51,10 @@
   "keywords": [
     "camera.ui",
     "nats",
-    "rpc"
+    "rpc",
+    "msgpack",
+    "streaming",
+    "microservices"
   ],
   "license": "MIT",
   "repository": {
