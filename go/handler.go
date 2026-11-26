@@ -72,7 +72,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 	var unsubscribers []func()
 	owner := newSessionOwner()
 	reg := newHandlerRegistration(client)
-	runners := make(map[string]func(data []byte, arrived time.Time), len(methods))
+	runners := make(map[string]func(data []byte, arrived time.Time, viewer bool), len(methods))
 
 	for methodName, fn := range methods {
 		fnCopy := fn
@@ -84,7 +84,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 		}
 		serial := reg.addMethod()
 
-		runners[methodName] = func(data []byte, arrived time.Time) {
+		runners[methodName] = func(data []byte, arrived time.Time, viewer bool) {
 			var msg RPCMessage
 			if err := DecodeMessageInto(data, &msg); err != nil {
 				return
@@ -149,15 +149,17 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 				}
 			}
 
+			sessionCtx := withCaller(owner.ctx, viewer)
+
 			if isStreamRequest(msg.Params) {
 				streamSubject, args := extractStreamParams(msg.Params)
-				go handleStreamRequestGo(owner, fnCopy, args, streamSubject, msg.ID, client, orphan, cfg.recoverPanics)
+				go handleStreamRequestGo(sessionCtx, owner, fnCopy, args, streamSubject, msg.ID, client, orphan, cfg.recoverPanics)
 				return
 			}
 
 			if isPullIteratorRequest(msg.Params) {
 				iteratorID, args := extractPullIteratorParams(msg.Params, msg.ID)
-				cleanup, err := handlePullIteratorRequestGo(owner.ctx, fnCopy, args, iteratorID, client, orphan, func() {
+				cleanup, err := handlePullIteratorRequestGo(sessionCtx, fnCopy, args, iteratorID, client, orphan, func() {
 					owner.untrack(&client.pullIteratorCleanups, iteratorID)
 				})
 				if err == nil && cleanup != nil {
@@ -175,7 +177,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 
 			if isPullCallbackRequest(msg.Params) {
 				iteratorID, callbackSubject, oneway, args := extractPullCallbackParams(msg.Params, msg.ID)
-				cleanup, err := handlePullCallbackRequestGo(owner.ctx, fnCopy, args, iteratorID, callbackSubject, oneway, client, orphan, func() {
+				cleanup, err := handlePullCallbackRequestGo(sessionCtx, fnCopy, args, iteratorID, callbackSubject, oneway, client, orphan, func() {
 					owner.untrack(&client.pullIteratorCleanups, iteratorID)
 				})
 				if err == nil && cleanup != nil {
@@ -194,7 +196,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 			if isCallbackRequest(msg.Params) {
 				callbackSubject, args := extractCallbackParams(msg.Params)
 				requestID := msg.ID
-				cleanup, err := handleCallbackRequestGo(owner.ctx, fnCopy, args, callbackSubject, requestID, client, orphan, func() {
+				cleanup, err := handleCallbackRequestGo(sessionCtx, fnCopy, args, callbackSubject, requestID, client, orphan, func() {
 					owner.untrack(&client.callbackCleanups, requestID)
 				})
 				if err == nil {
@@ -232,7 +234,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 				reply()
 			}
 
-			ctx, cancel := callContext(reg.callCtx, takesCtx)
+			ctx, cancel := callContext(withCaller(reg.callCtx, viewer), takesCtx)
 			if slots == nil && !reg.drains {
 				defer cancel()
 				serve(ctx)
@@ -320,7 +322,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 	}
 
 	// expiring methods are served from a lane, so their queue wait is measured on this side
-	reg.lanes = newLaneSet(client, prefix, cfg.pendingMsgs, cfg.pendingBytes, func(method string) func([]byte, time.Time) {
+	reg.lanes = newLaneSet(client, prefix, cfg.pendingMsgs, cfg.pendingBytes, func(method string) func([]byte, time.Time, bool) {
 		if !cfg.namespaceSubscription && !cfg.dropsExpired(method) {
 			return nil
 		}
@@ -328,7 +330,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 	})
 
 	if cfg.namespaceSubscription {
-		entry := &subscriptionEntry{pattern: prefix + ">", queue: cfg.queue, routed: func(subject string, data []byte) {
+		entry := &subscriptionEntry{pattern: prefix + ">", queue: cfg.queue, routed: func(subject string, data []byte, viewer bool) {
 			method := strings.TrimPrefix(subject, prefix)
 			if method == methodsSubject {
 				answerMethods(data)
@@ -337,7 +339,7 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 				if cfg.dropsExpired(method) {
 					arrived = time.Now()
 				}
-				lane.push(data, arrived)
+				lane.push(data, arrived, viewer)
 			} else {
 				answerUnknownMethod(client, method, data, methodNames)
 			}
@@ -360,12 +362,12 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 			opts = append(opts, pendingLimits(cfg.pendingMsgs, cfg.pendingBytes))
 		}
 		for methodName, run := range runners {
-			handle := func(data []byte) { run(data, time.Time{}) }
+			handle := func(_ string, data []byte, viewer bool) { run(data, time.Time{}, viewer) }
 			if cfg.dropsExpired(methodName) {
 				lane := reg.lanes.lane(methodName)
-				handle = func(data []byte) { lane.push(data, time.Now()) }
+				handle = func(_ string, data []byte, viewer bool) { lane.push(data, time.Now(), viewer) }
 			}
-			entry := &subscriptionEntry{pattern: prefix + methodName, queue: cfg.queue, opts: opts, handler: handle}
+			entry := &subscriptionEntry{pattern: prefix + methodName, queue: cfg.queue, opts: opts, routed: handle}
 			if err := subscribe(entry); err != nil {
 				return nil, err
 			}

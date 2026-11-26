@@ -1,6 +1,7 @@
 import { createError, localNoRespondersSubject, RPCException } from './errors.js';
 import { ERROR_CODES } from './types.js';
 
+import type { MsgHdrs } from '@nats-io/nats-core';
 import type { RPCClient } from './client.js';
 import type { CallbackInvocation, CallbackMessage, OrphanProbeOptions, PullIteratorRequest, PullIteratorResponse, RPCError, StreamMessage } from './types.js';
 
@@ -19,13 +20,20 @@ export type SessionKind = 'stream' | 'pull' | 'pullCallback' | 'callback';
 
 export type MethodHandler = (...args: any[]) => unknown;
 
-interface SessionStore {
-  run<R>(signal: AbortSignal, fn: () => R): R;
+interface AsyncStore<T> {
+  run<R>(value: T, fn: () => R): R;
   exit<R>(fn: () => R): R;
-  getStore(): AbortSignal | undefined;
+  getStore(): T | undefined;
 }
 
-const sessionStore = createSessionStore();
+export const CALLER_ROLE_HEADER = 'Cui-Role';
+
+const VIEWER_ROLE = 'viewer';
+const VIEWER_CALL = Symbol('viewerCall');
+
+const sessionStore = createAsyncStore<AbortSignal>();
+const callerStore = createAsyncStore<true>();
+let syncViewer = false; // node < 24 gets no store, there the flag only holds until the method's first await
 
 const yieldToEventLoop: () => Promise<void> =
   typeof setImmediate === 'function' ? () => new Promise((resolve) => setImmediate(resolve)) : () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -35,7 +43,26 @@ export function sessionSignal(): AbortSignal | undefined {
 }
 
 export function outsideSession<R>(fn: () => R): R {
-  return sessionStore ? sessionStore.exit(fn) : fn();
+  const outsideCaller = callerStore ? () => callerStore.exit(fn) : () => withSyncViewer(false, fn);
+  return sessionStore ? sessionStore.exit(outsideCaller) : outsideCaller();
+}
+
+export function callerIsViewer(): boolean {
+  return callerStore ? callerStore.getStore() === true : syncViewer;
+}
+
+export function markViewerCall(data: unknown, headers: MsgHdrs | undefined): void {
+  if (data && typeof data === 'object' && headers?.values(CALLER_ROLE_HEADER).includes(VIEWER_ROLE)) {
+    (data as Record<symbol, boolean>)[VIEWER_CALL] = true;
+  }
+}
+
+export function isViewerCall(msg: object): boolean {
+  return (msg as Record<symbol, boolean>)[VIEWER_CALL] === true;
+}
+
+export function asViewer<R>(fn: () => R): R {
+  return callerStore ? callerStore.run(true, fn) : withSyncViewer(true, fn);
 }
 
 export class SessionOwner {
@@ -552,13 +579,16 @@ async function servePullSession(
     return reason instanceof RPCException ? { id: iteratorId, type: 'error', error: formatErrorObject(reason) } : undefined;
   };
 
+  // a step runs on the consumer's request, outside the viewer call that opened the session
+  const next = callerIsViewer() ? (producer: Producer) => asViewer(() => producer.next()) : (producer: Producer) => producer.next();
+
   const advance = async (producer: Producer): Promise<PullIteratorResponse> => {
     // a frame that failed between steps, the producer does not run again
     const failure = failed();
     if (failure) return failure;
     stepping = true;
     try {
-      const { value, done } = await inSession(controller.signal, () => producer.next());
+      const { value, done } = await inSession(controller.signal, () => next(producer));
       return failed() ?? (done ? { id: iteratorId, type: 'done' } : valueResponse(value));
     } catch (error) {
       return failed() ?? { id: iteratorId, type: 'error', error: formatErrorObject(error) };
@@ -728,10 +758,20 @@ function inSession<R>(signal: AbortSignal, fn: () => R): R {
   return sessionStore ? sessionStore.run(signal, fn) : fn();
 }
 
-function createSessionStore(): SessionStore | undefined {
+function withSyncViewer<R>(viewer: boolean, fn: () => R): R {
+  const outer = syncViewer;
+  syncViewer = viewer;
+  try {
+    return fn();
+  } finally {
+    syncViewer = outer;
+  }
+}
+
+function createAsyncStore<T>(): AsyncStore<T> | undefined {
   const runtime = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
   // no static import, the browser build bundles this file
-  const hooks = runtime?.getBuiltinModule?.('node:async_hooks') as { AsyncLocalStorage?: new () => SessionStore } | undefined;
+  const hooks = runtime?.getBuiltinModule?.('node:async_hooks') as { AsyncLocalStorage?: new () => AsyncStore<T> } | undefined;
   const Store = hooks?.AsyncLocalStorage;
   // the async_hooks implementation (--no-async-context-frame) slows every await of the process
   return Store && !('_propagate' in Store.prototype) ? new Store() : undefined;

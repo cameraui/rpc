@@ -5,7 +5,19 @@ import { ChunkingManager, createChunks, parseChunkIndex, TransferBudget } from '
 import { assembleFrame, decode, decodeMessage, encode, encodeMessage, encodeMessageParts } from './codec.js';
 import { extractNestedMethodsWithDecorators, extractNestedMethodsWithoutDecorators } from './decorators.js';
 import { createError, markLocalNoResponders, RPCException } from './errors.js';
-import { callNormalRPC, formatErrorObject, handleStreamRequest, openSession, outsideSession, probeSettings, sessionKind, SessionOwner } from './handler.js';
+import {
+  asViewer,
+  callNormalRPC,
+  formatErrorObject,
+  handleStreamRequest,
+  isViewerCall,
+  markViewerCall,
+  openSession,
+  outsideSession,
+  probeSettings,
+  sessionKind,
+  SessionOwner,
+} from './handler.js';
 import { flushOutbound, packSmallPublishes, presizeSplitPayloads, PUBLISH_FRAME_MIN_SIZE, publishFrame, publishFrameZeroCopy, shareReadBuffer } from './patches.js';
 import { RPCService } from './service.js';
 import { ERROR_CODES } from './types.js';
@@ -669,6 +681,7 @@ export class RPCClient implements RPCClientImpl {
             chunkId,
             data.totalChunks,
             (assembledData) => {
+              markViewerCall(assembledData, msg.headers);
               runHandler(assembledData, msg);
             },
             (error) => {
@@ -695,6 +708,7 @@ export class RPCClient implements RPCClientImpl {
         } else {
           // the binary views into msg.data are safe, nats.js allocates one buffer per message
           const data = decodeMessage(msg.data);
+          markViewerCall(data, msg.headers);
           runHandler(data, msg);
         }
       } catch (error) {
@@ -2691,6 +2705,7 @@ export class RPCClient implements RPCClientImpl {
         }
 
         const kind = sessionKind(msg.params);
+        if (isViewerCall(msg)) return asViewer(() => (kind ? handleSession(kind, handler, method, msg, response) : handleCall(handler, msg, response)));
         return kind ? handleSession(kind, handler, method, msg, response) : handleCall(handler, msg, response);
       };
     };

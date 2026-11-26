@@ -168,11 +168,12 @@ export function muxSub(client: RPCClient, nc: ReturnType<typeof createMockNc>): 
 }
 
 export function emptyHeaders(code = 0) {
-  return { code, get: (_k: string) => undefined as string | undefined };
+  return { code, get: (_k: string) => undefined as string | undefined, values: (_k: string): string[] => [] };
 }
 
-export function headersWith(entries: Record<string, string>) {
-  return { code: 0, get: (k: string) => entries[k] };
+export function headersWith(entries: Record<string, string | string[]>) {
+  const values = (k: string): string[] => [entries[k] ?? []].flat();
+  return { code: 0, get: (k: string) => values(k)[0], values };
 }
 
 export function chunkedMessages(subject: string, payload: unknown, transferId: string, chunkSize: number) {

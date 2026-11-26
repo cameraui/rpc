@@ -11,7 +11,7 @@ export { RPCClass, RPCMethod, RPCNested, RPCProperty } from './decorators.js';
 
 export { rpcCallbacks } from './utils.js';
 
-export { sessionSignal } from './handler.js';
+export { callerIsViewer, CALLER_ROLE_HEADER, sessionSignal } from './handler.js';
 
 export type {
   CallbackInvocation,

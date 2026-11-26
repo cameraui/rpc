@@ -57,11 +57,14 @@ from .errors import (
 )
 from .executor import get_executor
 from .handler import (
+    as_caller,
     format_error_dict,
+    from_viewer,
     handle_callback_request,
     handle_normal_rpc,
     handle_pull_callback_request,
     handle_pull_iterator_request,
+    mark_viewer_call,
     refuse_stream,
     run_in_background,
     set_up_session,
@@ -1265,6 +1268,7 @@ class RPCClient(RPCClientProtocol):
         handler_is_async: bool = entry["handler_is_async"]
         # the handler takes the time nats-py read the message as its second argument
         with_arrival: bool = entry.get("arrival", False)
+        marks_caller: bool = entry.get("marks_caller", False)
 
         # raw mode for the mux: it needs headers and the subject and reassembles chunks itself
         if entry.get("raw"):
@@ -1311,7 +1315,9 @@ class RPCClient(RPCClientProtocol):
                         return
 
                     def on_complete(assembled_data: Any) -> None:
-                        assembled_queue.append(assembled_data)
+                        assembled_queue.append(
+                            mark_viewer_call(assembled_data, msg.headers) if marks_caller else assembled_data
+                        )
 
                     def on_error(error: Exception) -> None:
                         print(f"Error assembling chunks for {pattern}: {error}")
@@ -1350,6 +1356,8 @@ class RPCClient(RPCClientProtocol):
                 else:
                     # views into msg.data are safe, nats-py hands over one bytes object per message
                     data = decode_message(msg.data)
+                    if marks_caller:
+                        data = mark_viewer_call(data, msg.headers)
                     if with_arrival:
                         await cast(Any, handler)(data, getattr(msg, "arrived", None))
                     elif handler_is_async:
@@ -1429,7 +1437,11 @@ class RPCClient(RPCClientProtocol):
 
         entry["raw"] = True
         return await self._subscribe(
-            f"rpc.{namespace}.>", self._raw_router(entry, route, method_of), queue, entry, yield_after=False
+            f"rpc.{namespace}.>",
+            self._raw_router(entry, route, method_of, marks_caller=True),
+            queue,
+            entry,
+            yield_after=False,
         )
 
     def _raw_router(
@@ -1437,6 +1449,8 @@ class RPCClient(RPCClientProtocol):
         entry: dict[str, Any],
         deliver: Callable[[str, Any, bool, int], None],
         method_of: Callable[[str], str | None] | None = None,
+        *,
+        marks_caller: bool = False,
     ) -> Callable[[Msg], None]:
 
         def manager_for(scope: _ChunkScope, subject: str, create: bool) -> ChunkingManager | None:
@@ -1458,6 +1472,9 @@ class RPCClient(RPCClientProtocol):
             headers = msg.headers
             chunk_type = headers.get("x-chunked-transfer") if headers else None
             if not headers or chunk_type not in ("header", "chunk"):
+                if marks_caller and from_viewer(headers):
+                    deliver(subject, mark_viewer_call(decode_message(msg.data), headers), True, len(msg.data))
+                    return
                 deliver(subject, msg.data, False, len(msg.data))
                 return
             chunk_id = headers.get("x-chunk-id")
@@ -1473,7 +1490,12 @@ class RPCClient(RPCClientProtocol):
                 manager.start_receiving(
                     chunk_id,
                     header.get("totalChunks"),
-                    lambda assembled: deliver(subject, assembled, True, size if isinstance(size, int) else 0),
+                    lambda assembled: deliver(
+                        subject,
+                        mark_viewer_call(assembled, headers) if marks_caller else assembled,
+                        True,
+                        size if isinstance(size, int) else 0,
+                    ),
                     lambda error: print(f"Error assembling chunks for {subject}: {error}"),
                     size,
                     header.get("chunkSize"),
@@ -2763,7 +2785,7 @@ class RPCClient(RPCClientProtocol):
             # outlives suspend()/connect(): the restored subscription keeps this closure
             slots = asyncio.Semaphore(limits[method]) if handler_is_async and method in limits else None
             # filled by _subscribe, a reply reads the method's queue from it
-            entry: dict[str, Any] = {"arrival": True} if method in dropping else {}
+            entry: dict[str, Any] = {"marks_caller": True, "arrival": method in dropping}
 
             async def handle_message(
                 msg: Any,
@@ -2971,9 +2993,11 @@ class RPCClient(RPCClientProtocol):
                     await send_error(message, response, e, entry)
 
             if namespace_subscription:
-                dispatchers[method] = handle_message
+                dispatchers[method] = as_caller(handle_message)
                 continue
-            unsubscribe = await client._subscribe(subject, handle_message, queue, entry, yield_after=False)
+            unsubscribe = await client._subscribe(
+                subject, as_caller(handle_message), queue, entry, yield_after=False
+            )
             unsubscribers.append(unsubscribe)
             registration.entries.append(entry)
 

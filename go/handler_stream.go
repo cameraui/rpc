@@ -348,12 +348,12 @@ func (p *pullPump) run(respond func(val reflect.Value, ok bool)) {
 	}
 }
 
-func handleStreamRequestGo(owner *sessionOwner, fn reflect.Value, args []any, streamSubject, requestID string, client *Client, orphan *orphanConfig, recoverPanics bool) {
+func handleStreamRequestGo(parent context.Context, owner *sessionOwner, fn reflect.Value, args []any, streamSubject, requestID string, client *Client, orphan *orphanConfig, recoverPanics bool) {
 	if !isControlSubject(streamSubject, streamSubjectPrefix) {
 		return
 	}
 
-	ctx, cancel := context.WithCancel(owner.ctx)
+	ctx, cancel := context.WithCancel(parent)
 	s := &pushSession{id: requestID, subject: streamSubject, client: client, cancel: cancel, stopped: make(chan struct{})}
 	s.probe = client.newOrphanProbe(orphan, s.ping)
 

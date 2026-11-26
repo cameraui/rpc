@@ -6,6 +6,7 @@ from .channel import Channel, PrivateChannel
 from .client import create_rpc_client
 from .decorators import RPCClass, RPCMethod, RPCNested, RPCProperty
 from .errors import RPCException, RPCTimeoutError
+from .handler import CALLER_ROLE_HEADER, caller_is_viewer
 from .service import RPCService, Service
 from .types import (
     CallbackInvocation,
@@ -23,6 +24,8 @@ from .utils import RPCCallbacks, rpc_callbacks
 
 __all__ = [
     "create_rpc_client",
+    "caller_is_viewer",
+    "CALLER_ROLE_HEADER",
     "Channel",
     "PrivateChannel",
     "RPCException",

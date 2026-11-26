@@ -10,11 +10,12 @@ import (
 type laneItem struct {
 	data    []byte
 	arrived time.Time
+	viewer  bool
 }
 
 type methodLane struct {
 	subject  string
-	run      func(data []byte, arrived time.Time)
+	run      func(data []byte, arrived time.Time, viewer bool)
 	client   *Client
 	maxMsgs  int
 	maxBytes int
@@ -32,7 +33,7 @@ type laneSet struct {
 	client   *Client
 	maxMsgs  int
 	maxBytes int
-	runner   func(method string) func(data []byte, arrived time.Time)
+	runner   func(method string) func(data []byte, arrived time.Time, viewer bool)
 
 	mu     sync.Mutex
 	lanes  map[string]*methodLane
@@ -40,7 +41,7 @@ type laneSet struct {
 	closed bool
 }
 
-func newLaneSet(client *Client, prefix string, maxMsgs, maxBytes int, runner func(method string) func([]byte, time.Time)) *laneSet {
+func newLaneSet(client *Client, prefix string, maxMsgs, maxBytes int, runner func(method string) func([]byte, time.Time, bool)) *laneSet {
 	if maxMsgs == 0 {
 		maxMsgs = nats.DefaultSubPendingMsgsLimit
 	}
@@ -122,7 +123,7 @@ func (s *laneSet) close() {
 	}
 }
 
-func (l *methodLane) push(data []byte, arrived time.Time) {
+func (l *methodLane) push(data []byte, arrived time.Time, viewer bool) {
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
@@ -140,7 +141,7 @@ func (l *methodLane) push(data []byte, arrived time.Time) {
 		}
 		return
 	}
-	l.queue = append(l.queue, laneItem{data: data, arrived: arrived})
+	l.queue = append(l.queue, laneItem{data: data, arrived: arrived, viewer: viewer})
 	l.bytes += len(data)
 	if l.running {
 		l.mu.Unlock()
@@ -166,7 +167,7 @@ func (l *methodLane) serve() {
 		l.queue = l.queue[1:]
 		l.bytes -= len(item.data)
 		l.mu.Unlock()
-		l.run(item.data, item.arrived)
+		l.run(item.data, item.arrived, item.viewer)
 	}
 }
 

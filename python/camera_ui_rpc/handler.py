@@ -5,9 +5,9 @@ import inspect
 import threading
 import time
 from collections import deque
-from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from functools import partial, wraps
 from typing import Any, Protocol, cast
 
 from .errors import RPCException, create_error, reported_error
@@ -31,6 +31,13 @@ PULL_CALLBACK_SUBJECT_PREFIX = "_rpc.cb."
 # a producer that never waits would keep cancel messages unread, publish loops yield after this long
 _YIELD_INTERVAL = 0.002
 
+CALLER_ROLE_HEADER = "Cui-Role"
+
+_VIEWER_ROLE = "viewer"
+_caller_viewer: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "camera_ui_rpc_caller_viewer", default=False
+)
+
 _background: set[asyncio.Future[Any]] = set()
 
 
@@ -49,6 +56,44 @@ _enter_task: Callable[[asyncio.AbstractEventLoop, asyncio.Task[Any]], None] | No
 _leave_task: Callable[[asyncio.AbstractEventLoop, asyncio.Task[Any]], None] | None = getattr(
     asyncio.tasks, "_leave_task", None
 )
+
+
+class ViewerCall(dict[str, Any]):
+    __slots__ = ()
+
+
+def caller_is_viewer() -> bool:
+    return _caller_viewer.get()
+
+
+def from_viewer(headers: Mapping[str, str] | None) -> bool:
+    # the proxy appends the role line last, nats-py keeps the last value of a repeated header
+    return headers is not None and headers.get(CALLER_ROLE_HEADER) == _VIEWER_ROLE
+
+
+def mark_viewer_call(data: Any, headers: Mapping[str, str] | None) -> Any:
+    if isinstance(data, dict) and from_viewer(headers):
+        return ViewerCall(cast(dict[str, Any], data))
+    return data
+
+
+def as_caller(
+    handle: Callable[..., Coroutine[Any, Any, None]],
+) -> Callable[..., Coroutine[Any, Any, None]]:
+    @wraps(handle)
+    async def run(message: Any, *args: Any, **kwargs: Any) -> None:
+        viewer = isinstance(message, ViewerCall)
+        # a subscription made during a viewer call keeps that call's context
+        if viewer == _caller_viewer.get():
+            await handle(message, *args, **kwargs)
+            return
+        token = _caller_viewer.set(viewer)
+        try:
+            await handle(message, *args, **kwargs)
+        finally:
+            _caller_viewer.reset(token)
+
+    return run
 
 
 class SessionProbe(Protocol):
@@ -218,7 +263,7 @@ async def _stream_generator(
             raise create_error(ErrorCode.INTERNAL_ERROR, "Handler must return a generator for stream")
     else:
         loop = asyncio.get_event_loop()
-        func = partial(handler, *args)
+        func = partial(contextvars.copy_context().run, handler, *args)
         result = await loop.run_in_executor(io_pool, func)
 
         if hasattr(result, "__aiter__"):
@@ -696,7 +741,7 @@ async def _open_pull_generator(
             raise create_error(ErrorCode.INTERNAL_ERROR, "Handler must return a generator for pull iterator")
     else:
         loop = asyncio.get_event_loop()
-        func = partial(handler, *args)
+        func = partial(contextvars.copy_context().run, handler, *args)
         result = await loop.run_in_executor(io_pool, func)
 
         if hasattr(result, "__aiter__"):
@@ -812,7 +857,7 @@ async def _open_pull_callback_generator(
             )
     else:
         loop = asyncio.get_event_loop()
-        func = partial(handler, *args, invoker)
+        func = partial(contextvars.copy_context().run, handler, *args, invoker)
         result = await loop.run_in_executor(io_pool, func)
         if hasattr(result, "__aiter__"):
             generator = result
@@ -906,7 +951,7 @@ async def handle_callback_request(
         handler_cleanup = await handler(*args, wrapper_callback)
     else:
         loop = asyncio.get_event_loop()
-        func = partial(handler, *args, sync_wrapper_callback)
+        func = partial(contextvars.copy_context().run, handler, *args, sync_wrapper_callback)
         handler_cleanup = await loop.run_in_executor(io_pool, func)
 
     async def invoke_cleanup() -> None:

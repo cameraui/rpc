@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from collections.abc import Callable
 from typing import Any, cast
@@ -263,7 +264,7 @@ def test_a_call_that_gets_its_slot_as_the_deadline_passes_gets_connection_closed
         await until(lambda: gate.started == [0, 1])
         entries = client._subscription_entries.values()  # pyright: ignore[reportPrivateUsage]
         handler = next(e["handler"] for e in entries if e["pattern"] == "rpc.ns.work")
-        slots = handler.__kwdefaults__.values()
+        slots = inspect.unwrap(handler).__kwdefaults__.values()
         at_deadline.append(next(d for d in slots if isinstance(d, asyncio.Semaphore)).release)
 
         await client.disconnect()

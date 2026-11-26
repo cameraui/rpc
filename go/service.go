@@ -136,7 +136,7 @@ func (s *RPCService) RegisterHandler(config ServiceConfig, handler any, isolated
 
 			if isStreamRequest(msg.Params) {
 				streamSubject, args := extractStreamParams(msg.Params)
-				go handleStreamRequestGo(owner, fnCopy, args, streamSubject, msg.ID, client, orphan, false)
+				go handleStreamRequestGo(owner.ctx, owner, fnCopy, args, streamSubject, msg.ID, client, orphan, false)
 				return
 			}
 

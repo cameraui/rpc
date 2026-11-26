@@ -392,7 +392,7 @@ func TestForeignControlSubjectSkipsHandler(t *testing.T) {
 	fn := reflect.ValueOf(func(cb func(string)) { called = true })
 	target := "rpc.other.method"
 
-	handleStreamRequestGo(nil, fn, nil, target, "id", nil, nil, false)
+	handleStreamRequestGo(t.Context(), nil, fn, nil, target, "id", nil, nil, false)
 	if _, err := handleCallbackRequestGo(t.Context(), fn, nil, target, "id", nil, nil, nil); err == nil {
 		t.Error("callback: foreign subject accepted")
 	}

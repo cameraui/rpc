@@ -34,7 +34,7 @@ type subscriptionEntry struct {
 	pattern    string
 	queue      string
 	handler    func(data []byte)
-	routed     func(subject string, data []byte)
+	routed     func(subject string, data []byte, viewer bool)
 	rawHandler func(msg *nats.Msg)
 	opts       []func(*nats.Subscription)
 	sub        *nats.Subscription
@@ -622,17 +622,19 @@ func (c *Client) entryHandler(entry *subscriptionEntry) nats.MsgHandler {
 		}
 		return laneOf(subject)
 	}
-	deliver := func(subject string, data []byte) {
+	deliver := func(subject string, data []byte, viewer bool) {
 		if routed != nil {
-			routed(subject, data)
+			routed(subject, data, viewer)
 		} else {
 			handler(data)
 		}
 	}
 	return func(msg *nats.Msg) {
 		chunkType := ""
+		viewer := false
 		if msg.Header != nil {
 			chunkType = msg.Header.Get("x-chunked-transfer")
+			viewer = slices.Contains(msg.Header.Values(CallerRoleHeader), viewerRole)
 		}
 
 		switch chunkType {
@@ -644,7 +646,7 @@ func (c *Client) entryHandler(entry *subscriptionEntry) nats.MsgHandler {
 			subject := msg.Subject
 			scope.loadLane(lane(subject), c.Options.MaxTransferSize, c.chunkBudget).StartReceiving(
 				hdr.TransferID, hdr.TotalChunks,
-				func(data []byte) { deliver(subject, data) },
+				func(data []byte) { deliver(subject, data, viewer) },
 				func(err error) {},
 				hdr.TotalSize, hdr.ChunkSize,
 			)
@@ -663,7 +665,7 @@ func (c *Client) entryHandler(entry *subscriptionEntry) nats.MsgHandler {
 			cm.ProcessChunk(chunk)
 
 		default:
-			deliver(msg.Subject, msg.Data)
+			deliver(msg.Subject, msg.Data, viewer)
 		}
 	}
 }
