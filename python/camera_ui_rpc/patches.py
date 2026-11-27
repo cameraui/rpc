@@ -16,7 +16,7 @@ from nats.protocol import parser as nats_parser
 from nats.protocol.parser import Parser
 
 # nats-py releases the parser and flush patches were checked against
-TESTED_NATS_VERSIONS = frozenset({(2, 15), (2, 16)})
+TESTED_NATS_VERSIONS = frozenset({(2, 15), (2, 16), (2, 17)})
 LARGE_PAYLOAD = 32 * 1024  # copied once on receive from this size on instead of three times
 _AWAITING_CONTROL_LINE: int = getattr(nats_parser, "AWAITING_CONTROL_LINE", 1)
 _AWAITING_MSG_PAYLOAD: int = getattr(nats_parser, "AWAITING_MSG_PAYLOAD", 2)
