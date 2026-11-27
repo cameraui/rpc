@@ -45,7 +45,7 @@
   "author": "seydx",
   "devDependencies": {
     "@camera.ui/nats": "^2.15.3",
-    "@stylistic/eslint-plugin": "^5.10.0",
+    "@stylistic/eslint-plugin": "^6.0.1",
     "@types/node": "^26.6.6",
     "@typescript-eslint/parser": "^8.73.0",
     "eslint": "9.39.2",
