@@ -47,15 +47,15 @@
     "@camera.ui/nats": "^2.15.3",
     "@stylistic/eslint-plugin": "^5.10.0",
     "@types/node": "^26.6.6",
-    "@typescript-eslint/parser": "^8.72.2",
+    "@typescript-eslint/parser": "^8.73.0",
     "eslint": "9.39.2",
     "globals": "^17.14.0",
     "prettier": "^3.10.1",
     "rimraf": "^6.1.4",
     "tsx": "^4.23.15",
     "typescript": "5.9.3",
-    "typescript-eslint": "^8.72.2",
-    "updates": "^20.0.1"
+    "typescript-eslint": "^8.73.0",
+    "updates": "^20.0.2"
   },
   "allowScripts": {
     "esbuild": true,

@@ -31,15 +31,15 @@
     "prepublishOnly": "npm i --package-lock-only && npm run lint && npm run format && npm run build"
   },
   "dependencies": {
-    "@nats-io/nats-core": "^3.4.0",
-    "@nats-io/services": "^3.4.0",
-    "@nats-io/transport-node": "^3.4.0",
+    "@nats-io/nats-core": "~3.4.0",
+    "@nats-io/services": "~3.4.0",
+    "@nats-io/transport-node": "~3.4.0",
     "msgpackr": "^2.1.4",
     "reflect-metadata": "^0.2.2"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
-    "vitest": "^5.1.0"
+    "vitest": "^5.1.1"
   },
   "bugs": {
     "url": "https://github.com/cameraui/rpc/issues"
