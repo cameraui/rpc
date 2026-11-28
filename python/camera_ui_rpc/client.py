@@ -2710,12 +2710,21 @@ class RPCClient(RPCClientProtocol):
         ) -> None:
             wants_timing = message.get("__timing") is True
             start = time.time() * 1000 if wants_timing else 0.0
-            result = await handle_normal_rpc(
-                handler,
-                message.get("params", []),
-                client.io_pool,
-                handler_is_async,
-            )
+            called_at = time.monotonic()
+            try:
+                result = await handle_normal_rpc(
+                    handler,
+                    message.get("params", []),
+                    client.io_pool,
+                    handler_is_async,
+                )
+            except Exception:
+                if _expired(message, called_at):
+                    return
+                raise
+            # the caller timed out already, the answer would cross the link for nobody
+            if _expired(message, called_at):
+                return
             if wants_timing:
                 response["__timing"] = {
                     "start": int(start),

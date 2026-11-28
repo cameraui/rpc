@@ -174,3 +174,22 @@ def test_a_new_connection_stamps_arrivals_too(monkeypatch: pytest.MonkeyPatch) -
         assert answers(nc) == {"req.0": 0}
 
     asyncio.run(run())
+
+
+def test_a_call_that_outlives_its_ttl_gets_no_answer() -> None:
+    async def run() -> None:
+        client, nc = make_client()
+        gate = Gate()
+        await client.register_handler("ns", {"work": gate.work})
+        await request(nc, "rpc.ns.work", 0, 20, 0)
+        await until(lambda: gate.started == [0])
+        await request(nc, "rpc.ns.work", 1, 10000, 1)
+        await asyncio.sleep(0.06)
+
+        gate.open.set()
+        await until(lambda: gate.started == [0, 1])
+        await until(lambda: len(answers(nc)) == 1)
+        await asyncio.sleep(0.01)
+        assert answers(nc) == {"req.1": 1}
+
+    asyncio.run(run())

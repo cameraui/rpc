@@ -221,7 +221,13 @@ func (c *Client) RegisterHandler(namespace string, handler any, opts ...HandlerO
 				if msg.Timing {
 					start = time.Now().UnixMilli()
 				}
+				calledAt := time.Now()
 				result, err := callHandler(ctx, fnCopy, msg.Params)
+				// the caller timed out already, the answer would cross the link for nobody
+				if expired(calledAt, msg.TTL) {
+					state.Store(replyDone)
+					return
+				}
 				if msg.Timing {
 					response.Timing = &RPCTiming{Start: start, End: time.Now().UnixMilli()}
 				}

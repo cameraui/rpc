@@ -516,6 +516,19 @@ describe('expired requests', () => {
     expect(replied().sort()).toEqual(['r.1', 'r.3', 'r.4', 'w.1', 'w.2']);
   });
 
+  it('sends no answer for a call that outlived its ttl, a call within it still gets one', async () => {
+    const { release, send, replied } = await busyMethods({});
+
+    send('read', 'r.1', 10);
+    send('write', 'w.1', 1000);
+    await sleep(40);
+    release();
+
+    await vi.waitFor(() => expect(replied()).toEqual(['w.1']));
+    await sleep(10);
+    expect(replied()).toEqual(['w.1']);
+  });
+
   it('does the same through a namespace subscription and leaves a skipped request out of the drain', async () => {
     const { cleanup, ran, release, send, replied } = await busyMethods({ dropExpired: true, namespaceSubscription: true });
 

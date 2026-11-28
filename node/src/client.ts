@@ -2622,6 +2622,7 @@ export class RPCClient implements RPCClientImpl {
       const replySubject = `rpc.reply.${msg.id}`;
       const wantsTiming = msg.__timing === true;
       const start = wantsTiming ? Date.now() : 0;
+      const calledAt = performance.now();
 
       let result: unknown;
       try {
@@ -2636,10 +2637,11 @@ export class RPCClient implements RPCClientImpl {
           try {
             value = await result;
           } catch (error) {
-            if (claim(msg)) await replyError(replySubject, response, error);
+            if (claim(msg) && !pastTtl(msg, calledAt)) await replyError(replySubject, response, error);
             return;
           }
-          if (!claim(msg)) return;
+          // the caller timed out already, the answer would cross the link for nobody
+          if (!claim(msg) || pastTtl(msg, calledAt)) return;
           if (wantsTiming) {
             response.__timing = { start, end: Date.now() };
           }
@@ -2683,9 +2685,8 @@ export class RPCClient implements RPCClientImpl {
       };
     };
     const expired = (msg: RPCMessage): boolean => {
-      const ttl = msg.__ttl;
       const arrived = arrivals.get(msg);
-      return typeof ttl === 'number' && ttl > 0 && arrived !== undefined && performance.now() - arrived > ttl + EXPIRY_SLACK_MS;
+      return arrived !== undefined && pastTtl(msg, arrived);
     };
 
     const serve = (method: string, handler: MethodHandler): ((msg: RPCMessage) => void | Promise<void>) => {
@@ -3083,6 +3084,11 @@ function refusedPublishSubject(error: unknown): string | undefined {
 function namespaceSubscribable(namespace: string): boolean {
   const first = namespace.split('.', 1)[0];
   return first !== 'reply' && first !== 'cb';
+}
+
+function pastTtl(msg: RPCMessage, since: number): boolean {
+  const ttl = msg.__ttl;
+  return typeof ttl === 'number' && ttl > 0 && performance.now() - since > ttl + EXPIRY_SLACK_MS;
 }
 
 function isRequest(msg: unknown): msg is RPCMessage {

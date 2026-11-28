@@ -137,3 +137,42 @@ func TestDropExpiredSkipsCallsTheCallerGaveUpOn(t *testing.T) {
 		})
 	}
 }
+
+func TestCallPastItsTTLGetsNoAnswer(t *testing.T) {
+	s := startFakeNATS(t)
+	server := connectFake(t, s, nil)
+	if _, err := server.RegisterHandler("late", map[string]any{
+		"slow": func(n int) int {
+			time.Sleep(60 * time.Millisecond)
+			return n
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	watcher := connectFake(t, s, nil)
+	var mu sync.Mutex
+	var answered []string
+	if _, err := watcher.Subscribe("rpc.reply.>", func(data []byte) {
+		var res RPCResponse
+		if err := DecodeMessageInto(data, &res); err == nil {
+			mu.Lock()
+			answered = append(answered, res.ID)
+			mu.Unlock()
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, req := range []RPCMessage{{ID: "gone", Method: "call", Params: []any{1}, TTL: 20}, {ID: "waiting", Method: "call", Params: []any{2}, TTL: 2000}} {
+		if err := watcher.Publish("rpc.late.slow", req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(250 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(answered, []string{"waiting"}) {
+		t.Errorf("answered %v, want [waiting]", answered)
+	}
+}
